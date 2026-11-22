@@ -1083,3 +1083,53 @@ fn a_text_edit_during_a_take_keeps_the_text_it_was_read_from(cx: &mut TestAppCon
         assert!(take.recorded_against_old_text, "{take:?}");
     });
 }
+
+#[gpui_kit::test]
+fn a_take_whose_finish_failed_stays_locked_until_saved(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0); // begun on disk, streaming into the partial WAV
+    f.view
+        .read_with(cx, |view, _| view.recorder.fail_next_finish());
+    super::recorder::commits_fail(true);
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("could not be saved"), "{shown}");
+
+    let report = tw::repair(&f.dir).expect("repair");
+    assert!(report.adopted.is_empty(), "{:?}", report.adopted);
+
+    super::recorder::commits_fail(false);
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "saved on retry");
+    assert_eq!((takes[0].1, takes[0].2.samples), (1, 2400));
+    assert!(!takes[0].2.recovered);
+}
+
+#[gpui_kit::test]
+fn a_take_begun_late_is_rewritten_under_its_lock(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // A file where the line's take directory belongs: the take cannot be
+    // begun on disk and is kept in memory.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/a"), b"").expect("blocker");
+    begin(cx, &f, 100.0);
+    fs::remove_file(f.dir.join("takes/a")).expect("unblock");
+    super::recorder::commits_fail(true);
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("could not be saved"), "{shown}");
+
+    let report = tw::repair(&f.dir).expect("repair");
+    assert!(report.adopted.is_empty(), "{:?}", report.adopted);
+
+    super::recorder::commits_fail(false);
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "saved on retry");
+    assert_eq!((takes[0].1, takes[0].2.samples), (1, 2400));
+}

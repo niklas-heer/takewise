@@ -65,8 +65,9 @@ struct Unsaved {
     input: RecordedInput,
     samples: Vec<i32>,
     partial: Option<PartialTake>,
-    /// The partial WAV's lock, held until the take is committed.
-    _lock: Option<WavLock>,
+    /// The partial WAV's lock, held from the first write (or the rewrite
+    /// from memory) until the take is committed or the window exits.
+    lock: Option<WavLock>,
     /// Whether the partial WAV already holds every sample.
     complete: bool,
 }
@@ -146,6 +147,14 @@ impl Recorder {
         match &self.phase {
             Phase::Recording(take) => Some(take.writer.progress()),
             _ => None,
+        }
+    }
+
+    /// Makes finishing the take's partial WAV fail when it stops.
+    #[cfg(test)]
+    pub fn fail_next_finish(&self) {
+        if let Phase::Recording(take) = &self.phase {
+            take.writer.fail_finish();
         }
     }
 
@@ -395,7 +404,7 @@ impl Recorder {
             input,
             samples,
             partial,
-            _lock: lock,
+            lock,
             complete,
         };
         let mut update = self.save(dir, unsaved);
@@ -739,12 +748,33 @@ fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<TakeRef, String> {
         partial
     };
     if !unsaved.complete {
+        // Rewritten only while holding the file's lock (kept from the
+        // recording, else taken now), so a repair never adopts it meanwhile.
+        if unsaved.lock.is_none() {
+            unsaved.lock = Some(WavLock::acquire(&partial.wav).map_err(|err| err.to_string())?);
+        }
         write_take_wav(&partial.wav, &unsaved.samples, RECORD_RATE)
             .map_err(|err| err.to_string())?;
         unsaved.complete = true;
     }
     update_take_meta(&partial, &unsaved.input).map_err(|err| err.to_string())?;
+    #[cfg(test)]
+    if COMMITS_FAIL.get() {
+        return Err("the commit failed (test)".to_owned());
+    }
     commit_take(dir, partial).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether commits on this thread fail, as a failing disk makes them.
+    static COMMITS_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes commits of takes on this thread fail (or succeed again).
+#[cfg(test)]
+pub fn commits_fail(fail: bool) {
+    COMMITS_FAIL.set(fail);
 }
 
 /// "Audio dropout at 0:05." for the dropouts of a take whose first sample

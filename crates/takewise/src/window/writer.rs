@@ -42,13 +42,17 @@ pub struct Written {
     pub dropouts: Vec<Dropout>,
     /// Whether the partial WAV holds every sample, finished and synced.
     pub complete: bool,
-    /// The partial WAV's lock, held until the take is committed.
+    /// The partial WAV's lock, held until the take is committed, also when
+    /// the WAV could not be finished.
     pub lock: Option<WavLock>,
 }
 
 enum Control {
     Open(PathBuf),
     Stop,
+    /// Makes finishing the partial WAV fail, as a failing disk would.
+    #[cfg(test)]
+    FailFinish,
 }
 
 pub struct TakeWriter {
@@ -87,6 +91,12 @@ impl TakeWriter {
         let _ = self.control.send(Control::Open(wav));
     }
 
+    /// Makes finishing the partial WAV fail when the writer stops.
+    #[cfg(test)]
+    pub fn fail_finish(&self) {
+        let _ = self.control.send(Control::FailFinish);
+    }
+
     /// Ends the thread after the capture stopped (every buffer is already
     /// in the channel) and returns what it captured.
     pub fn finish(mut self) -> Written {
@@ -110,6 +120,8 @@ struct State {
     wav: Option<PartialWav>,
     /// Set once writing failed: the WAV is kept locked but not written.
     failed: bool,
+    #[cfg(test)]
+    fail_finish: bool,
 }
 
 impl State {
@@ -171,12 +183,16 @@ impl State {
     }
 
     fn finish(self) -> Written {
+        // The partial WAV stays locked whether or not it could be finished:
+        // a take that failed here is written again from memory under the
+        // same lock, so a repair never adopts it meanwhile.
         let (complete, lock) = match self.wav {
-            Some(wav) if !self.failed => match wav.finish() {
-                Ok(lock) => (true, Some(lock)),
-                Err(_) => (false, None),
-            },
-            Some(wav) => (false, Some(wav.into_lock())),
+            Some(mut wav) => {
+                let synced = !self.failed && wav.sync().is_ok();
+                #[cfg(test)]
+                let synced = synced && !self.fail_finish;
+                (synced, Some(wav.into_lock()))
+            }
             None => (false, None),
         };
         Written {
@@ -203,12 +219,16 @@ fn run(
         samples: Vec::new(),
         wav: None,
         failed: false,
+        #[cfg(test)]
+        fail_finish: false,
     };
     let mut capturing = true;
     'run: loop {
         loop {
             match commands.try_recv() {
                 Ok(Control::Open(path)) => state.open(&path, progress),
+                #[cfg(test)]
+                Ok(Control::FailFinish) => state.fail_finish = true,
                 Ok(Control::Stop) | Err(TryRecvError::Disconnected) => break 'run,
                 Err(TryRecvError::Empty) => break,
             }
@@ -217,6 +237,8 @@ fn run(
             // The capture is gone: wait for the window's next command.
             match commands.recv() {
                 Ok(Control::Open(path)) => state.open(&path, progress),
+                #[cfg(test)]
+                Ok(Control::FailFinish) => state.fail_finish = true,
                 Ok(Control::Stop) | Err(_) => break 'run,
             }
             continue;

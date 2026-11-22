@@ -292,6 +292,26 @@ pub struct WavLock {
     _file: fs::File,
 }
 
+impl WavLock {
+    /// Locks the take audio at `path`, creating an empty file when there is
+    /// none, so [`repair`] leaves it alone while the take is written there
+    /// (from memory) and committed. Fails when another holder locked it.
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(io(path))?;
+        file.try_lock().map_err(|err| match err {
+            fs::TryLockError::Error(err) => io(path)(err),
+            fs::TryLockError::WouldBlock => io(path)(std::io::ErrorKind::WouldBlock.into()),
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 impl PartialWav {
     /// Creates `path` (which must not exist), locks it and writes the header
     /// of an empty mono 24-bit WAV.
@@ -368,9 +388,15 @@ impl PartialWav {
     /// Flushes and fsyncs the file; it stays locked until the returned
     /// guard is dropped (after `commit_take`).
     pub fn finish(mut self) -> Result<WavLock> {
+        self.sync()?;
+        Ok(self.into_lock())
+    }
+
+    /// Flushes and fsyncs everything written. On failure the caller keeps
+    /// the lock (`into_lock`) while it writes the take again from memory.
+    pub fn sync(&mut self) -> Result<()> {
         self.flush()?;
-        self.file.sync_all().map_err(io(&self.path))?;
-        Ok(WavLock { _file: self.file })
+        self.file.sync_all().map_err(io(&self.path))
     }
 }
 
@@ -755,6 +781,20 @@ mod tests {
             dropouts: None,
             film_shift_ms: None,
         }
+    }
+
+    #[test]
+    fn repair_leaves_a_take_written_under_its_lock() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        let lock = WavLock::acquire(&partial.wav).unwrap();
+        write_take_wav(&partial.wav, &[1000; 480], 48_000).unwrap();
+        assert!(WavLock::acquire(&partial.wav).is_err(), "held");
+        assert_eq!(repair(dir).unwrap().adopted, Vec::new());
+        drop(lock);
+        let adopted = repair(dir).unwrap().adopted;
+        assert_eq!(adopted.len(), 1, "a crash leaves it adoptable");
     }
 
     fn record(dir: &Path, line: &str, samples: usize) -> TakeRef {
