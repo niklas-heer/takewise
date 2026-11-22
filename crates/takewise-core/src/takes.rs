@@ -111,12 +111,35 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Publishes a finished take: under the lock, allocates the next number,
 /// renames the metadata to `NNN.json` and the audio to `NNN.wav`, and appends
 /// the `recorded` event.
+// Taken by value: a committed partial take no longer exists.
+#[allow(clippy::needless_pass_by_value)]
 pub fn commit_take(dir: &Path, partial: PartialTake) -> Result<TakeRef> {
     let input = read_meta(&partial.meta)?.input;
+    let _guard = lock(dir)?;
+    publish_locked(dir, &partial, input, false)
+}
+
+/// Replaces a partial take's metadata with `input`, such as the line's
+/// position at commit time. Atomic: a crash leaves the old or the new file.
+pub fn update_take_meta(partial: &PartialTake, input: &RecordedInput) -> Result<()> {
+    let mut meta = read_meta(&partial.meta)?;
+    meta.input = input.clone();
+    let json = serde_json::to_vec_pretty(&meta).map_err(|err| Error::Parse {
+        path: partial.meta.clone(),
+        message: err.to_string(),
+    })?;
+    crate::fsutil::write_atomic(&partial.meta, &json)
+}
+
+/// Numbers and publishes a partial take; the caller holds the project lock.
+fn publish_locked(
+    dir: &Path,
+    partial: &PartialTake,
+    input: RecordedInput,
+    recovered: bool,
+) -> Result<TakeRef> {
     let (sample_rate, samples) = wav_header(&partial.wav)?;
     let line_dir = line_dir(dir, &partial.line)?;
-
-    let _guard = lock(dir)?;
     let ledger = ledger::read(dir)?;
     let files = scan(dir)?;
     let used = files
@@ -138,10 +161,10 @@ pub fn commit_take(dir: &Path, partial: PartialTake) -> Result<TakeRef> {
     let wav = line_dir.join(format!("{take:03}.wav"));
     fs::rename(&partial.meta, &meta).map_err(io(&meta))?;
     fs::rename(&partial.wav, &wav).map_err(io(&wav))?;
-    let event = recorded_event(&partial.line, take, input, sample_rate, samples, false);
+    let event = recorded_event(&partial.line, take, input, sample_rate, samples, recovered);
     ledger::append_locked(dir, &event)?;
     Ok(TakeRef {
-        line: partial.line,
+        line: partial.line.clone(),
         take,
     })
 }
@@ -225,6 +248,164 @@ pub(crate) fn encode_wav(
     buffer
         .into_inner()
         .map_err(|err| hound::Error::IoError(err.into_error()))
+}
+
+fn take_spec(sample_rate: u32) -> hound::WavSpec {
+    hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    }
+}
+
+/// A take's audio streamed into its partial WAV while it is recorded.
+///
+/// The file is exclusively locked (advisory `flock`) while this lives, so
+/// [`repair`] never adopts a take that is still being recorded; the lock
+/// ends with the process, so a crash leaves the take adoptable. The header
+/// is rewritten by [`PartialWav::flush`], after which the file is a valid
+/// WAV up to that point; dropping the writer without [`PartialWav::finish`]
+/// leaves the file as a crash would.
+#[derive(Debug)]
+pub struct PartialWav {
+    file: fs::File,
+    path: PathBuf,
+    /// Offset of the data chunk's length field; the data follows it.
+    data_len_at: u64,
+    samples: u64,
+    flushed: u64,
+}
+
+/// Keeps a finished take's audio locked until it is committed.
+#[derive(Debug)]
+pub struct WavLock {
+    _file: fs::File,
+}
+
+impl PartialWav {
+    /// Creates `path` (which must not exist), locks it and writes the header
+    /// of an empty mono 24-bit WAV.
+    pub fn create(path: &Path, sample_rate: u32) -> Result<Self> {
+        use std::io::Write as _;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(io(path))?;
+        file.try_lock().map_err(|err| match err {
+            fs::TryLockError::Error(err) => io(path)(err),
+            fs::TryLockError::WouldBlock => io(path)(std::io::ErrorKind::WouldBlock.into()),
+        })?;
+        // hound's own header, so streamed takes match finished ones.
+        let mut header = std::io::Cursor::new(Vec::new());
+        hound::WavWriter::new(&mut header, take_spec(sample_rate))
+            .and_then(hound::WavWriter::finalize)
+            .map_err(wav_error(path))?;
+        let header = header.into_inner();
+        let mut this = Self {
+            data_len_at: header.len() as u64 - 4,
+            file,
+            path: path.to_path_buf(),
+            samples: 0,
+            flushed: 0,
+        };
+        this.file.write_all(&header).map_err(io(path))?;
+        Ok(this)
+    }
+
+    /// Appends samples, clamped to 24 bits. Not yet durable: see `flush`.
+    pub fn write(&mut self, samples: &[i32]) -> Result<()> {
+        use std::io::Write as _;
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| {
+                let [a, b, c, _] = s.clamp(&MIN_SAMPLE, &FULL_SCALE).to_le_bytes();
+                [a, b, c]
+            })
+            .collect();
+        self.file.write_all(&bytes).map_err(io(&self.path))?;
+        self.samples += samples.len() as u64;
+        Ok(())
+    }
+
+    /// Samples written so far.
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Samples written since the last flush.
+    pub fn unflushed(&self) -> u64 {
+        self.samples - self.flushed
+    }
+
+    /// Rewrites the header for everything written and syncs the data, so the
+    /// file is a valid WAV of it even if the process dies next.
+    pub fn flush(&mut self) -> Result<()> {
+        write_wav_lengths(&self.file, self.data_len_at, self.samples * 3)
+            .map_err(io(&self.path))?;
+        self.file.sync_data().map_err(io(&self.path))?;
+        self.flushed = self.samples;
+        Ok(())
+    }
+
+    /// Flushes and fsyncs the file; it stays locked until the returned
+    /// guard is dropped (after `commit_take`).
+    pub fn finish(mut self) -> Result<WavLock> {
+        self.flush()?;
+        self.file.sync_all().map_err(io(&self.path))?;
+        Ok(WavLock { _file: self.file })
+    }
+}
+
+/// Writes the RIFF and data chunk lengths for `data_bytes` of audio whose
+/// length field is at `data_len_at`.
+fn write_wav_lengths(file: &fs::File, data_len_at: u64, data_bytes: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let too_long = || std::io::Error::other("the take is longer than a WAV file can hold");
+    let data = u32::try_from(data_bytes).map_err(|_| too_long())?;
+    let riff = u32::try_from(data_len_at + 4 - 8 + data_bytes).map_err(|_| too_long())?;
+    file.write_all_at(&riff.to_le_bytes(), 4)?;
+    file.write_all_at(&data.to_le_bytes(), data_len_at)
+}
+
+/// Sets a WAV's lengths from its size on disk, as left by a crash while it
+/// was streamed: the data chunk (the last chunk) runs to the end of the file,
+/// in whole sample frames.
+fn fix_wav_lengths(file: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a WAV file");
+    let read_u32 = |at: u64| -> std::io::Result<u32> {
+        let mut word = [0; 4];
+        file.read_exact_at(&mut word, at)?;
+        Ok(u32::from_le_bytes(word))
+    };
+    let len = file.metadata()?.len();
+    let mut tag = [0; 4];
+    file.read_exact_at(&mut tag, 0)?;
+    let mut wave = [0; 4];
+    file.read_exact_at(&mut wave, 8)?;
+    if &tag != b"RIFF" || &wave != b"WAVE" {
+        return Err(invalid());
+    }
+    let mut at = 12;
+    let mut block_align = None;
+    while at + 8 <= len {
+        file.read_exact_at(&mut tag, at)?;
+        let size = u64::from(read_u32(at + 4)?);
+        if &tag == b"fmt " {
+            let mut align = [0; 2];
+            file.read_exact_at(&mut align, at + 8 + 12)?;
+            block_align = Some(u64::from(u16::from_le_bytes(align)).max(1));
+        } else if &tag == b"data" {
+            let align = block_align.ok_or_else(invalid)?;
+            let data = (len - (at + 8)) / align * align;
+            return write_wav_lengths(file, at + 4, data);
+        }
+        at += 8 + size + size % 2;
+    }
+    Err(invalid())
 }
 
 /// Reads a take as 24-bit-scale samples of its first channel.
@@ -425,7 +606,9 @@ pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
 
 /// Adopts `NNN.wav` files that lack a `recorded` event from their `NNN.json`
 /// (marked `recovered`), completes commits interrupted between renaming the
-/// metadata and the audio, and reports the rest. Never deletes anything.
+/// metadata and the audio, adopts takes whose recording ended without a
+/// commit (a crash: an unlocked `.partial` metadata and audio pair), and
+/// reports the rest. Never deletes anything.
 pub fn repair(dir: &Path) -> Result<RepairReport> {
     let _guard = lock(dir)?;
     let ledger = ledger::read(dir)?;
@@ -441,6 +624,13 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
         }
     }
 
+    for meta in scan(dir)?.partials {
+        if let Some(take) = adopt_partial(dir, &meta)? {
+            adopted.insert(take);
+        }
+    }
+
+    let ledger = ledger::read(dir)?;
     let files = scan(dir)?;
     let mut report = RepairReport {
         partials: files.partials.clone(),
@@ -471,6 +661,61 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
     }
     report.adopted = adopted.into_iter().collect();
     Ok(report)
+}
+
+/// Adopts the take whose partial metadata is `meta` (relative to `dir`)
+/// when its partial audio exists, is not locked by a recording, and holds
+/// audio: fixes the WAV's lengths from its size and publishes it as
+/// `recovered`. The caller holds the project lock.
+fn adopt_partial(dir: &Path, meta: &Path) -> Result<Option<TakeRef>> {
+    let Some(name) = meta.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    if !name.ends_with(".json.partial") {
+        return Ok(None);
+    }
+    let meta = dir.join(meta);
+    let Ok(take_meta) = read_meta(&meta) else {
+        return Ok(None);
+    };
+    let Some(wav_name) = take_meta.partial_wav.as_deref() else {
+        return Ok(None);
+    };
+    if Path::new(wav_name).file_name() != Some(std::ffi::OsStr::new(wav_name))
+        || !wav_name.ends_with(".wav.partial")
+    {
+        return Ok(None);
+    }
+    let wav = meta.with_file_name(wav_name);
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&wav) else {
+        return Ok(None);
+    };
+    // A live recording holds the lock; never touch its files.
+    if file.try_lock().is_err() {
+        return Ok(None);
+    }
+    if fix_wav_lengths(&file)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if !matches!(wav_header(&wav), Ok((_, samples)) if samples > 0) {
+        return Ok(None);
+    }
+    let Some(line) = meta
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+    else {
+        return Ok(None);
+    };
+    let partial = PartialTake {
+        line: line.to_owned(),
+        meta: meta.clone(),
+        wav,
+    };
+    publish_locked(dir, &partial, take_meta.input, true).map(Some)
 }
 
 #[cfg(test)]
@@ -757,19 +1002,116 @@ mod tests {
     }
 
     #[test]
-    fn repair_keeps_partials() {
+    fn repair_keeps_partials_without_a_pair() {
         let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
+        // Metadata whose audio never started, and audio without metadata.
         let partial = begin_take(dir, "hook", &input()).unwrap();
-        write_take_wav(&partial.wav, &[1; 10], 48_000).unwrap();
+        let stray = dir.join("takes/hook/.stray.wav.partial");
+        write_take_wav(&stray, &[1; 10], 48_000).unwrap();
         let report = repair(dir).unwrap();
         let mut expected = vec![
             partial.meta.strip_prefix(dir).unwrap().to_path_buf(),
-            partial.wav.strip_prefix(dir).unwrap().to_path_buf(),
+            stray.strip_prefix(dir).unwrap().to_path_buf(),
         ];
         expected.sort();
         assert_eq!(report.partials, expected);
+        assert!(partial.meta.exists() && stray.exists());
+        assert_eq!(read(dir).unwrap().events, []);
+    }
+
+    #[test]
+    fn partial_wav_streams_and_finishes() {
+        let tmp = crate::testutil::project_tempdir();
+        let path = tmp.path().join("a.wav.partial");
+        let mut wav = PartialWav::create(&path, 48_000).unwrap();
+        let samples: Vec<i32> = (0..10_000).map(|i| (i * 37) % 9_000 - 4_500).collect();
+        for chunk in samples.chunks(512) {
+            wav.write(chunk).unwrap();
+        }
+        assert_eq!(wav.samples(), 10_000);
+        let lock = wav.finish().unwrap();
+        assert_eq!(read_take_wav(&path).unwrap(), (samples, 48_000));
+        drop(lock);
+    }
+
+    #[test]
+    fn partial_wav_is_valid_up_to_the_last_flush() {
+        let tmp = crate::testutil::project_tempdir();
+        let path = tmp.path().join("a.wav.partial");
+        let mut wav = PartialWav::create(&path, 48_000).unwrap();
+        wav.write(&vec![3; 4800]).unwrap();
+        wav.flush().unwrap();
+        wav.write(&vec![4; 2400]).unwrap();
+        let (samples, rate) = read_take_wav(&path).unwrap();
+        assert_eq!((samples.len(), rate), (4800, 48_000));
+        drop(wav);
+    }
+
+    /// Records into a partial take as the window does, then "crashes":
+    /// drops the writer without finishing, after unflushed writes.
+    fn crash_mid_take(dir: &Path) -> PartialTake {
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        let mut wav = PartialWav::create(&partial.wav, 48_000).unwrap();
+        wav.write(&vec![9; 4800]).unwrap();
+        wav.flush().unwrap();
+        wav.write(&vec![8; 2400]).unwrap();
+        drop(wav);
+        partial
+    }
+
+    #[test]
+    fn repair_adopts_a_crashed_partial_take() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        record(dir, "hook", 10);
+        let partial = crash_mid_take(dir);
+
+        let report = repair(dir).unwrap();
+        let take_2 = TakeRef {
+            line: "hook".to_owned(),
+            take: 2,
+        };
+        assert_eq!(report.adopted, vec![take_2]);
+        assert!(report.partials.is_empty(), "{report:?}");
+        assert!(!partial.meta.exists() && !partial.wav.exists());
+        let (samples, _) = read_take_wav(&dir.join("takes/hook/002.wav")).unwrap();
+        assert_eq!(
+            samples.len(),
+            7200,
+            "the header is fixed from the file size"
+        );
+        assert_eq!(&samples[4800..], &vec![8; 2400][..]);
+        let ledger = read(dir).unwrap();
+        let rec = ledger
+            .recorded("hook", 2)
+            .expect("recorded event for take 2");
+        assert!(rec.recovered);
+        assert_eq!(rec.samples, 7200);
+        assert_eq!(rec.snapshot, input().snapshot);
+        assert!(dir.join("takes/hook/002.json").is_file());
+
+        let again = repair(dir).unwrap();
+        assert!(again.adopted.is_empty(), "repair is idempotent");
+    }
+
+    #[test]
+    fn repair_never_adopts_a_live_partial_take() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        let mut wav = PartialWav::create(&partial.wav, 48_000).unwrap();
+        wav.write(&vec![9; 4800]).unwrap();
+        wav.flush().unwrap();
+
+        let report = repair(dir).unwrap();
+        assert_eq!(report.adopted, []);
+        assert_eq!(report.partials.len(), 2, "{report:?}");
         assert!(partial.meta.exists() && partial.wav.exists());
         assert_eq!(read(dir).unwrap().events, []);
+
+        // Once recording ends (here: a crash), the take is adopted.
+        drop(wav);
+        assert_eq!(repair(dir).unwrap().adopted.len(), 1);
     }
 }

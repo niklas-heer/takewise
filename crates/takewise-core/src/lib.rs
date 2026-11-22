@@ -33,8 +33,8 @@ pub use session::{AvailableInput, RECORD_RATE, SessionState, can_record, check_i
 pub use speech::{Analysis, analyze};
 pub use state::{LineState, State, TakeState, fold};
 pub use takes::{
-    Judgment, PartialTake, RecordedInput, RepairReport, TakeRef, begin_take, choose_take,
-    commit_take, judge_take, read_take_wav, repair, write_take_wav,
+    Judgment, PartialTake, PartialWav, RecordedInput, RepairReport, TakeRef, WavLock, begin_take,
+    choose_take, commit_take, judge_take, read_take_wav, repair, update_take_meta, write_take_wav,
 };
 pub use timing::{
     RecordPlan, Timebase, TimebaseHistory, clamp_mark, line_offset_s, pace_fill, plan_take,
