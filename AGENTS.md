@@ -10,7 +10,7 @@ Takewise is a macOS app for recording voiceover narration over a finished film: 
 
 - **Never lose a take.** Takes are only ever added. `takes.jsonl` is append-only; nothing rewrites or deletes takes or ledger events.
 - **Flag, don't decide.** Checks and judgments propose and rank; only the narrator or an explicit `choose` picks a take. Nothing rejects a take on its own.
-- **No monitoring.** The app never plays the microphone input back.
+- **Monitoring only on request.** The app plays the microphone back only when the narrator turns monitoring on, and monitoring never changes what is recorded.
 - **Agents are first-class.** Every state the app shows is readable through the CLI with `--json`; files stay plain TOML, JSONL and WAV.
 
 ## Stack

@@ -27,7 +27,7 @@ Takewise is a small macOS app for exactly that job: speak a script over a finish
 - Retiming the film to the voice. The manifest gives agents the measured timings to do that.
 - Driving Resolve from Takewise. Agents place the export in Resolve with their own Resolve tools.
 - Hearing the previous line's take during pre-roll (later).
-- Loudness normalization or integrated loudness.
+- Loudness control beyond the fixed `clean` export profile (one static gain to −16 LUFS, peaks at −1 dBTP).
 - Windows and Linux. Apple Silicon macOS only.
 
 ## Anti-goals
@@ -59,7 +59,7 @@ kindred-promo.takewise/
   takes/<line-id>/001.json  # the take's recording metadata, written before the WAV is published
   takes.jsonl         # append-only ledger
   .lock               # advisory lock held while writing
-  export/narration.wav
+  export/narration.wav  # or .flac, see "Setup and sound"
   export/manifest.json
 ```
 
@@ -117,7 +117,7 @@ The app, the CLI and agents editing by hand may all touch the folder.
 
 `takes.jsonl` is append-only. Each line is one event: `{"v": 1, "at": RFC 3339, "kind": …, "line": id, "take": n, …}`.
 
-- `recorded`: `file`, `sample_rate`, `samples`, `device`, `channel`, `line_offset_s` (film time of the take's first sample minus the line's start when the take is stopped and committed; negative because capture begins with pre-roll), a `snapshot` of the line at that moment (`text`, `start`, `end`), so a line moved with **M** during the take keeps the take at the film time it was recorded at, and optionally `dropouts`: how many gaps the capture had (buffers arriving later than the previous one ended, by more than 1 ms), each filled with silence so later audio keeps its timing. Takes recorded before it existed, and takes recovered after a crash, have no `dropouts`; readers treat it as unknown.
+- `recorded`: `file`, `sample_rate`, `samples`, `device`, `channel`, `line_offset_s` (film time of the take's first sample minus the line's start when the take is stopped and committed; negative because capture begins with pre-roll), a `snapshot` of the line at that moment (`text`, `start`, `end`), so a line moved with **M** during the take keeps the take at the film time it was recorded at, and optionally `dropouts`: how many gaps the capture had (buffers arriving later than the previous one ended, by more than 1 ms), each filled with silence so later audio keeps its timing. Takes recorded before it existed, and takes recovered after a crash, have no `dropouts`; readers treat it as unknown. Optionally `film_shift_ms`: the take's audio is contiguous and placed by its first sample, so when the film stalled or changed rate after the take started, the largest distance between where the film really was and where the take places it (until the film's end), recorded only when above 5 ms; the window then shows "film stalled during the take; placement may be off by N ms". Absent on takes without a shift and on takes recorded before it existed; readers ignore it when absent.
 - `checked`: `snapshot` checked against (text and slot), transcript with word times, word differences, `speech` (start and end in source seconds, from the energy detector), `overrun_s`, `peak_dbfs`, `clipped_samples`, `noise_floor_dbfs`, `verdict` (`keep`, `retake`, `listen`), `reasons` (list of `{code, message}`), `checker` (whisper model and Takewise version).
 - `judged`: an outside judgment: `snapshot` judged against, `by` (free text, for example `claude-opus-5-5`), `verdict`, optional `score` 0–1, `reason`.
 - `chosen`: `by` (`narrator` or the agent's name).
@@ -128,7 +128,7 @@ Snapshots store the resolved slot end, so moving a neighbour also changes them. 
 
 Takes belong to their line, not to absolute film time. A take's position is `line.start + line_offset_s`, so when the narrator presses **M** or an agent moves a line's `start`, its takes move with it; overrun checks are re-run against the new slot.
 
-Capture starts at the beginning of pre-roll (so the noise floor before speech is recorded) and stops at Space or `tail_s` after the slot's end; when the film ends first (the last line's slot runs to the film's end), it stops `tail_s` of host time after the film reached its end. Space starts capture first; once its first buffer arrives, the film is scheduled to start at least 300 ms ahead (the players need the lead), so a slow input never eats into the pre-roll. From the scheduled start on, the window reads the player's timebase back every frame and records each departure from the mapping in effect (a late start, a stall, a rate change) in the take's timebase history, which places the samples; the prompter and the automatic stop follow the film as it really plays. The loopback calibration (`takewise calibrate`) runs this same start routine, so it measures the window's path. When a line starts less than `preroll_s` into the film, the film holds its first frame during the count-in and starts playing at film time zero; the capture's first samples then have negative film time and are cropped at export.
+Capture starts at the beginning of pre-roll (so the noise floor before speech is recorded) and stops at Space or `tail_s` after the slot's end; when the film ends first (the last line's slot runs to the film's end), it stops `tail_s` of host time after the film reached its end. Space starts capture first; once its first buffer arrives, the film is scheduled to start at least 300 ms ahead (the players need the lead), so a slow input never eats into the pre-roll. From the scheduled start on, the window reads the player's timebase back every frame and records each departure from the mapping in effect (a late start, a stall, a rate change) in the take's timebase history, which places the samples: the first read-back replaces the scheduled mapping for the whole take, count-in included, so a late start moves the take, and the take's first sample is placed with it when the take is committed; the prompter and the automatic stop follow the film as it really plays. The loopback calibration (`takewise calibrate`) runs this same start routine, so it measures the window's path. When a line starts less than `preroll_s` into the film, the film holds its first frame during the count-in and starts playing at film time zero; the capture's first samples then have negative film time and are cropped at export.
 
 The clock mapping is the spike's job to prove. The model: capture buffers carry host timestamps; the player's timebase maps host time to film time. The film time a sample belongs to is the film time *heard by the narrator* when the sound was made, so the mapping must account for both input latency (mic to timestamp) and output latency (player to headphones). The spike establishes which of these the capture timestamp and the player clock already include, so neither is subtracted twice. `latency_offset_ms` is a manual correction set from a loopback test: a film with beeps at known times played through headphones held to the mic; the recorded beeps must land at their film times within ±20 ms, including at film time zero and after repeated seeks. A clap test is not sufficient. Bluetooth headphones are not supported for recording; `doctor` warns when the output device is Bluetooth.
 
@@ -151,7 +151,7 @@ The clock mapping is the spike's job to prove. The model: capture buffers carry 
 ```
 
 - The current line is large; the next line is dimmed below it. A bar shows the slot running out, and the words fill from left to right at an even pace across the slot (karaoke-style pace guide, by character count; Niklas's original idea, kept because it is small). A level meter shows the input.
-- **Record (Space):** the film starts `preroll_s` before the line's start; a 3-2-1 count-in shows on screen; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is never monitored.
+- **Record (Space):** the film starts `preroll_s` before the line's start; a 3-2-1 count-in shows on screen; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is monitored only when the narrator has turned monitoring on.
 - **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…". The top-ranked take gets a hollow star (proposed); a chosen take gets a filled one.
 - **Enter** chooses the selected take, **R** records another, **P** plays the line in context (pre-roll, take, tail) with the selected take locked to the film, **↑/↓** move between lines and **←/→** between takes.
 - **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place; the draft belongs to the line and the `script.toml` version it was begun on, so a script changed meanwhile refuses it, and a line removed meanwhile is never replaced by another. Both write `script.toml` as described above.
@@ -193,7 +193,7 @@ One binary, `takewise`. Every command takes the project directory and supports `
 
 ## Export and Resolve handoff
 
-`narration.wav` is 48 kHz mono 24-bit PCM, starting at film time zero and exactly as long as the film.
+`narration.wav` is mono PCM, starting at film time zero and exactly as long as the film; 48 kHz 24-bit WAV with `raw` processing, otherwise as set in `[export]` (see "Setup and sound").
 
 For each line, the chosen take is used; a line without one makes `export` fail with the line ids, unless `--use-proposed` uses the proposed take (the manifest records `by: "proposed"`), which it refuses with `no-acceptable-take` when that take's effective verdict is `retake`; a line with no takes at all always fails. A used take in which no speech is detected also fails export, naming the line. A used take recorded against different text than the line has now is exported, with a `recorded-against-old-text` warning in the manifest (and a notice in `status`). From the take, the source range is its speech, extended by 150 ms on either side and clipped to the take. A source sample `i` lands at destination sample `round((line.start + line_offset_s) × 48000) + i`; trimming never shifts the speech. Ranges are cropped to `[0, film length)`; a take whose speech (without the margin) lies entirely outside that range fails export with `speech-outside-film`, and one whose speech lies partly outside is exported with a `speech-cropped` warning in the manifest that gives the unclamped speech times (the line's `speech_film_s` is clamped to the film). When two lines' destination ranges overlap, export fails and names both lines, so the narrator can choose another take or move a start. Each placed range gets 10 ms fades.
 
@@ -201,7 +201,7 @@ Export holds the project lock while it reads and folds the project and writes bo
 
 `manifest.json` lists the film (path, duration, size, modified), the WAV it describes (`narration`: file, size, SHA-256) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and, once milestone 3 adds transcription, word times in film seconds.
 
-For Resolve, an agent imports `narration.wav` onto a new audio track at the timeline start, or places the individual takes at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the WAV against the loopback beeps and imports it into Resolve once.
+For Resolve, an agent imports `narration.wav` onto a new audio track at the timeline start, or places the individual takes (always the raw originals) at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the WAV against the loopback beeps and imports it into Resolve once.
 
 ## Architecture
 
@@ -215,7 +215,7 @@ The media path below was proven by the milestone 0 spike on 2026-11-22 (decision
 
 **Playback.** AVPlayer plays the film. `AVPlayerItemVideoOutput` delivers NV12 full-range `CVPixelBuffer`s (Metal-compatible, IOSurface-backed), polled once per frame and drawn with GPUI's `surface()` element; text draws on top of it. A second AVPlayer started at the same host time plays a take locked to the film (within 0.01 ms in the spike).
 
-**Capture.** cpal opens an input stream only (so the mic can never be monitored) on the named device and takes one channel. Each buffer's film time is `timebase(callback_host_time + i / sample_rate − L_in) + latency_offset_ms`, where `L_in` is the device's input latency plus safety offset plus stream latency from CoreAudio (`objc2-core-audio`). cpal's own capture timestamp is not used, because it leaves out the stream latency. AVPlayer's clock already accounts for output latency, so it is not subtracted. Changes of the player timebase (seeks, rate changes) are kept as a history, so a buffer is mapped with the timebase that was valid when it was captured. For a start scheduled at a later host time, the player's own timebase stays stopped until that moment, so the history takes the scheduled mapping (film time at the start host time, rate 1) from the call on; once playing, the player's timebase matches it within 0.02 ms. Before the first take after opening, the film plays briefly muted, so a cold output device does not shift the first take.
+**Capture.** cpal opens an input stream on the named device and takes one channel; optional monitoring taps this stream (see "Setup and sound") and never opens a second capture. Each buffer's film time is `timebase(callback_host_time + i / sample_rate − L_in) + latency_offset_ms`, where `L_in` is the device's input latency plus safety offset plus stream latency from CoreAudio (`objc2-core-audio`). cpal's own capture timestamp is not used, because it leaves out the stream latency. AVPlayer's clock already accounts for output latency, so it is not subtracted. Changes of the player timebase (seeks, rate changes) are kept as a history, so a buffer is mapped with the timebase that was valid when it was captured. For a start scheduled at a later host time, the player's own timebase stays stopped until that moment, so the history takes the scheduled mapping (film time at the start host time, rate 1) from the call on; once playing, the player's timebase matches it within 0.02 ms. Before the first take after opening, the film plays briefly muted, so a cold output device does not shift the first take.
 
 **Calibration.** One loopback measures only the total of input and output latency, so `latency_offset_ms` is calibrated per device pair with the loopback test. In the spike, beeps landed 31.5 ms late (standard deviation 0.01 ms) on the MacBook's speakers and mic, at film time 0.1 s and after seeks; CoreAudio's reported latencies alone left −19.5 ms, a calibrated offset under 1 ms. `takewise calibrate --write` stores the offset only when every detected beep landed within 20 ms of the mean error; otherwise it refuses (exit 1, `inconsistent-beeps`) and leaves `latency_offset_ms` as it is.
 
@@ -225,43 +225,79 @@ The media path below was proven by the milestone 0 spike on 2026-11-22 (decision
 
 ## Setup and sound
 
-Added 2026-11-23 at Niklas's request. The aim is outcomes good enough to use without post-production, while staying easy: the app guides the narrator to a good setup instead of expecting audio knowledge.
+Added 2026-11-23 at Niklas's request and revised after council review (Claude Fable 5.2: 6/10, GPT Sol 6.2: 7/10). The aim is outcomes good enough to use without post-production, while staying easy: the app guides the narrator to a good setup instead of expecting audio knowledge.
 
-**Audio panel** (toggled with **A**, usable while the film plays): input device, input channel and output device as pickers. Every channel of the selected input shows its own live meter, so the channel that carries the mic is obvious. Film volume and monitor volume are sliders, also on keys (**-**/**=** film, **Shift-** and **Shift=** monitor), and can change during a take. Device choices are saved in `project.toml`; the last choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`.
+### Settings schema
 
-**Monitoring.** Off by default; **H** toggles it. When on, the mic plays to the output with the smallest buffer the device allows, and the panel shows the resulting delay in milliseconds. When the input device offers hardware monitoring (the RØDECaster does, with no delay), the panel says so and recommends it instead. Monitoring never changes what is recorded.
-
-**Meters.** The input meter shows peak with a 1.5 s hold, a shaded target band from −18 to −6 dBFS, and a clip light that turns red at −0.5 dBFS and stays red until clicked or until the next take starts. A take that clipped says so in its row.
-
-**Long lines.** Up to three lines of text show at full size. A longer line scrolls smoothly so that the words under the pace fill stay on the middle row.
-
-**Setup check** (**C**, offered when a project is first opened and when the input or output device changes):
-
-1. *Devices:* choose input, channel and output; Bluetooth output and inputs not at 48 kHz are flagged.
-2. *Room:* five seconds of silence. Reports the noise floor (quiet below −60 dBFS, acceptable to −50, noisy above) and mains hum (strong peaks at 50 or 60 Hz and their harmonics), with tips.
-3. *Voice:* the narrator reads a test sentence. Reports peak and average level and any clipping, and suggests a gain change in dB so peaks land near −10 dBFS; flags plosives (bursts of energy below 120 Hz, "turn the mic slightly off-axis or add a pop filter") and proximity boom (a high ratio of energy below 200 Hz to 200 Hz–4 kHz, "move a little further from the mic").
-4. *Clarity (optional):* the test sentence is transcribed and compared with the text.
-5. *Latency (optional):* the loopback calibration, offered when the device pair has no calibration yet.
-
-Results are saved under `[setup]` in `project.toml` with the date and the devices, and `takewise status` shows when the setup was last checked and whether the devices still match.
-
-**Noise per take.** A `checked` event records the take's noise floor (already measured). A new verdict rule after rule 6: a noise floor above −50 dBFS gives `listen` ("background noise at −46 dBFS").
-
-**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed.
-
-**Export cleanup and formats.** Takes are always recorded as 48 kHz, 24-bit WAV, the lossless original, and are never modified. Export settings live in `[export]` in `project.toml` and can be overridden on the command line:
+New tables in `project.toml`; a project without them behaves as before (no monitoring, `raw` export):
 
 ```toml
+[output]
+device = "RODECaster Duo Main Stereo"   # where film audio and monitoring play
+
+[monitor]
+enabled = false
+volume_db = -6.0
+
+[calibration]                            # which device pair `input.latency_offset_ms` was measured on
+input = "RODECaster Duo Main Stereo"
+output = "RODECaster Duo Main Stereo"
+date = "2026-11-23"
+
 [export]
 format = "wav"        # wav or flac
 bit_depth = 24        # 16 or 24
 sample_rate = 48000   # 48000 or 44100
-processing = "clean"  # raw or clean
-loudness_lufs = -16.0 # target integrated loudness for clean
-true_peak_db = -1.0
+processing = "clean"  # raw or clean; new projects default to clean
+
+[setup]               # written by the setup check
+date = "2026-11-23"
+input = "RODECaster Duo Main Stereo"
+channel = 1
+output = "RODECaster Duo Main Stereo"
+room_floor_dbfs = -68.0
+speech_to_noise_db = 46.0
 ```
 
-`clean` applies, per take, a high-pass at 80 Hz and noise reduction using the noise floor measured in that take's pre-roll, then normalizes the whole narration to the target loudness with a true-peak limit (two-pass loudness measurement). It runs through `ffmpeg` filters, which Takewise already needs. `raw` is the current behaviour. The manifest records the profile used and the measured loudness. Sample positions in the manifest refer to the exported file's sample rate.
+When the input or output differs from `[calibration]`, `status` and the window warn that the latency calibration is stale. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`. Device and route changes take effect between takes, never during one.
+
+### Recording screen additions (milestone 4a)
+
+**Audio panel** (toggled with **A**, usable while the film plays): input device, input channel and output device as pickers. Every channel of the selected input shows its own live meter, so the channel that carries the mic is obvious. A missing device is explained in plain words ("RODECaster Duo is not connected. Connect it or pick another input."). An input not at 48 kHz offers a "Switch to 48 kHz" button (sets the device's nominal rate through CoreAudio). Film volume and monitor volume are sliders and also keys that match the typed character, so they work on QWERTY and QWERTZ alike: `-` and `+` for the film, `,` and `.` for the monitor. They can change during a take.
+
+**Monitoring** (**H**, also a visible toggle in the panel). Off by default. When on, the existing capture callback also writes into a ring buffer that an output stream plays at `monitor.volume_db`; monitoring never opens a second capture and never changes the buffer size of the capture stream, which is fixed per session (128 frames) so calibration stays valid. In v1 monitoring requires the input and output to be the same device (a shared clock, such as the RØDECaster's mic and headphone outputs); with different devices the toggle explains why it is unavailable. The panel shows the estimated mic-to-ear delay (input latency + buffer + output latency, labeled as an estimate) and warns above 15 ms, which rules out the built-in mic (about 50 ms). Monitoring is refused while the output is the built-in speakers (feedback). Because CoreAudio cannot tell whether an interface monitors in hardware, the panel always shows a hint: "If your interface has direct monitoring, use it instead and leave this off, or you will hear yourself twice." A monitoring failure mutes only the monitor; recording continues.
+
+**Meters.** The input meter shows peak with a 1.5 s hold and a shaded target band from −18 to −6 dBFS. A "near clipping" light turns red at −1 dBFS and stays red until **K** or the next take; a take whose samples reached −0.1 dBFS is marked "clipped" in its row (the verdict rule's threshold).
+
+**Long lines.** Up to three lines of text show at full size. A longer line scrolls smoothly so that the words under the pace fill stay on the middle row; the first and last rows hold still, and a retake starts from the top again.
+
+### Setup check (milestone 4b)
+
+**C**, offered when a project is first opened and when the input or output device changes. Steps:
+
+1. *Devices:* input, channel and output, as in the panel. Bluetooth output and the built-in speakers are flagged ("film sound from speakers will leak into your takes; use wired headphones").
+2. *Voice:* the narrator reads a test sentence shown on screen. Reports peak and average speech level and any clipping, and suggests a gain change in dB on the interface so peaks land near −10 dBFS. Hints, not verdicts: plosives (bursts of energy below 80 Hz, "turn the mic slightly off-axis or add a pop filter") and boom (much more energy below 200 Hz than in 200 Hz–4 kHz, "if you sound boomy, move a little further from the mic"; tuned on Niklas's voice at known distances).
+3. *Room:* five seconds of silence. Reports the room's noise floor and the speech-to-noise ratio against step 2's speech level: 40 dB or more is good, 30–40 dB acceptable, below 30 dB noisy, with tips. Mains hum is flagged when narrow peaks at 50 or 60 Hz *and* at least two harmonics stand clearly above neighbouring frequencies for the whole recording. The recording is kept as the session's room tone (`takes/.room.wav`) for noise reduction.
+4. *Latency (optional):* the loopback calibration, offered when `[calibration]` does not match the current device pair.
+
+Results are saved in `[setup]`.
+
+**Noise per take.** A new verdict rule after rule 6: a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
+
+**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed.
+
+### Export cleanup and formats (milestone 4b)
+
+Takes are always recorded as 48 kHz, 24-bit WAV, the lossless original, and are never modified. Export follows `[export]`, overridable with `takewise export --format … --bit-depth … --sample-rate … --processing …`. The file is `export/narration.wav` or `export/narration.flac`.
+
+`clean` works in this order, all at 48 kHz until the last step:
+
+1. Each used take, whole, through a high-pass at 80 Hz and gentle noise reduction (`afftdn`, fixed reduction of 10 dB, noise floor from the session's room tone). Noise reduction is skipped when there is no room tone or the room tone is digital silence (a gated interface). A click fixture proves the filters add no delay, or the delay is measured and compensated, so `clean` places speech exactly where `raw` does.
+2. Placement, fades and cropping in Rust, as for `raw`.
+3. Loudness: measure integrated loudness and true peak of the assembled narration (`ebur128`), then apply one static gain: the smaller of the gain to reach −16 LUFS and the gain that keeps true peak at −1 dBTP. No dynamic normalization. The achieved loudness and true peak are recorded in the manifest, measured on the final encoded file.
+4. Resampling to 44.1 kHz (once, for the whole narration) and dither when writing 16-bit.
+
+`raw` skips steps 1 and 3 and needs no `ffmpeg` unless resampling or FLAC is requested; `doctor` checks `ffmpeg`. The manifest states `sample_rate` of the export file and `source_sample_rate` (48000) of the takes: source ranges stay in take samples at 48 kHz, destination ranges are in export samples (`round(n × rate / 48000)`), and film seconds are authoritative.
 
 ## Milestones
 
@@ -269,7 +305,7 @@ true_peak_db = -1.0
 1. **Core and CLI:** format, validation, lock and write protocol, ledger and folding, the energy speech detector, `init` (film info through `ffprobe`), `status`, `script set`, `choose`, `judge`, `export`, and `doctor` limited to tools, model and film (devices arrive with milestone 2); tests with fixtures.
 2. **Recording window:** the screen above on the spike's media path: record, play in context, choose, mark start, edit text, level meter. After this milestone Niklas can narrate a film; agents can judge takes from the folder.
 3. **Checks:** whisper-cli integration, alignment, verdict rules, ranking, `check`; thresholds tuned on real takes; verdicts in the window.
-4. **Setup and sound:** the audio panel, optional monitoring, meters with clip lights, scrolling long lines, the setup check, the noise rule, export cleanup and export formats (section "Setup and sound").
+4. **Setup and sound** (section "Setup and sound"): 4a the audio panel, monitoring, meters and scrolling; 4b the setup check, the noise rule, export cleanup and formats. 4a starts with a short spike proving monitoring on the RØDECaster with wired headphones.
 5. **Ship:** app bundle, README with the Resolve recipe, agent instructions.
 
 ## Constraints
