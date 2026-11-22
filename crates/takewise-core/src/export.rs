@@ -260,16 +260,17 @@ fn place(
 ) -> std::result::Result<Placed, (&'static str, &'static str)> {
     let rate = project.config.sample_rate;
     let line_state = state.lines.iter().find(|l| l.id == line.id);
+    // `fallback`: no choice, so the proposed take stands in for one.
     let choice = line_state.and_then(|ls| match (&ls.chosen, ls.proposed) {
-        (Some((take, by)), _) => Some((*take, by.clone())),
-        (None, Some(take)) if use_proposed => Some((take, "proposed".to_owned())),
+        (Some((take, by)), _) => Some((*take, by.clone(), false)),
+        (None, Some(take)) if use_proposed => Some((take, "proposed".to_owned(), true)),
         _ => None,
     });
-    let (take_no, by) = choice.ok_or(("no-choice", "lines without a chosen take"))?;
+    let (take_no, by, fallback) = choice.ok_or(("no-choice", "lines without a chosen take"))?;
     let take = line_state
         .and_then(|ls| ls.takes.iter().find(|t| t.take == take_no))
         .ok_or(("missing-file", "chosen takes that were never recorded"))?;
-    if by == "proposed" && take.effective == Some(Verdict::Retake) {
+    if fallback && take.effective == Some(Verdict::Retake) {
         return Err((
             "no-acceptable-take",
             "lines whose best take is marked retake; choose one explicitly or record another",
@@ -671,6 +672,25 @@ mod tests {
         assert_eq!(refused_codes(&report), vec!["no-acceptable-take"]);
         assert_eq!(report.refused[0].lines, vec!["hook".to_owned()]);
         assert!(!dir.join("export/narration.wav").exists());
+    }
+
+    #[test]
+    fn explicit_choice_by_proposed_is_exported_like_any_choice() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        let judgment = crate::takes::Judgment {
+            by: "claude".to_owned(),
+            verdict: crate::ledger::Verdict::Retake,
+            score: None,
+            reason: "rushed".to_owned(),
+        };
+        crate::takes::judge_take(&dir, "hook", t.take, judgment).unwrap();
+        crate::takes::choose_take(&dir, "hook", t.take, "proposed").unwrap();
+        for use_proposed in [false, true] {
+            let report = run(&dir, use_proposed);
+            assert_eq!(report.refused, [], "use_proposed = {use_proposed}");
+            assert_eq!(report.lines[0].chosen_by, "proposed");
+        }
     }
 
     #[test]
