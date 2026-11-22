@@ -61,6 +61,8 @@ pub struct TakeState {
     pub speech: Option<(f64, f64)>,
     /// The take's WAV is not on disk.
     pub missing: bool,
+    /// The take was recorded against different text than the line has now.
+    pub recorded_against_old_text: bool,
 }
 
 // serde's `serialize_with` hands the field over by reference.
@@ -170,6 +172,7 @@ fn fold_take(
         stale_check,
         speech: latest_checked.and_then(|c| c.speech),
         missing: !project.dir.join(&rec.file).is_file(),
+        recorded_against_old_text: rec.snapshot.text != current.text,
     };
     let rank = Rank {
         take,
@@ -254,8 +257,8 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
     }
 }
 
-/// A missing chosen take file is a problem; a missing other take and a
-/// stale chosen take are notices.
+/// A missing chosen take file is a problem; a missing other take, a stale
+/// chosen take and one recorded against older text are notices.
 fn take_findings(
     line: &str,
     takes: &[TakeState],
@@ -275,6 +278,16 @@ fn take_findings(
                 Some(line),
                 "missing-file",
                 format!("{whose} {} ({}) is missing", take.take, take.file),
+            ));
+        }
+        if is_chosen && take.recorded_against_old_text {
+            notices.push(Problem::new(
+                Some(line),
+                "recorded-against-old-text",
+                format!(
+                    "the chosen take {} was recorded against different text than the line has now",
+                    take.take
+                ),
             ));
         }
         if is_chosen && take.stale_check {
@@ -687,6 +700,30 @@ text = "Today we start."
                 .notices
                 .iter()
                 .any(|n| n.code == "stale-chosen" && n.line.as_deref() == Some("hook")),
+            "{:?}",
+            state.notices
+        );
+    }
+
+    #[test]
+    fn chosen_take_recorded_against_old_text_is_a_notice() {
+        let (_tmp, project) = setup(TWO_LINES);
+        recorded(&project, "hook", 1);
+        fs::create_dir_all(project.dir.join("takes/hook")).unwrap();
+        crate::takes::write_take_wav(&project.dir.join("takes/hook/001.wav"), &[0; 10], 48_000)
+            .unwrap();
+        chosen(&project, "hook", 1, "narrator");
+        assert!(fold_now(&project).notices.is_empty());
+        set_line_field(&project.dir, "hook", Field::Text("Hi.".to_owned()), None).unwrap();
+        let state = fold_now(&project);
+        assert!(line(&state, "hook").takes[0].recorded_against_old_text);
+        assert!(state.problems.is_empty(), "{:?}", state.problems);
+        assert!(
+            state
+                .notices
+                .iter()
+                .any(|n| n.code == "recorded-against-old-text"
+                    && n.line.as_deref() == Some("hook")),
             "{:?}",
             state.notices
         );

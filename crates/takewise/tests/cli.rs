@@ -209,6 +209,27 @@ fn choose_then_export_writes_wav_and_manifest() {
     assert_eq!(manifest["lines"][0]["id"], "hook");
     assert_eq!(manifest["lines"][0]["chosen_by"], "claude");
     assert_eq!(value["data"]["lines"][0]["take_file"], "takes/hook/001.wav");
+    assert_eq!(value["data"]["warnings"], Value::Array(Vec::new()));
+
+    // After a text edit the take still exports, with a warning.
+    takewise()
+        .args(["script", "set"])
+        .arg(&dir)
+        .args(["hook", "--text", "Hi there."])
+        .assert()
+        .success();
+    let (code, value) = json(takewise().arg("export").arg(&dir));
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(
+        value["data"]["warnings"][0]["code"],
+        "recorded-against-old-text"
+    );
+    takewise()
+        .arg("export")
+        .arg(&dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recorded-against-old-text"));
 
     takewise()
         .arg("choose")

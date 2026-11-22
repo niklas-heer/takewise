@@ -478,16 +478,20 @@ fn export(dir: &Path, use_proposed: bool) -> Result<Outcome, CliError> {
     let report = tw::export(&project, &state, &ExportOptions { use_proposed })?;
     if report.refused.is_empty() {
         let narration = dir.join("export/narration.wav");
-        let text = format!(
-            "Wrote {} ({} line(s))",
+        let mut text = format!(
+            "Wrote {} ({} line(s))\n",
             narration.display(),
             report.lines.len()
         );
+        for w in &report.warnings {
+            let _ = writeln!(text, "warning: {}: {} ({})", w.line, w.message, w.code);
+        }
         return Ok(Outcome::new(
             json!({
                 "narration": narration,
                 "manifest": dir.join("export/manifest.json"),
                 "lines": report.lines,
+                "warnings": report.warnings,
             }),
             text,
         ));

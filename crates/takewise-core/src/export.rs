@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, rename_temp, write_temp};
+use crate::ledger::Verdict;
 use crate::project::Project;
 use crate::script::{Line, validate};
 use crate::speech::analyze;
@@ -35,6 +36,15 @@ pub struct ExportReport {
     pub lines: Vec<ManifestLine>,
     /// Why nothing was written; empty on success.
     pub refused: Vec<Refusal>,
+    /// Exported, but worth a look; also listed in the manifest.
+    pub warnings: Vec<ExportWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportWarning {
+    pub code: &'static str,
+    pub line: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -67,6 +77,7 @@ struct Manifest<'a> {
     narration: ManifestNarration,
     sample_rate: u32,
     lines: &'a [ManifestLine],
+    warnings: &'a [ExportWarning],
 }
 
 #[derive(Serialize)]
@@ -92,6 +103,8 @@ struct Placed {
     /// Source start and destination start and end, after cropping.
     src: usize,
     dest: (usize, usize),
+    /// The take was recorded against different text than the line has now.
+    old_text: bool,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -162,6 +175,7 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
         return Ok(ExportReport {
             lines: Vec::new(),
             refused,
+            warnings: Vec::new(),
         });
     }
 
@@ -184,6 +198,7 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
         }
     };
 
+    let warnings = warnings(&placed);
     let lines: Vec<ManifestLine> = placed.into_iter().map(|p| p.line).collect();
     let info = &project.config.film_info;
     let manifest = Manifest {
@@ -197,6 +212,7 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
         narration,
         sample_rate: rate,
         lines: &lines,
+        warnings: &warnings,
     };
     let manifest_path = dir.join(MANIFEST_FILE);
     let manifest_temp = match write_manifest(&manifest_path, &manifest) {
@@ -216,6 +232,7 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
     Ok(ExportReport {
         lines,
         refused: Vec::new(),
+        warnings,
     })
 }
 
@@ -238,6 +255,12 @@ fn place(
     let take = line_state
         .and_then(|ls| ls.takes.iter().find(|t| t.take == take_no))
         .ok_or(("missing-file", "chosen takes that were never recorded"))?;
+    if by == "proposed" && take.effective == Some(Verdict::Retake) {
+        return Err((
+            "no-acceptable-take",
+            "lines whose best take is marked retake; choose one explicitly or record another",
+        ));
+    }
     let (samples, take_rate) = read_take_wav(&project.dir.join(&take.file))
         .map_err(|_| ("missing-file", "take files that are missing or unreadable"))?;
     if take_rate != rate {
@@ -298,7 +321,23 @@ fn place(
         samples,
         src: src0,
         dest: (dest0, dest1),
+        old_text: take.recorded_against_old_text,
     })
+}
+
+fn warnings(placed: &[Placed]) -> Vec<ExportWarning> {
+    placed
+        .iter()
+        .filter(|p| p.old_text)
+        .map(|p| ExportWarning {
+            code: "recorded-against-old-text",
+            line: p.line.id.clone(),
+            message: format!(
+                "{} was recorded against different text than the line has now",
+                p.line.take_file
+            ),
+        })
+        .collect()
 }
 
 fn overlaps(placed: &[Placed]) -> Vec<Refusal> {
@@ -594,6 +633,55 @@ mod tests {
         assert_eq!(report.lines[0].take_file, "takes/hook/002.wav");
         let at = onset(&narration(&dir));
         assert!(at.abs_diff(504_000) <= 480, "onset at {at}");
+    }
+
+    #[test]
+    fn use_proposed_refuses_a_line_whose_best_take_is_retake() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        for _ in 0..2 {
+            let t = take(&dir, "hook", Some((2.0, 3.0)));
+            let judgment = crate::takes::Judgment {
+                by: "claude".to_owned(),
+                verdict: crate::ledger::Verdict::Retake,
+                score: None,
+                reason: "rushed".to_owned(),
+            };
+            crate::takes::judge_take(&dir, "hook", t.take, judgment).unwrap();
+        }
+        let project = Project::open(&dir).unwrap();
+        let state = fold(&project, &ledger::read(&dir).unwrap());
+        assert_eq!(
+            state.lines[0].proposed,
+            Some(2),
+            "still proposed for display"
+        );
+        let report = run(&dir, true);
+        assert_eq!(refused_codes(&report), vec!["no-acceptable-take"]);
+        assert_eq!(report.refused[0].lines, vec!["hook".to_owned()]);
+        assert!(!dir.join("export/narration.wav").exists());
+    }
+
+    #[test]
+    fn take_recorded_against_old_text_is_exported_with_a_warning() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        set_line_field(&dir, "hook", Field::Text("Hi there.".to_owned()), None).unwrap();
+        let report = run(&dir, false);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert_eq!(report.warnings[0].code, "recorded-against-old-text");
+        assert_eq!(report.warnings[0].line, "hook");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["warnings"][0]["code"], "recorded-against-old-text");
+        assert_eq!(manifest["warnings"][0]["line"], "hook");
+
+        // A take recorded against the current text carries no warning.
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        assert!(run(&dir, false).warnings.is_empty());
     }
 
     #[test]

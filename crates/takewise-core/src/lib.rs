@@ -16,7 +16,7 @@ mod testutil;
 
 pub use edit::{Field, ScriptVersion, script_version, set_film_info, set_line_field};
 pub use error::{Error, Result};
-pub use export::{ExportOptions, ExportReport, ManifestLine, Refusal, export};
+pub use export::{ExportOptions, ExportReport, ExportWarning, ManifestLine, Refusal, export};
 pub use fsutil::{ProjectLock, lock, write_atomic};
 pub use ledger::{
     Checked, Chosen, Event, EventKind, Judged, Ledger, Reason, Recorded, Snapshot, Verdict, Word,
