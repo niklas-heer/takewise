@@ -354,6 +354,12 @@ impl PartialWav {
         Ok(())
     }
 
+    /// Stops writing (after a failed write) but keeps the file locked, so
+    /// nothing adopts it before the take is written again from memory.
+    pub fn into_lock(self) -> WavLock {
+        WavLock { _file: self.file }
+    }
+
     /// Flushes and fsyncs the file; it stays locked until the returned
     /// guard is dropped (after `commit_take`).
     pub fn finish(mut self) -> Result<WavLock> {

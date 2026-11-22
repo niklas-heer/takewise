@@ -14,6 +14,7 @@ mod takes;
 mod tests;
 mod video;
 mod watch;
+mod writer;
 
 use std::path::{Path, PathBuf};
 
@@ -222,9 +223,33 @@ impl RecordingWindow {
             subscriptions: vec![on_quit],
         };
         view.after_reload(None);
+        view.recover();
         view.check_inputs();
         view.park();
         view
+    }
+
+    /// Adopts takes left by a recording that ended without a commit (a
+    /// crash), as `takewise status --repair` would.
+    fn recover(&mut self) {
+        match tw::repair(&self.dir) {
+            Ok(report) if !report.adopted.is_empty() => {
+                let takes: Vec<String> = report
+                    .adopted
+                    .iter()
+                    .map(|t| format!("{} take {}", t.line, t.take))
+                    .collect();
+                self.reload();
+                self.message = Some(format!(
+                    "Recovered {} from an interrupted recording.",
+                    takes.join(", ")
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.message = Some(format!("Could not look for interrupted takes: {err}"));
+            }
+        }
     }
 
     /// Ends whatever runs: commits a take in progress (if it has audio),
@@ -232,6 +257,10 @@ impl RecordingWindow {
     fn shutdown(&mut self) {
         if self.recorder.is_recording() {
             self.finish_take();
+        }
+        if self.recorder.has_unsaved() {
+            let update = self.recorder.save_unsaved_now(&self.dir);
+            self.show(update);
         }
         self.recorder.stop_playback(&mut *self.media);
         self.recorder.keep_meter(&mut *self.media, None);
@@ -349,10 +378,8 @@ impl RecordingWindow {
     }
 
     fn finish_take(&mut self) {
-        match self.recorder.finish_take(&mut *self.media, &self.dir) {
-            Ok(committed) => self.took(committed),
-            Err(err) => self.message = Some(err),
-        }
+        let update = self.recorder.finish_take(&mut *self.media, &self.dir);
+        self.show(update);
     }
 
     fn took(&mut self, committed: Option<TakeRef>) {
@@ -393,6 +420,11 @@ impl RecordingWindow {
                 .map(|(device, channel)| (device.as_str(), *channel)),
         );
         let update = self.recorder.tick(&mut *self.media, &self.dir);
+        self.show(update);
+    }
+
+    /// Shows what the recorder reports and selects a committed take.
+    fn show(&mut self, update: recorder::Update) {
         if let Some(message) = update.message {
             self.message = Some(message);
         }

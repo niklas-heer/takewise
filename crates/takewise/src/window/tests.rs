@@ -27,6 +27,9 @@ struct Fake {
     now: f64,
     inputs: Vec<AvailableInput>,
     sink: Option<Sender<CaptureBuffer>>,
+    /// Buffers sent to the current capture.
+    sent: u64,
+    capture_error: Option<String>,
     /// Every `film_play_at` call: (`film_s`, `host_s`).
     plays: Vec<(f64, f64)>,
 }
@@ -46,6 +49,8 @@ impl FakeMedia {
                 })
                 .collect(),
             sink: None,
+            sent: 0,
+            capture_error: None,
             plays: Vec::new(),
         })))
     }
@@ -57,13 +62,18 @@ impl FakeMedia {
     /// Delivers a buffer of `len` samples whose first sample has callback
     /// host time `host_s`, as the capture would.
     fn send(&self, host_s: f64, len: usize) {
-        let fake = self.0.borrow();
+        let mut fake = self.0.borrow_mut();
         let sink = fake.sink.as_ref().expect("a capture is running");
         sink.send(CaptureBuffer {
             host_time_s: host_s,
             samples: vec![100_000; len],
         })
         .expect("the window receives");
+        fake.sent += 1;
+    }
+
+    fn sent(&self) -> u64 {
+        self.0.borrow().sent
     }
 
     fn capturing(&self) -> bool {
@@ -110,13 +120,15 @@ impl Media for FakeMedia {
             return Err(format!("no input device named {device:?}"));
         }
         fake.sink = Some(sink);
+        fake.sent = 0;
+        fake.capture_error = None;
         Ok(())
     }
     fn stop_capture(&mut self) {
         self.0.borrow_mut().sink = None;
     }
     fn capture_error(&self) -> Option<String> {
-        None
+        self.0.borrow().capture_error.clone()
     }
     fn open_take(&mut self, _: &Path) -> Result<(), String> {
         Ok(())
@@ -181,7 +193,17 @@ fn project(device: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 fn open(cx: &mut TestAppContext, inputs: &[(&str, u32)]) -> Fixture {
+    open_with(cx, inputs, |_| {})
+}
+
+/// Opens the window after `prepare` ran on the new project.
+fn open_with(
+    cx: &mut TestAppContext,
+    inputs: &[(&str, u32)],
+    prepare: impl FnOnce(&Path),
+) -> Fixture {
     let (tmp, dir) = project(DEVICE);
+    prepare(&dir);
     let media = FakeMedia::new(inputs);
     let loaded = load(&dir).expect("load");
     let window_dir = dir.clone();
@@ -249,6 +271,39 @@ fn start_of(dir: &Path, id: &str) -> f64 {
     let project = Project::open(dir).expect("project");
     let line = project.script.lines.iter().find(|line| line.id == id);
     line.expect("line").start
+}
+
+/// Waits (on the real clock) until `done` holds for the window, such as
+/// the take writer having received every buffer sent.
+fn wait_for(
+    cx: &mut TestAppContext,
+    view: &Entity<RecordingWindow>,
+    done: impl Fn(&RecordingWindow) -> bool,
+) {
+    for _ in 0..2000 {
+        if view.read_with(cx, |view, _| done(view)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("timed out waiting for the window");
+}
+
+/// Waits until the take writer received every buffer sent.
+fn settle(cx: &mut TestAppContext, f: &Fixture) {
+    let sent = f.media.sent();
+    wait_for(cx, &f.view, |view| {
+        view.recorder.progress().is_some_and(|p| p.buffers >= sent)
+    });
+}
+
+/// The take's partial WAV while it is recorded.
+fn partial_wav(dir: &Path, line: &str) -> Option<PathBuf> {
+    fs::read_dir(dir.join("takes").join(line))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".wav.partial"))
 }
 
 fn message(cx: &mut TestAppContext, view: &Entity<RecordingWindow>) -> String {
@@ -513,4 +568,130 @@ fn recorded_input_round_trips(cx: &mut TestAppContext) {
         assert_eq!(view.line_state().map(|line| line.takes.len()), Some(1));
         assert_eq!(view.take, Some(1));
     });
+}
+
+#[gpui_kit::test]
+fn a_live_take_is_streamed_to_disk_and_never_adopted(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.2, 48_000);
+    f.media.send(101.2, 4800);
+    settle(cx, &f);
+    f.media.set_now(101.3);
+    frame(cx, f.window); // places the take and begins it on disk
+    wait_for(cx, &f.view, |view| {
+        view.recorder
+            .progress()
+            .is_some_and(|p| p.flushed >= 52_800)
+    });
+    let wav = partial_wav(&f.dir, "a").expect("the partial WAV exists while recording");
+    let (samples, _) = tw::read_take_wav(&wav).expect("a valid WAV up to the last flush");
+    assert_eq!(samples.len(), 52_800);
+
+    let report = tw::repair(&f.dir).expect("repair");
+    assert!(report.adopted.is_empty(), "a live take is never adopted");
+    assert!(wav.is_file());
+
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1);
+    assert_eq!(takes[0].2.samples, 52_800);
+    assert!(!takes[0].2.recovered);
+    assert_eq!(takes[0].2.dropouts, Some(0));
+}
+
+#[gpui_kit::test]
+fn a_take_survives_when_its_metadata_cannot_be_written(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // A file where the line's take directory belongs.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/a"), b"").expect("blocker");
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.2, 4800);
+    settle(cx, &f);
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("kept in memory"), "{shown}");
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    f.media.send(100.3, 4800);
+
+    fs::remove_file(f.dir.join("takes/a")).expect("unblock");
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "written from memory on stop");
+    assert_eq!(takes[0].2.samples, 9600);
+}
+
+#[gpui_kit::test]
+fn an_unsaved_take_is_kept_and_saved_later(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/a"), b"").expect("blocker");
+    record_take(cx, &f);
+    assert_eq!(recorded(&f.dir).len(), 0);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("could not be saved"), "{shown}");
+    assert!(f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
+
+    fs::remove_file(f.dir.join("takes/a")).expect("unblock");
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "saved on retry");
+    assert_eq!(takes[0].2.samples, 4800);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
+}
+
+#[gpui_kit::test]
+fn opening_the_window_adopts_a_crashed_take(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        let snapshot = Project::open(dir)
+            .expect("project")
+            .snapshot("a")
+            .expect("snapshot");
+        let input = RecordedInput {
+            sample_rate: 48_000,
+            device: DEVICE.to_owned(),
+            channel: 1,
+            line_offset_s: -2.0,
+            snapshot,
+            dropouts: None,
+        };
+        let partial = tw::begin_take(dir, "a", &input).expect("begin");
+        let mut wav = tw::PartialWav::create(&partial.wav, 48_000).expect("wav");
+        wav.write(&vec![5; 4800]).expect("write");
+        wav.flush().expect("flush");
+        wav.write(&vec![6; 480]).expect("write");
+        // The process dies here: no finish, no commit.
+    });
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1);
+    assert!(takes[0].2.recovered);
+    assert_eq!(takes[0].2.samples, 5280);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("Recovered a take 1"), "{shown}");
+    f.view
+        .read_with(cx, |view, _| assert_eq!(view.take, Some(1)));
+}
+
+#[gpui_kit::test]
+fn a_dropout_is_filled_and_counted(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.2, 4800); // 100.2 .. 100.3
+    f.media.send(100.35, 4800); // 50 ms lost before it
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes[0].2.samples, 4800 + 2400 + 4800);
+    assert_eq!(takes[0].2.dropouts, Some(1));
+    let wav = f.dir.join("takes/a/001.wav");
+    let (samples, _) = tw::read_take_wav(&wav).expect("take");
+    assert_eq!(&samples[4800..7200], &vec![0; 2400][..]);
+    assert_eq!(samples[7200], 100_000);
 }

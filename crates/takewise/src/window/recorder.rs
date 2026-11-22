@@ -8,13 +8,14 @@ use std::sync::mpsc::{self, Receiver};
 
 use takewise_core::takes::FULL_SCALE;
 use takewise_core::{
-    PartialTake, Project, RECORD_RATE, RecordedInput, TakeRef, TakeState, Timebase,
-    TimebaseHistory, begin_take, commit_take, line_offset_s, plan_take, sample_film_time,
-    write_take_wav,
+    Dropout, PartialTake, Project, RECORD_RATE, RecordedInput, Snapshot, TakeRef, TakeState,
+    Timebase, TimebaseHistory, WavLock, begin_take, commit_take, line_offset_s, plan_take,
+    sample_film_time, update_take_meta, write_take_wav,
 };
 use takewise_media::CaptureBuffer;
 
 use super::media::Media;
+use super::writer::{Progress, TakeWriter, Written};
 
 /// How far ahead a start is scheduled, so the players are set up before it.
 pub const START_LEAD_S: f64 = 0.15;
@@ -27,6 +28,8 @@ const TAKE_LOAD_TIMEOUT_S: f64 = 3.0;
 const LEVEL_HOLD_S: f64 = 0.5;
 /// How long to wait before reopening the meter after it failed.
 const METER_RETRY_S: f64 = 2.0;
+/// How often saving a take that could not be saved is retried.
+const SAVE_RETRY_S: f64 = 2.0;
 
 /// What a tick or a stop produced, for the window to show.
 #[derive(Debug, Default)]
@@ -45,6 +48,21 @@ pub struct Recorder {
     /// The idle capture that drives the level meter (never played back).
     meter: Option<Receiver<CaptureBuffer>>,
     meter_retry_at: f64,
+    /// Takes whose audio could not be saved yet; kept in memory and retried.
+    unsaved: Vec<Unsaved>,
+    unsaved_retry_at: f64,
+}
+
+/// A stopped take that is not on disk yet.
+struct Unsaved {
+    line: String,
+    input: RecordedInput,
+    samples: Vec<i32>,
+    partial: Option<PartialTake>,
+    /// The partial WAV's lock, held until the take is committed.
+    _lock: Option<WavLock>,
+    /// Whether the partial WAV already holds every sample.
+    complete: bool,
 }
 
 enum Warmup {
@@ -62,15 +80,22 @@ enum Phase {
 struct Take {
     line: String,
     line_start: f64,
-    /// The take's metadata; `line_offset_s` is set from the first buffer.
-    input: RecordedInput,
+    snapshot: Snapshot,
+    device: String,
+    channel: u16,
     latency_s: f64,
     offset_ms: f64,
     history: TimebaseHistory,
-    rx: Receiver<CaptureBuffer>,
-    samples: Vec<i32>,
-    /// Begun when the first buffer arrives.
+    /// Receives the capture and keeps and writes the audio.
+    writer: TakeWriter,
+    /// The take on disk: begun once the first buffer places the take.
     partial: Option<PartialTake>,
+    /// Film time of the first sample, once known.
+    first_film_s: Option<f64>,
+    /// Why the take could not be begun on disk (it is kept in memory).
+    begin_error: Option<String>,
+    /// Whether the writer's error was shown.
+    write_error_shown: bool,
     /// Host time at which the film reaches the line's start.
     line_start_host_s: f64,
     stop_film_s: f64,
@@ -97,7 +122,23 @@ impl Recorder {
             level: None,
             meter: None,
             meter_retry_at: 0.0,
+            unsaved: Vec::new(),
+            unsaved_retry_at: 0.0,
         }
+    }
+
+    /// What the take writer has seen of the take being recorded.
+    #[cfg(test)]
+    pub fn progress(&self) -> Option<Progress> {
+        match &self.phase {
+            Phase::Recording(take) => Some(take.writer.progress()),
+            _ => None,
+        }
+    }
+
+    /// Whether stopped takes still wait to be saved.
+    pub fn has_unsaved(&self) -> bool {
+        !self.unsaved.is_empty()
     }
 
     pub fn is_recording(&self) -> bool {
@@ -118,7 +159,10 @@ impl Recorder {
 
     /// The input level in dBFS, while buffers arrive.
     pub fn level_dbfs(&self, media: &dyn Media) -> Option<f64> {
-        let (db, at) = self.level?;
+        let (db, at) = match &self.phase {
+            Phase::Recording(take) => take.writer.progress().level?,
+            _ => self.level?,
+        };
         (media.host_now_s() - at < LEVEL_HOLD_S).then_some(db)
     }
 
@@ -242,53 +286,137 @@ impl Recorder {
         self.phase = Phase::Recording(Box::new(Take {
             line: line.id.clone(),
             line_start: line.start,
-            input: RecordedInput {
-                sample_rate: RECORD_RATE,
-                device,
-                channel: input.channel,
-                line_offset_s: 0.0,
-                snapshot,
-                dropouts: None,
-            },
+            snapshot,
+            device,
+            channel: input.channel,
             latency_s,
             offset_ms: f64::from(input.latency_offset_ms),
             history,
-            rx,
-            samples: Vec::new(),
+            writer: TakeWriter::spawn(rx),
             partial: None,
+            first_film_s: None,
+            begin_error: None,
+            write_error_shown: false,
             line_start_host_s: tb.host_anchor_s + (line.start - tb.film_anchor_s),
             stop_film_s: plan.capture_stop_film_s,
         }));
         Ok(())
     }
 
-    /// Stops the take, writes its audio and commits it. A take without any
-    /// audio is dropped (nothing was begun on disk).
-    pub fn finish_take(
-        &mut self,
-        media: &mut dyn Media,
-        dir: &Path,
-    ) -> Result<Option<TakeRef>, String> {
-        let Phase::Recording(mut take) = mem::replace(&mut self.phase, Phase::Idle) else {
-            return Ok(None);
+    /// Stops the take and commits it. A take without any audio is dropped
+    /// (nothing was begun on disk). When the take cannot be saved, it is
+    /// kept in memory and saving is retried; the error says so.
+    pub fn finish_take(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
+        let Phase::Recording(take) = mem::replace(&mut self.phase, Phase::Idle) else {
+            return Update::default();
         };
         media.stop_capture();
-        let drained = drain(&mut take, dir, &mut self.level);
+        let Take {
+            line,
+            line_start,
+            snapshot,
+            device,
+            channel,
+            latency_s,
+            offset_ms,
+            history,
+            writer,
+            partial,
+            first_film_s,
+            ..
+        } = *take;
+        let written = writer.finish();
         media.film_pause();
         media.film_seek(self.park_s);
         self.level = None;
-        let Some(partial) = take.partial else {
-            return drained.map(|()| None);
+        if written.samples.is_empty() {
+            return Update::default();
+        }
+        let first_film_s = first_film_s.or_else(|| {
+            let host = written.first_host_s?;
+            sample_film_time(&history, host, 0, RECORD_RATE, latency_s, offset_ms)
+        });
+        let dropouts = dropout_note(&written.dropouts, first_film_s);
+        #[allow(clippy::cast_possible_truncation)]
+        let input = RecordedInput {
+            sample_rate: RECORD_RATE,
+            device,
+            channel,
+            line_offset_s: line_offset_s(first_film_s.unwrap_or(line_start), line_start),
+            snapshot,
+            dropouts: Some(written.dropouts.len().min(u32::MAX as usize) as u32),
         };
-        write_take_wav(&partial.wav, &take.samples, RECORD_RATE).map_err(|err| {
-            format!(
-                "The take's audio could not be written ({err}); it stays in {}",
-                partial.wav.display()
-            )
-        })?;
-        commit_take(dir, partial)
-            .map(Some)
-            .map_err(|err| format!("The take could not be committed: {err}"))
+        let Written {
+            samples,
+            complete,
+            lock,
+            ..
+        } = written;
+        let unsaved = Unsaved {
+            line,
+            input,
+            samples,
+            partial,
+            _lock: lock,
+            complete,
+        };
+        let mut update = self.save(dir, unsaved);
+        update.message = join(update.message, dropouts);
+        update
+    }
+
+    /// Writes and commits a stopped take, or keeps it to retry.
+    fn save(&mut self, dir: &Path, mut unsaved: Unsaved) -> Update {
+        match save(dir, &mut unsaved) {
+            Ok(committed) => Update {
+                committed: Some(committed),
+                message: None,
+            },
+            Err(err) => {
+                let message = format!(
+                    "The take of {} could not be saved ({err}); it is kept in memory and saving is retried.",
+                    unsaved.line
+                );
+                self.unsaved.push(unsaved);
+                Update {
+                    committed: None,
+                    message: Some(message),
+                }
+            }
+        }
+    }
+
+    /// Tries once more to save the takes that could not be saved (when the
+    /// window closes).
+    pub fn save_unsaved_now(&mut self, dir: &Path) -> Update {
+        self.unsaved_retry_at = f64::NEG_INFINITY;
+        self.retry_unsaved(dir, f64::NEG_INFINITY)
+    }
+
+    /// Retries saving the takes that could not be saved; the first one
+    /// saved is reported.
+    fn retry_unsaved(&mut self, dir: &Path, now: f64) -> Update {
+        if self.unsaved.is_empty() || now < self.unsaved_retry_at {
+            return Update::default();
+        }
+        self.unsaved_retry_at = now + SAVE_RETRY_S;
+        let mut update = Update::default();
+        let mut left = Vec::new();
+        for mut unsaved in mem::take(&mut self.unsaved) {
+            match save(dir, &mut unsaved) {
+                Ok(committed) if update.committed.is_none() => {
+                    update.message = Some(format!(
+                        "Saved the earlier take of {} as take {}.",
+                        committed.line, committed.take
+                    ));
+                    update.committed = Some(committed);
+                }
+                Ok(_) => {}
+                Err(_) => left.push(unsaved),
+            }
+        }
+        self.unsaved = left;
+        update
     }
 
     /// Plays line `idx` in context: pre-roll, the take locked to the film,
@@ -356,28 +484,39 @@ impl Recorder {
             }
         }
         match &mut self.phase {
-            Phase::Idle => Update::default(),
+            Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
-                let failure = drain(take, dir, &mut self.level)
-                    .err()
-                    .or_else(|| media.capture_error());
+                let progress = take.writer.progress();
+                let mut message = begin_on_disk(take, dir, &progress);
+                if let Some(err) = progress.error.as_ref().filter(|_| !take.write_error_shown) {
+                    take.write_error_shown = true;
+                    message = join(
+                        message,
+                        Some(format!(
+                            "Writing the take failed ({err}); recording goes on, the audio is kept in memory and written when you stop."
+                        )),
+                    );
+                }
+                let failure = media.capture_error();
                 let at_end = take
                     .history
                     .film_at(now)
                     .is_some_and(|film| film >= take.stop_film_s);
                 if failure.is_none() && !at_end {
-                    return Update::default();
+                    return Update {
+                        message,
+                        ..Update::default()
+                    };
                 }
                 let finished = self.finish_take(media, dir);
-                let (committed, error) = match finished {
-                    Ok(committed) => (committed, None),
-                    Err(err) => (None, Some(err)),
-                };
                 Update {
-                    committed,
-                    message: match (failure, error) {
-                        (Some(failure), _) => Some(format!("Recording stopped: {failure}")),
-                        (None, error) => error,
+                    committed: finished.committed,
+                    message: match failure {
+                        Some(failure) => join(
+                            Some(format!("Recording stopped: {failure}")),
+                            finished.message,
+                        ),
+                        None => finished.message,
                     },
                 }
             }
@@ -459,32 +598,108 @@ fn start_both(media: &mut dyn Media, playback: &Playback, now: f64) -> Result<Ti
     Ok(tb)
 }
 
-/// Moves captured buffers into the take, beginning it on disk with the
-/// first buffer, whose film time gives the take's `line_offset_s`.
-fn drain(take: &mut Take, dir: &Path, level: &mut Option<(f64, f64)>) -> Result<(), String> {
-    while let Ok(buffer) = take.rx.try_recv() {
-        if buffer.samples.is_empty() {
-            continue;
-        }
-        *level = Some((peak_dbfs(&buffer.samples), buffer.host_time_s));
-        if take.partial.is_none() {
-            let first = sample_film_time(
-                &take.history,
-                buffer.host_time_s,
-                0,
-                RECORD_RATE,
-                take.latency_s,
-                take.offset_ms,
-            )
-            .unwrap_or(take.line_start);
-            take.input.line_offset_s = line_offset_s(first, take.line_start);
-            let partial = begin_take(dir, &take.line, &take.input)
-                .map_err(|err| format!("cannot start the take on disk: {err}"))?;
-            take.partial = Some(partial);
-        }
-        take.samples.extend_from_slice(&buffer.samples);
+/// Film time of the take's first sample, whose buffer has callback host time
+/// `first_host_s`.
+fn first_sample_film_s(take: &Take, first_host_s: f64) -> Option<f64> {
+    sample_film_time(
+        &take.history,
+        first_host_s,
+        0,
+        RECORD_RATE,
+        take.latency_s,
+        take.offset_ms,
+    )
+}
+
+/// Begins the take on disk once its first sample is placed: writes the
+/// metadata and has the writer stream into the partial WAV. On failure the
+/// take goes on in memory; returns the message to show.
+fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<String> {
+    if take.partial.is_some() || take.begin_error.is_some() {
+        return None;
     }
-    Ok(())
+    let first = first_sample_film_s(take, progress.first_host_s?).unwrap_or(take.line_start);
+    take.first_film_s = Some(first);
+    let input = RecordedInput {
+        sample_rate: RECORD_RATE,
+        device: take.device.clone(),
+        channel: take.channel,
+        line_offset_s: line_offset_s(first, take.line_start),
+        snapshot: take.snapshot.clone(),
+        dropouts: None,
+    };
+    match begin_take(dir, &take.line, &input) {
+        Ok(partial) => {
+            take.writer.open(partial.wav.clone());
+            take.partial = Some(partial);
+            None
+        }
+        Err(err) => {
+            let message = format!(
+                "The take cannot be started on disk ({err}); recording goes on, the audio is kept in memory and written when you stop."
+            );
+            take.begin_error = Some(err.to_string());
+            Some(message)
+        }
+    }
+}
+
+/// Writes a stopped take's metadata and, when the partial WAV is not
+/// complete, its audio from memory, then commits it.
+fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<TakeRef, String> {
+    let partial = if let Some(partial) = &unsaved.partial {
+        partial.clone()
+    } else {
+        let partial =
+            begin_take(dir, &unsaved.line, &unsaved.input).map_err(|err| err.to_string())?;
+        unsaved.partial = Some(partial.clone());
+        partial
+    };
+    if !unsaved.complete {
+        write_take_wav(&partial.wav, &unsaved.samples, RECORD_RATE)
+            .map_err(|err| err.to_string())?;
+        unsaved.complete = true;
+    }
+    update_take_meta(&partial, &unsaved.input).map_err(|err| err.to_string())?;
+    commit_take(dir, partial).map_err(|err| err.to_string())
+}
+
+/// "Audio dropout at 0:05." for the dropouts of a take whose first sample
+/// is at `first_film_s`.
+fn dropout_note(dropouts: &[Dropout], first_film_s: Option<f64>) -> Option<String> {
+    if dropouts.is_empty() {
+        return None;
+    }
+    let first = first_film_s.unwrap_or(0.0);
+    let times: Vec<String> = dropouts
+        .iter()
+        .map(|d| clock(first + d.at_sample as f64 / f64::from(RECORD_RATE)))
+        .collect();
+    let noun = if dropouts.len() == 1 {
+        "Audio dropout"
+    } else {
+        "Audio dropouts"
+    };
+    Some(format!(
+        "{noun} at {} (filled with silence; listen before choosing).",
+        times.join(", ")
+    ))
+}
+
+/// Film time as m:ss.
+fn clock(film_s: f64) -> String {
+    #[allow(clippy::cast_possible_truncation)]
+    let whole = film_s.abs().floor() as i64;
+    let sign = if film_s < 0.0 { "-" } else { "" };
+    format!("{sign}{}:{:02}", whole / 60, whole % 60)
+}
+
+/// Both messages, or whichever there is.
+pub fn join(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Peak of `samples` in dBFS (24-bit full scale).
