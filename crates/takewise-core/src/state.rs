@@ -22,7 +22,13 @@ pub struct State {
     pub partials: Vec<PathBuf>,
     /// `NNN.wav` files without a `recorded` event, relative to the project.
     pub unadopted: Vec<PathBuf>,
+    /// What blocks a finished narration; these fail `status --strict`:
+    /// validation problems and missing chosen take files.
     pub problems: Vec<Problem>,
+    /// Worth knowing but not blocking: crash leftovers (torn or bad ledger
+    /// lines, partial and unadopted files), stale chosen takes, missing
+    /// files of takes that are not chosen.
+    pub notices: Vec<Problem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -183,9 +189,10 @@ fn fold_take(
 }
 
 /// Folds the ledger over the current script: effective verdicts, staleness,
-/// the proposed and chosen take per line, orphans and file problems.
+/// the proposed and chosen take per line, orphans, problems and notices.
 pub fn fold(project: &Project, ledger: &Ledger) -> State {
     let mut problems = validate(&project.script, project.film_duration());
+    let mut notices = Vec::new();
     let mut lines = Vec::with_capacity(project.script.lines.len());
     for line in &project.script.lines {
         let Some(current) = project.snapshot(&line.id) else {
@@ -209,17 +216,8 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         }
         takes.sort_by_key(|t| t.take);
         let proposed = ranks.iter().min_by(|a, b| a.cmp(b)).map(|r| r.take);
-        if let Some(take) = chosen
-            .as_ref()
-            .and_then(|(no, _)| takes.iter().find(|t| t.take == *no))
-            .filter(|t| t.missing)
-        {
-            problems.push(Problem::new(
-                Some(&line.id),
-                "missing-file",
-                format!("the chosen take {} ({}) is missing", take.take, take.file),
-            ));
-        }
+        let chosen_take = chosen.as_ref().map(|(take, _)| *take);
+        take_findings(&line.id, &takes, chosen_take, &mut problems, &mut notices);
         lines.push(LineState {
             id: line.id.clone(),
             text: current.text.clone(),
@@ -244,7 +242,7 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
     orphans.sort();
     orphans.dedup();
 
-    let (partials, unadopted) = recovery_problems(project, ledger, &mut problems);
+    let (partials, unadopted) = recovery_notices(project, ledger, &mut notices);
 
     State {
         lines,
@@ -252,26 +250,63 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         partials,
         unadopted,
         problems,
+        notices,
+    }
+}
+
+/// A missing chosen take file is a problem; a missing other take and a
+/// stale chosen take are notices.
+fn take_findings(
+    line: &str,
+    takes: &[TakeState],
+    chosen: Option<u32>,
+    problems: &mut Vec<Problem>,
+    notices: &mut Vec<Problem>,
+) {
+    for take in takes {
+        let is_chosen = chosen == Some(take.take);
+        if take.missing {
+            let (list, whose) = if is_chosen {
+                (&mut *problems, "the chosen take")
+            } else {
+                (&mut *notices, "take")
+            };
+            list.push(Problem::new(
+                Some(line),
+                "missing-file",
+                format!("{whose} {} ({}) is missing", take.take, take.file),
+            ));
+        }
+        if is_chosen && take.stale_check {
+            notices.push(Problem::new(
+                Some(line),
+                "stale-chosen",
+                format!(
+                    "the chosen take {} was checked or judged against an older text or slot",
+                    take.take
+                ),
+            ));
+        }
     }
 }
 
 /// Reports what a crash can leave behind: unparseable ledger lines, partial
 /// files, takes without a `recorded` event, and metadata without audio.
 /// Returns the partial files and the unadopted WAVs.
-fn recovery_problems(
+fn recovery_notices(
     project: &Project,
     ledger: &Ledger,
-    problems: &mut Vec<Problem>,
+    notices: &mut Vec<Problem>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if ledger.torn_tail {
-        problems.push(Problem::new(
+        notices.push(Problem::new(
             None,
             "torn-ledger",
             "the last line of takes.jsonl is incomplete (a crash while writing); it is ignored",
         ));
     }
     for line in &ledger.bad_lines {
-        problems.push(Problem::new(
+        notices.push(Problem::new(
             None,
             "bad-ledger-line",
             format!("takes.jsonl line {line} does not parse; it is ignored"),
@@ -302,17 +337,17 @@ fn recovery_problems(
                         ),
                     )
                 };
-                problems.push(Problem::new(Some(&meta.line), code, message));
+                notices.push(Problem::new(Some(&meta.line), code, message));
             }
             (files.partials, unadopted)
         }
         Err(err) => {
-            problems.push(Problem::new(None, "scan-failed", err.to_string()));
+            notices.push(Problem::new(None, "scan-failed", err.to_string()));
             (Vec::new(), Vec::new())
         }
     };
     for path in &partials {
-        problems.push(Problem::new(
+        notices.push(Problem::new(
             None,
             "partial-take",
             format!(
@@ -322,7 +357,7 @@ fn recovery_problems(
         ));
     }
     for path in &unadopted {
-        problems.push(Problem::new(
+        notices.push(Problem::new(
             None,
             "unadopted-take",
             format!(
@@ -636,6 +671,28 @@ text = "Today we start."
     }
 
     #[test]
+    fn stale_chosen_take_is_a_notice() {
+        let (_tmp, project) = setup(TWO_LINES);
+        recorded(&project, "hook", 1);
+        fs::create_dir_all(project.dir.join("takes/hook")).unwrap();
+        crate::takes::write_take_wav(&project.dir.join("takes/hook/001.wav"), &[0; 10], 48_000)
+            .unwrap();
+        checked(&project, "hook", 1, Verdict::Keep, 0, None);
+        chosen(&project, "hook", 1, "narrator");
+        set_line_field(&project.dir, "today", Field::Start(21.0), None).unwrap();
+        let state = fold_now(&project);
+        assert!(state.problems.is_empty(), "{:?}", state.problems);
+        assert!(
+            state
+                .notices
+                .iter()
+                .any(|n| n.code == "stale-chosen" && n.line.as_deref() == Some("hook")),
+            "{:?}",
+            state.notices
+        );
+    }
+
+    #[test]
     fn orphan_after_id_change() {
         let (_tmp, project) = setup(TWO_LINES);
         recorded(&project, "hook", 1);
@@ -672,8 +729,9 @@ text = "Today we start."
         fs::write(project.dir.join("takes/today/001.json"), "{}").unwrap();
 
         let state = fold_now(&project);
+        assert!(state.problems.is_empty(), "{:?}", state.problems);
         let codes: Vec<(Option<&str>, &str)> = state
-            .problems
+            .notices
             .iter()
             .map(|p| (p.line.as_deref(), p.code))
             .collect();
@@ -711,7 +769,12 @@ text = "Today we start."
         fs::write(project.dir.join("takes/today/001.wav"), b"x").unwrap();
 
         let state = fold_now(&project);
-        let codes: Vec<&str> = state.problems.iter().map(|p| p.code).collect();
+        assert!(
+            state.problems.is_empty(),
+            "crash leftovers are notices: {:?}",
+            state.problems
+        );
+        let codes: Vec<&str> = state.notices.iter().map(|p| p.code).collect();
         assert!(codes.contains(&"torn-ledger"), "{codes:?}");
         assert!(codes.contains(&"partial-take"), "{codes:?}");
         assert!(codes.contains(&"unadopted-take"), "{codes:?}");

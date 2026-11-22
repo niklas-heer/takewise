@@ -42,7 +42,8 @@ enum Command {
     /// Lines, takes, verdicts, proposed and chosen takes, and problems.
     Status {
         dir: PathBuf,
-        /// Exit 1 when a line has no chosen take or any problem exists.
+        /// Exit 1 when a line has no chosen take or any problem exists
+        /// (notices, such as crash leftovers, do not count).
         #[arg(long)]
         strict: bool,
         /// Adopt take files left without a ledger event by a crash first.
@@ -431,9 +432,15 @@ fn status_text(project: &Project, data: &StatusData) -> String {
             );
         }
     }
-    if !data.state.problems.is_empty() {
-        text.push_str("problems:\n");
-        for p in &data.state.problems {
+    for (title, list) in [
+        ("problems", &data.state.problems),
+        ("notices", &data.state.notices),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        let _ = writeln!(text, "{title}:");
+        for p in list {
             let line = p
                 .line
                 .as_deref()

@@ -309,7 +309,7 @@ fn status_strict_exit_codes() {
         .assert()
         .code(0);
 
-    // A leftover partial is a problem until someone looks at it.
+    // A leftover partial is a notice: reported, but it does not fail --strict.
     let project = Project::open(&dir).unwrap();
     let input = RecordedInput {
         sample_rate: RATE,
@@ -319,6 +319,31 @@ fn status_strict_exit_codes() {
         snapshot: project.snapshot("hook").unwrap(),
     };
     begin_take(&dir, "hook", &input).unwrap();
+    let (code, value) = json(takewise().arg("status").arg(&dir).arg("--strict"));
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["problems"], Value::Array(Vec::new()));
+    assert_eq!(value["data"]["notices"][0]["code"], "partial-take");
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("notices:").and(predicate::str::contains("partial-take")));
+
+    // A torn ledger line is a notice too.
+    let ledger = dir.join("takes.jsonl");
+    let mut text = fs::read_to_string(&ledger).unwrap();
+    text.push_str("{\"v\":1,");
+    fs::write(&ledger, text).unwrap();
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .arg("--strict")
+        .assert()
+        .code(0);
+
+    // A validation problem still fails --strict.
+    fs::write(dir.join("script.toml"), SCRIPT.replace("10.0", "90.0")).unwrap();
     takewise()
         .arg("status")
         .arg(&dir)
