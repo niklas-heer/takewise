@@ -17,11 +17,14 @@ const MERGE_GAP_FRAMES: usize = 30;
 /// Runs with fewer voiced frames than this after merging are dropped (in
 /// 10 ms frames); bridged silence does not count.
 const MIN_RUN_FRAMES: usize = 8;
-/// A first or last run with fewer voiced frames than this (in 10 ms frames)
-/// is dropped when at least `ISOLATION_GAP_FRAMES` separate it from the next
-/// run: a breath, a click or a chair, not the first or last word.
+/// A first or last run is dropped as a breath, a click or a chair, not the
+/// first or last word, only when all hold: it has fewer voiced frames than
+/// this (in 10 ms frames), at least `ISOLATION_GAP_FRAMES` separate it from
+/// the next run, and its level is at least `WEAK_RUN_BELOW_MEDIAN_DB` below
+/// the median level of the runs that remain.
 const WEAK_RUN_FRAMES: usize = 15;
 const ISOLATION_GAP_FRAMES: usize = 40;
+const WEAK_RUN_BELOW_MEDIAN_DB: f64 = 10.0;
 const CLIP_DBFS: f64 = -0.1;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -104,6 +107,8 @@ struct Run {
     end: usize,
     /// Frames above the threshold, not counting bridged gaps.
     voiced: usize,
+    /// Sum of the voiced frames' mean-square levels, relative to full scale.
+    power: f64,
 }
 
 impl Run {
@@ -112,25 +117,51 @@ impl Run {
         later.start - self.end - 1
     }
 
-    fn is_weak(self) -> bool {
+    /// RMS level of the voiced frames in dBFS.
+    fn level_db(self) -> f64 {
+        10.0 * (self.power / self.voiced as f64).log10()
+    }
+
+    /// Whether this run, isolated by `gap` frames at one end of the speech,
+    /// is noise rather than a word, judged against the runs that remain. A
+    /// run 10 dB below their median leaves a louder run behind, so trimming
+    /// never leaves only weaker runs; `rest` is never empty.
+    fn is_isolated_noise(self, gap: usize, rest: &[Run]) -> bool {
         self.voiced < WEAK_RUN_FRAMES
+            && gap >= ISOLATION_GAP_FRAMES
+            && median_level(rest)
+                .is_some_and(|median| self.level_db() <= median - WEAK_RUN_BELOW_MEDIAN_DB)
+    }
+}
+
+fn median_level(runs: &[Run]) -> Option<f64> {
+    let mut levels: Vec<f64> = runs.iter().map(|r| r.level_db()).collect();
+    levels.sort_by(f64::total_cmp);
+    let mid = levels.len() / 2;
+    match levels.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(levels[mid]),
+        _ => Some(f64::midpoint(levels[mid - 1], levels[mid])),
     }
 }
 
 /// The first and last frame of speech: bridges short gaps, drops runs with
-/// too few voiced frames, then drops weak runs isolated at either end.
+/// too few voiced frames, then drops short, quiet runs isolated at either end.
 fn speech_runs(levels: &[f64], threshold: f64) -> Option<(usize, usize)> {
     let mut runs: Vec<Run> = Vec::new();
-    for (idx, _) in levels.iter().enumerate().filter(|(_, db)| **db > threshold) {
+    for (idx, db) in levels.iter().enumerate().filter(|(_, db)| **db > threshold) {
+        let power = 10f64.powf(db / 10.0);
         match runs.last_mut() {
             Some(run) if idx - run.end - 1 < MERGE_GAP_FRAMES => {
                 run.end = idx;
                 run.voiced += 1;
+                run.power += power;
             }
             _ => runs.push(Run {
                 start: idx,
                 end: idx,
                 voiced: 1,
+                power,
             }),
         }
     }
@@ -138,17 +169,17 @@ fn speech_runs(levels: &[f64], threshold: f64) -> Option<(usize, usize)> {
         .into_iter()
         .filter(|run| run.voiced >= MIN_RUN_FRAMES)
         .collect::<Vec<_>>();
-    while let [first, next, ..] = kept {
-        if !(first.is_weak() && first.gap_to(*next) >= ISOLATION_GAP_FRAMES) {
-            break;
-        }
-        kept = &kept[1..];
+    while let [first, rest @ ..] = kept
+        && let Some(next) = rest.first()
+        && first.is_isolated_noise(first.gap_to(*next), rest)
+    {
+        kept = rest;
     }
-    while let [.., previous, last] = kept {
-        if !(last.is_weak() && previous.gap_to(*last) >= ISOLATION_GAP_FRAMES) {
-            break;
-        }
-        kept = &kept[..kept.len() - 1];
+    while let [rest @ .., last] = kept
+        && let Some(previous) = rest.last()
+        && last.is_isolated_noise(previous.gap_to(*last), rest)
+    {
+        kept = rest;
     }
     Some((kept.first()?.start, kept.last()?.end))
 }
@@ -234,6 +265,46 @@ mod tests {
         burst_at(&mut take, 3.0, 3.09, -37.0);
         let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
         assert!(close(start, 1.0) && close(end, 2.0), "{start}..{end}");
+    }
+
+    #[test]
+    fn a_short_word_before_a_quieter_breath_is_kept() {
+        // A 100 ms word, then a 90 ms breath 500 ms later.
+        let mut take = noise(3.0);
+        burst(&mut take, 1.0, 1.1);
+        burst_at(&mut take, 1.6, 1.69, -37.0);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 1.0) && close(end, 1.1), "{start}..{end}");
+    }
+
+    #[test]
+    fn a_loud_short_last_word_is_kept() {
+        // A 130 ms last word 450 ms after the phrase, as loud as the phrase.
+        let mut take = noise(4.0);
+        burst(&mut take, 1.0, 2.0);
+        burst(&mut take, 2.45, 2.58);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 1.0) && close(end, 2.58), "{start}..{end}");
+    }
+
+    #[test]
+    fn a_short_first_word_before_a_pause_is_kept() {
+        // "Yes." (120 ms), a 500 ms pause, then the phrase.
+        let mut take = noise(4.0);
+        burst(&mut take, 1.0, 1.12);
+        burst(&mut take, 1.62, 2.6);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 1.0) && close(end, 2.6), "{start}..{end}");
+    }
+
+    #[test]
+    fn a_burst_12_db_below_speech_is_still_trimmed() {
+        // Half-scale bursts are about -9 dBFS RMS; this one is 12 dB quieter.
+        let mut take = noise(4.0);
+        burst_at(&mut take, 0.91, 1.0, -21.0);
+        burst(&mut take, 2.0, 3.0);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 2.0) && close(end, 3.0), "{start}..{end}");
     }
 
     #[test]
