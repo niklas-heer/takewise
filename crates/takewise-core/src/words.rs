@@ -11,7 +11,9 @@
 //! read as "two thousand five", as people say them.
 //!
 //! [`align`] reports differences between normalized tokens, so a diff names a
-//! token such as `kindred`, not the original spelling.
+//! token such as `kindred`, not the original spelling. It also accepts a heard
+//! `links` for an expected `link is` (and the reverse), since a contracted
+//! "is" sounds like a plural and whisper writes it as one.
 
 use crate::ledger::{Word, WordDiff, WordDiffKind};
 
@@ -263,6 +265,21 @@ fn ordinal(word: &str) -> String {
     }
 }
 
+/// True when `expected[..i]` ends in `<stem> is` and `token` is `<stem>s`:
+/// a contracted "is" ("link's", "it's") sounds like a plural, and whisper
+/// writes it as one ("links", "its").
+fn is_split_s(expected: &[String], i: usize, token: &str) -> bool {
+    i >= 2 && expected[i - 1] == "is" && token.strip_suffix('s') == Some(expected[i - 2].as_str())
+}
+
+/// [`is_split_s`] the other way round: `heard[..j]` ends in `<stem> is` and
+/// the expected token is `<stem>s`.
+fn heard_split_s(heard: &[Heard], j: usize, token: &str) -> bool {
+    j >= 2
+        && heard[j - 1].text == "is"
+        && token.strip_suffix('s') == Some(heard[j - 2].text.as_str())
+}
+
 /// A normalized heard token with the times of the word it came from.
 struct Heard {
     text: String,
@@ -299,15 +316,33 @@ pub fn align(expected: &[String], heard: &[Word]) -> Vec<WordDiff> {
     for i in 1..=n {
         for j in 1..=m {
             let same = usize::from(expected[i - 1] != heard[j - 1].text);
-            cost[i][j] = (cost[i - 1][j - 1] + same)
+            let mut best = (cost[i - 1][j - 1] + same)
                 .min(cost[i - 1][j] + 1)
                 .min(cost[i][j - 1] + 1);
+            if is_split_s(expected, i, &heard[j - 1].text) {
+                best = best.min(cost[i - 2][j - 1]);
+            }
+            if heard_split_s(&heard, j, &expected[i - 1]) {
+                best = best.min(cost[i - 1][j - 2]);
+            }
+            cost[i][j] = best;
         }
     }
 
     let mut diffs = Vec::new();
     let (mut i, mut j) = (n, m);
     while i > 0 || j > 0 {
+        if j > 0 && is_split_s(expected, i, &heard[j - 1].text) && cost[i][j] == cost[i - 2][j - 1]
+        {
+            i -= 2;
+            j -= 1;
+            continue;
+        }
+        if i > 0 && heard_split_s(&heard, j, &expected[i - 1]) && cost[i][j] == cost[i - 1][j - 2] {
+            i -= 1;
+            j -= 2;
+            continue;
+        }
         if i > 0 && j > 0 {
             let same = expected[i - 1] == heard[j - 1].text;
             if cost[i][j] == cost[i - 1][j - 1] + usize::from(!same) {
@@ -507,6 +542,25 @@ mod tests {
             &heard("Kindred is free and open-source, try the demo, the link is below"),
         );
         assert_eq!(diffs, []);
+    }
+
+    #[test]
+    fn align_hears_contracted_is_as_s() {
+        // whisper writes the spoken "link's" as "links" and "it's" as "its".
+        let expected = normalize("Try the demo; the link's below.");
+        assert_eq!(
+            align(&expected, &heard("Try the demo, the links below")),
+            []
+        );
+        let expected = normalize("It's free.");
+        assert_eq!(align(&expected, &heard("Its free")), []);
+        // And the other way round.
+        let expected = normalize("The links below.");
+        assert_eq!(align(&expected, &heard("The link's below")), []);
+        // A different word is still a difference.
+        let expected = normalize("the link's below");
+        let diffs = align(&expected, &heard("the lynx below"));
+        assert_ne!(diffs, []);
     }
 
     #[test]
