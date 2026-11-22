@@ -3,6 +3,7 @@
 mod cli;
 mod film;
 mod output;
+mod window;
 
 use std::process::ExitCode;
 

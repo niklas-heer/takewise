@@ -197,9 +197,10 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
     match cli.command {
         Command::Init { dir, film } => init(&dir, &film),
         Command::Record { dir } => record(&dir),
-        Command::Window { .. } => Err(CliError::NotYet(
-            "the recording window is not built yet; it arrives later in milestone 2".to_owned(),
-        )),
+        Command::Window { dir } => {
+            crate::window::run(&dir).map_err(CliError::Setup)?;
+            Ok(Outcome::new(json!({}), String::new()))
+        }
         Command::Status {
             dir,
             strict,
