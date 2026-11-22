@@ -392,7 +392,7 @@ mod tests {
     fn read_missing_ledger_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let ledger = read(tmp.path()).unwrap();
-        assert!(ledger.events.is_empty());
+        assert_eq!(ledger.events, []);
         assert!(!ledger.torn_tail);
     }
 
@@ -421,7 +421,7 @@ mod tests {
         let ledger = read(tmp.path()).unwrap();
         assert_eq!(ledger.events.len(), 1);
         assert!(ledger.torn_tail);
-        assert!(ledger.bad_lines.is_empty());
+        assert_eq!(ledger.bad_lines, [0_usize; 0]);
 
         append(tmp.path(), &recorded(2)).unwrap();
         let text = fs::read_to_string(&path).unwrap();

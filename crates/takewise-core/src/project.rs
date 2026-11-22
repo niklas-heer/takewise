@@ -281,7 +281,7 @@ mod tests {
         assert!((opened.config.record.film_gain_db + 12.0).abs() < f64::EPSILON);
         assert_eq!(opened.config.check.language, "en");
         assert_eq!(opened.config.check.whisper_model, "ggml-large-v3-turbo.bin");
-        assert!(opened.script.lines.is_empty());
+        assert_eq!(opened.script.lines, []);
         assert_eq!(opened.film_path(), dir.join("../film.mp4"));
     }
 

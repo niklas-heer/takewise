@@ -523,7 +523,7 @@ text = "Today we start."
         );
         assert_eq!(hook.takes[0].file, "takes/hook/001.wav");
         assert!((hook.takes[0].line_offset_s + 2.0).abs() < f64::EPSILON);
-        assert!(line(&state, "today").takes.is_empty());
+        assert_eq!(line(&state, "today").takes, []);
         assert_eq!(line(&state, "today").proposed, None);
         assert!(state.problems.is_empty(), "{:?}", state.problems);
     }
@@ -713,7 +713,7 @@ text = "Today we start."
         crate::takes::write_take_wav(&project.dir.join("takes/hook/001.wav"), &[0; 10], 48_000)
             .unwrap();
         chosen(&project, "hook", 1, "narrator");
-        assert!(fold_now(&project).notices.is_empty());
+        assert_eq!(fold_now(&project).notices, []);
         set_line_field(&project.dir, "hook", Field::Text("Hi.".to_owned()), None).unwrap();
         let state = fold_now(&project);
         assert!(line(&state, "hook").takes[0].recorded_against_old_text);
@@ -746,7 +746,7 @@ text = "Today we start."
                 take: 1
             }]
         );
-        assert!(line(&state, "opening").takes.is_empty());
+        assert_eq!(line(&state, "opening").takes, []);
     }
 
     #[test]

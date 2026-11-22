@@ -53,7 +53,7 @@ impl FromStr for ScriptVersion {
             return Err("a script version is 64 hex digits".to_owned());
         }
         let mut out = [0u8; 32];
-        for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
             let pair = std::str::from_utf8(pair).map_err(|err| err.to_string())?;
             *slot = u8::from_str_radix(pair, 16).map_err(|err| err.to_string())?;
         }

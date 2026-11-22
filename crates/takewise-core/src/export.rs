@@ -597,7 +597,7 @@ mod tests {
             report.refused[0].lines,
             vec!["one".to_owned(), "two".to_owned()]
         );
-        assert!(report.lines.is_empty());
+        assert_eq!(report.lines, []);
         assert!(!dir.join("export/narration.wav").exists());
     }
 
@@ -681,7 +681,7 @@ mod tests {
         let (_tmp, dir) = setup(ONE_LINE);
         let t = take(&dir, "hook", Some((2.0, 3.0)));
         choose(&dir, &t);
-        assert!(run(&dir, false).warnings.is_empty());
+        assert_eq!(run(&dir, false).warnings, []);
     }
 
     #[test]
@@ -716,7 +716,7 @@ mod tests {
         let (_tmp, dir) = setup(ONE_LINE);
         let t = take(&dir, "hook", Some((2.0, 3.0)));
         choose(&dir, &t);
-        assert!(run(&dir, false).refused.is_empty());
+        assert_eq!(run(&dir, false).refused, []);
         let wav = fs::read(dir.join("export/narration.wav")).unwrap();
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
@@ -742,7 +742,7 @@ mod tests {
         let (_tmp, dir) = setup(ONE_LINE);
         let t = take(&dir, "hook", Some((2.0, 3.0)));
         choose(&dir, &t);
-        assert!(run(&dir, false).refused.is_empty());
+        assert_eq!(run(&dir, false).refused, []);
         assert!(dir.join("export/manifest.json").exists());
 
         // A silent second take is chosen: export now refuses.
@@ -776,7 +776,7 @@ mod tests {
         );
         drop(guard);
         let report = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(report.refused.is_empty());
+        assert_eq!(report.refused, []);
         handle.join().unwrap();
     }
 

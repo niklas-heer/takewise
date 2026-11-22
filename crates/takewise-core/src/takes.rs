@@ -597,7 +597,7 @@ mod tests {
                 take: 2
             }]
         );
-        assert!(report.unadopted.is_empty());
+        assert_eq!(report.unadopted, Vec::<PathBuf>::new());
         let ledger = read(dir).unwrap();
         assert_eq!(ledger.events.len(), 2);
         let EventKind::Recorded(rec) = &ledger.events[1].kind else {
@@ -670,13 +670,13 @@ mod tests {
         fs::rename(&partial.wav, dir.join("takes/hook/elsewhere.wav")).unwrap();
 
         let report = repair(dir).unwrap();
-        assert!(report.adopted.is_empty());
+        assert_eq!(report.adopted, []);
         assert_eq!(
             report.metadata_without_audio,
             vec![PathBuf::from("takes/hook/001.json")]
         );
         assert!(dir.join("takes/hook/001.json").exists(), "kept");
-        assert!(read(dir).unwrap().events.is_empty());
+        assert_eq!(read(dir).unwrap().events, []);
     }
 
     #[test]
@@ -687,10 +687,10 @@ mod tests {
         fs::create_dir_all(&line_dir).unwrap();
         write_take_wav(&line_dir.join("003.wav"), &[5; 10], 48_000).unwrap();
         let report = repair(dir).unwrap();
-        assert!(report.adopted.is_empty());
+        assert_eq!(report.adopted, []);
         assert_eq!(report.unadopted, vec![PathBuf::from("takes/hook/003.wav")]);
         assert!(line_dir.join("003.wav").exists());
-        assert!(read(dir).unwrap().events.is_empty());
+        assert_eq!(read(dir).unwrap().events, []);
     }
 
     #[test]
@@ -770,6 +770,6 @@ mod tests {
         expected.sort();
         assert_eq!(report.partials, expected);
         assert!(partial.meta.exists() && partial.wav.exists());
-        assert!(read(dir).unwrap().events.is_empty());
+        assert_eq!(read(dir).unwrap().events, []);
     }
 }

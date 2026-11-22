@@ -170,7 +170,7 @@ note = "warm, a little wry"
         .unwrap();
         assert_eq!(script.lines.len(), 1);
         assert_eq!(script.lines[0].note.as_deref(), Some("warm, a little wry"));
-        assert!(validate(&script, 51.5).is_empty());
+        assert_eq!(validate(&script, 51.5), []);
     }
 
     #[test]
