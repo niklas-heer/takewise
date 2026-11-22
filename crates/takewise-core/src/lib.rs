@@ -14,7 +14,7 @@ pub mod takes;
 #[cfg(test)]
 mod testutil;
 
-pub use edit::{Field, ScriptVersion, script_version, set_line_field};
+pub use edit::{Field, ScriptVersion, script_version, set_film_info, set_line_field};
 pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport, ManifestLine, Refusal, export};
 pub use fsutil::{ProjectLock, lock, write_atomic};
@@ -27,6 +27,6 @@ pub use script::{Line, Problem, Script, validate};
 pub use speech::{Analysis, analyze};
 pub use state::{LineState, State, TakeState, fold};
 pub use takes::{
-    PartialTake, RecordedInput, RepairReport, TakeRef, begin_take, commit_take, read_take_wav,
-    repair, write_take_wav,
+    Judgment, PartialTake, RecordedInput, RepairReport, TakeRef, begin_take, choose_take,
+    commit_take, judge_take, read_take_wav, repair, write_take_wav,
 };

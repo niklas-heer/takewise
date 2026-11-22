@@ -11,7 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
-use crate::project::{SCRIPT_FILE, parse_script, read_config};
+use crate::project::{FilmInfo, PROJECT_FILE, SCRIPT_FILE, parse_script, read_config};
 use crate::script::validate;
 
 /// One field of one line.
@@ -136,6 +136,31 @@ pub fn set_line_field(
 
     write_atomic(&path, edited.as_bytes())?;
     Ok(ScriptVersion::of(edited.as_bytes()))
+}
+
+/// Rewrites `[film_info]` in `project.toml` under the lock, keeping the rest
+/// of the file as it is.
+pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
+    let path = dir.join(PROJECT_FILE);
+    let _guard = lock(dir)?;
+    let text = fs::read_to_string(&path).map_err(io(&path))?;
+    let parse_error = |message: String| Error::Parse {
+        path: path.clone(),
+        message,
+    };
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|err: toml_edit::TomlError| parse_error(err.to_string()))?;
+    let size = i64::try_from(info.size).map_err(|err| parse_error(err.to_string()))?;
+    let table = doc
+        .entry("film_info")
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| parse_error("film_info is not a table".to_owned()))?;
+    set_value(table, "duration_s", Some(Value::from(info.duration_s)));
+    set_value(table, "size", Some(Value::from(size)));
+    set_value(table, "modified", Some(Value::from(info.modified.as_str())));
+    write_atomic(&path, doc.to_string().as_bytes())
 }
 
 /// Replaces, inserts or removes `key`, keeping the old value's surrounding
@@ -282,6 +307,27 @@ text = "Third."
             "{problems:?}"
         );
         assert_eq!(script_text(&dir), SCRIPT);
+    }
+
+    #[test]
+    fn set_film_info_keeps_the_rest() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("# my film\n{original}")).unwrap();
+        let info = FilmInfo {
+            duration_s: 60.25,
+            size: 99,
+            modified: "2026-11-23T08:00:00Z".to_owned(),
+        };
+        set_film_info(&dir, &info).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.film_info, info);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# my film\n")
+        );
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub enum Error {
     Invalid(Vec<Problem>),
     #[error("no line with id {0:?} in script.toml")]
     UnknownLine(String),
+    #[error("line {line:?} has no take {take}")]
+    UnknownTake { line: String, take: u32 },
     #[error("no Takewise project at {} (missing project.toml)", .0.display())]
     NotAProject(PathBuf),
 }
@@ -38,6 +40,7 @@ impl Error {
             Error::ScriptChanged => "script-changed",
             Error::Invalid(_) => "invalid-script",
             Error::UnknownLine(_) => "unknown-line",
+            Error::UnknownTake { .. } => "unknown-take",
         }
     }
 }

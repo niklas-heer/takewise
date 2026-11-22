@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::lock;
-use crate::ledger::{self, Event, EventKind, Ledger, Recorded, Snapshot};
+use crate::ledger::{self, Chosen, Event, EventKind, Judged, Ledger, Recorded, Snapshot, Verdict};
+use crate::project::Project;
 use crate::project::TAKES_DIR;
 use crate::script::is_valid_id;
 
@@ -229,6 +230,57 @@ pub fn read_take_wav(path: &Path) -> Result<(Vec<i32>, u32)> {
         }
     }
     Ok((samples, spec.sample_rate))
+}
+
+/// Records a choice of a recorded take of a current line.
+pub fn choose_take(dir: &Path, line: &str, take: u32, by: &str) -> Result<()> {
+    let _guard = lock(dir)?;
+    check_take(dir, line, take)?;
+    let event = Event::new(line, take, EventKind::Chosen(Chosen { by: by.to_owned() }));
+    ledger::append_locked(dir, &event)
+}
+
+/// An outside judgment of a recorded take, against the line as it is now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Judgment {
+    pub by: String,
+    pub verdict: Verdict,
+    pub score: Option<f64>,
+    pub reason: String,
+}
+
+/// Appends a `judged` event for a recorded take of a current line.
+pub fn judge_take(dir: &Path, line: &str, take: u32, judgment: Judgment) -> Result<()> {
+    let _guard = lock(dir)?;
+    let snapshot = check_take(dir, line, take)?;
+    let event = Event::new(
+        line,
+        take,
+        EventKind::Judged(Judged {
+            snapshot,
+            by: judgment.by,
+            verdict: judgment.verdict,
+            score: judgment.score,
+            reason: judgment.reason,
+        }),
+    );
+    ledger::append_locked(dir, &event)
+}
+
+/// Checks that `line` is in the script and `take` was recorded for it, and
+/// returns the line's current snapshot.
+fn check_take(dir: &Path, line: &str, take: u32) -> Result<Snapshot> {
+    let project = Project::open(dir)?;
+    let snapshot = project
+        .snapshot(line)
+        .ok_or_else(|| Error::UnknownLine(line.to_owned()))?;
+    if ledger::read(dir)?.recorded(line, take).is_none() {
+        return Err(Error::UnknownTake {
+            line: line.to_owned(),
+            take,
+        });
+    }
+    Ok(snapshot)
 }
 
 /// A numbered take file, `NNN.wav` or `NNN.json`.
@@ -500,6 +552,46 @@ mod tests {
         assert_eq!(report.unadopted, vec![PathBuf::from("takes/hook/003.wav")]);
         assert!(line_dir.join("003.wav").exists());
         assert!(read(dir).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn choose_and_judge_require_a_recorded_take() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let info = crate::project::FilmInfo {
+            duration_s: 51.5,
+            size: 1,
+            modified: "2026-11-22T20:05:11Z".to_owned(),
+        };
+        Project::init(dir, Path::new("film.mp4"), info).unwrap();
+        fs::write(
+            dir.join("script.toml"),
+            "[[line]]\nid = \"hook\"\nstart = 10.0\ntext = \"Hello.\"\n",
+        )
+        .unwrap();
+        let err = choose_take(dir, "hook", 1, "narrator").unwrap_err();
+        assert!(matches!(err, Error::UnknownTake { take: 1, .. }), "{err:?}");
+        let err = choose_take(dir, "nope", 1, "narrator").unwrap_err();
+        assert!(matches!(err, Error::UnknownLine(_)), "{err:?}");
+
+        record(dir, "hook", 10);
+        choose_take(dir, "hook", 1, "narrator").unwrap();
+        let judgment = Judgment {
+            by: "claude".to_owned(),
+            verdict: Verdict::Keep,
+            score: Some(0.5),
+            reason: "clear".to_owned(),
+        };
+        judge_take(dir, "hook", 1, judgment).unwrap();
+        let ledger = read(dir).unwrap();
+        assert_eq!(ledger.events.len(), 3);
+        let EventKind::Judged(judged) = &ledger.events[2].kind else {
+            panic!("expected judged");
+        };
+        assert_eq!(
+            judged.snapshot,
+            Project::open(dir).unwrap().snapshot("hook").unwrap()
+        );
     }
 
     #[test]

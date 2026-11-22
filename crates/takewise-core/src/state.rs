@@ -28,6 +28,10 @@ pub struct State {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LineState {
     pub id: String,
+    pub text: String,
+    pub start: f64,
+    /// The resolved slot end.
+    pub end: f64,
     pub takes: Vec<TakeState>,
     /// The latest choice: take number and who chose it.
     #[serde(serialize_with = "serialize_chosen")]
@@ -202,6 +206,9 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         let proposed = ranks.iter().min_by(|a, b| a.cmp(b)).map(|r| r.take);
         lines.push(LineState {
             id: line.id.clone(),
+            text: current.text.clone(),
+            start: current.start,
+            end: current.end,
             takes,
             chosen,
             proposed,
