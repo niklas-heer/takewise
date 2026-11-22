@@ -2,6 +2,7 @@
 //! protocol, the take ledger, speech detection, export, and the timing and
 //! session rules of the recording window.
 
+pub mod check;
 pub mod edit;
 pub mod error;
 pub mod export;
