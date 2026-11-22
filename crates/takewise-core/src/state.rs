@@ -204,7 +204,7 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         let mut seen = HashSet::new();
         let mut takes = Vec::new();
         let mut ranks = Vec::new();
-        let mut chosen = None;
+        let mut choices = Vec::new();
         for event in ledger.events.iter().filter(|e| e.line == line.id) {
             match &event.kind {
                 EventKind::Recorded(rec) if seen.insert(event.take) => {
@@ -213,10 +213,11 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
                     takes.push(take);
                     ranks.push(rank);
                 }
-                EventKind::Chosen(choice) => chosen = Some((event.take, choice.by.clone())),
+                EventKind::Chosen(choice) => choices.push((event.take, choice.by.clone())),
                 _ => {}
             }
         }
+        let chosen = latest_valid_choice(&line.id, choices, &seen, &mut notices);
         takes.sort_by_key(|t| t.take);
         let proposed = ranks.iter().min_by(|a, b| a.cmp(b)).map(|r| r.take);
         let chosen_take = chosen.as_ref().map(|(take, _)| *take);
@@ -255,6 +256,30 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         problems,
         notices,
     }
+}
+
+/// The latest choice of a recorded take. A choice of a take without a
+/// (parseable) `recorded` event is ignored and reported as a notice.
+fn latest_valid_choice(
+    line: &str,
+    choices: Vec<(u32, String)>,
+    recorded: &HashSet<u32>,
+    notices: &mut Vec<Problem>,
+) -> Option<(u32, String)> {
+    let mut chosen = None;
+    let mut reported = HashSet::new();
+    for (take, by) in choices {
+        if recorded.contains(&take) {
+            chosen = Some((take, by));
+        } else if reported.insert(take) {
+            notices.push(Problem::new(
+                Some(line),
+                "choice-without-take",
+                format!("take {take} was chosen but has no recorded event; the choice is ignored"),
+            ));
+        }
+    }
+    chosen
 }
 
 /// A missing chosen take file is a problem; a missing other take, a stale
@@ -681,6 +706,52 @@ text = "Today we start."
         chosen(&project, "hook", 1, "claude");
         let state = fold_now(&project);
         assert_eq!(line(&state, "hook").chosen, Some((1, "claude".to_owned())));
+    }
+
+    #[test]
+    fn choice_without_a_recorded_take_is_ignored() {
+        let (_tmp, project) = setup(TWO_LINES);
+        recorded(&project, "hook", 1);
+        chosen(&project, "hook", 1, "narrator");
+        // A choice of a take that was never recorded.
+        chosen(&project, "hook", 3, "narrator");
+        // A choice whose recorded row is malformed.
+        let ledger = project.dir.join("takes.jsonl");
+        let mut text = fs::read_to_string(&ledger).unwrap();
+        text.push_str(
+            "{\"v\":1,\"at\":\"2026-11-22T20:00:00Z\",\"kind\":\"recorded\",\"line\":\"today\",\"take\":1}\n",
+        );
+        fs::write(&ledger, text).unwrap();
+        chosen(&project, "today", 1, "claude");
+
+        let state = fold_now(&project);
+        assert_eq!(
+            line(&state, "hook").chosen,
+            Some((1, "narrator".to_owned())),
+            "the earlier valid choice stands"
+        );
+        assert_eq!(line(&state, "today").chosen, None);
+        let codes: Vec<(Option<&str>, &str)> = state
+            .notices
+            .iter()
+            .map(|p| (p.line.as_deref(), p.code))
+            .collect();
+        assert!(
+            codes.contains(&(Some("hook"), "choice-without-take")),
+            "{codes:?}"
+        );
+        assert!(
+            codes.contains(&(Some("today"), "choice-without-take")),
+            "{codes:?}"
+        );
+        assert!(
+            !state
+                .problems
+                .iter()
+                .any(|p| p.code == "choice-without-take"),
+            "{:?}",
+            state.problems
+        );
     }
 
     #[test]

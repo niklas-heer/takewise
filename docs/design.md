@@ -122,7 +122,7 @@ The app, the CLI and agents editing by hand may all touch the folder.
 - `judged`: an outside judgment: `snapshot` judged against, `by` (free text, for example `claude-opus-5-5`), `verdict`, optional `score` 0–1, `reason`.
 - `chosen`: `by` (`narrator` or the agent's name).
 
-Snapshots store the resolved slot end, so moving a neighbour also changes them. Folding: a take's effective verdict is its latest `judged` event whose snapshot matches the current line (text exactly, start and end within 1 µs), otherwise its latest matching `checked` event, otherwise none (`unchecked`). A judgment or check against old text or an old slot is shown as stale; checks are re-run, judgments are not. A line's choice is its latest `chosen` event. No other event kinds in v1.
+Snapshots store the resolved slot end, so moving a neighbour also changes them. Folding: a take's effective verdict is its latest `judged` event whose snapshot matches the current line (text exactly, start and end within 1 µs), otherwise its latest matching `checked` event, otherwise none (`unchecked`). A judgment or check against old text or an old slot is shown as stale; checks are re-run, judgments are not. A line's choice is its latest `chosen` event of a recorded take; a choice of a take without a parseable `recorded` event is ignored and reported as a `choice-without-take` notice, so the line counts as unchosen. No other event kinds in v1.
 
 ## Timing model
 
@@ -183,7 +183,7 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | --- | --- |
 | `takewise init <dir> --film <path>` | Create a project with an empty script and the film's info. |
 | `takewise record <dir>` | Open the recording window. |
-| `takewise status <dir> [--strict] [--repair] [--refresh-film]` | Lines, takes, effective verdicts, proposed and chosen takes, validation problems, stale checks, orphans, film changes. Findings are `problems` (validation, missing chosen take files, film missing or changed) or `notices` (crash leftovers such as torn or bad ledger lines, `.partial` and unadoptable files; stale chosen takes; missing files of other takes). `--strict` fails on problems and lines without a chosen take, never on notices. |
+| `takewise status <dir> [--strict] [--repair] [--refresh-film]` | Lines, takes, effective verdicts, proposed and chosen takes, validation problems, stale checks, orphans, film changes. Findings are `problems` (validation, missing chosen take files, film missing or changed) or `notices` (crash leftovers such as torn or bad ledger lines, `.partial` and unadoptable files; choices of takes without a `recorded` event; stale chosen takes; missing files of other takes). `--strict` fails on problems and lines without a chosen take, never on notices. |
 | `takewise script set <dir> <line> --text … / --start … / --end …` | Edit one field of one line safely. |
 | `takewise check <dir> [--line ID] [--take N]` | Run checks; appends `checked` events. |
 | `takewise judge <dir> <line> <take> --verdict … --reason … --by … [--score …]` | Add an outside judgment. |
