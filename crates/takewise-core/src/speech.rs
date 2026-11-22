@@ -20,11 +20,11 @@ const MIN_RUN_FRAMES: usize = 8;
 /// A first or last run is dropped as a breath, a click or a chair, not the
 /// first or last word, only when all hold: it has fewer voiced frames than
 /// this (in 10 ms frames), at least `ISOLATION_GAP_FRAMES` separate it from
-/// the next run, and its level is at least `WEAK_RUN_BELOW_MEDIAN_DB` below
-/// the median level of the runs that remain.
+/// the next run, and its level is at least `WEAK_RUN_BELOW_LOUDEST_DB` below
+/// the loudest of the runs that remain.
 const WEAK_RUN_FRAMES: usize = 15;
 const ISOLATION_GAP_FRAMES: usize = 40;
-const WEAK_RUN_BELOW_MEDIAN_DB: f64 = 10.0;
+const WEAK_RUN_BELOW_LOUDEST_DB: f64 = 10.0;
 const CLIP_DBFS: f64 = -0.1;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -117,32 +117,31 @@ impl Run {
         later.start - self.end - 1
     }
 
+    /// Mean square of the voiced frames, relative to full scale.
+    fn mean_power(self) -> f64 {
+        self.power / self.voiced as f64
+    }
+
     /// RMS level of the voiced frames in dBFS.
     fn level_db(self) -> f64 {
-        10.0 * (self.power / self.voiced as f64).log10()
+        10.0 * self.mean_power().log10()
     }
 
     /// Whether this run, isolated by `gap` frames at one end of the speech,
-    /// is noise rather than a word, judged against the runs that remain. A
-    /// run 10 dB below their median leaves a louder run behind, so trimming
-    /// never leaves only weaker runs; `rest` is never empty.
+    /// is noise rather than a word, judged against the loudest run that
+    /// remains, so noise at the other end cannot shield it and trimming never
+    /// leaves only weaker runs; `rest` is never empty.
     fn is_isolated_noise(self, gap: usize, rest: &[Run]) -> bool {
         self.voiced < WEAK_RUN_FRAMES
             && gap >= ISOLATION_GAP_FRAMES
-            && median_level(rest)
-                .is_some_and(|median| self.level_db() <= median - WEAK_RUN_BELOW_MEDIAN_DB)
+            && loudest_level(rest)
+                .is_some_and(|loudest| self.level_db() <= loudest - WEAK_RUN_BELOW_LOUDEST_DB)
     }
 }
 
-fn median_level(runs: &[Run]) -> Option<f64> {
-    let mut levels: Vec<f64> = runs.iter().map(|r| r.level_db()).collect();
-    levels.sort_by(f64::total_cmp);
-    let mid = levels.len() / 2;
-    match levels.len() {
-        0 => None,
-        n if n % 2 == 1 => Some(levels[mid]),
-        _ => Some(f64::midpoint(levels[mid - 1], levels[mid])),
-    }
+/// The RMS level in dBFS of the loudest run.
+fn loudest_level(runs: &[Run]) -> Option<f64> {
+    runs.iter().map(|r| r.level_db()).max_by(f64::total_cmp)
 }
 
 /// The first and last frame of speech: bridges short gaps, drops runs with
@@ -169,17 +168,20 @@ fn speech_runs(levels: &[f64], threshold: f64) -> Option<(usize, usize)> {
         .into_iter()
         .filter(|run| run.voiced >= MIN_RUN_FRAMES)
         .collect::<Vec<_>>();
-    while let [first, rest @ ..] = kept
-        && let Some(next) = rest.first()
-        && first.is_isolated_noise(first.gap_to(*next), rest)
-    {
-        kept = rest;
-    }
-    while let [rest @ .., last] = kept
-        && let Some(previous) = rest.last()
-        && last.is_isolated_noise(previous.gap_to(*last), rest)
-    {
-        kept = rest;
+    loop {
+        if let [first, rest @ ..] = kept
+            && let Some(next) = rest.first()
+            && first.is_isolated_noise(first.gap_to(*next), rest)
+        {
+            kept = rest;
+        } else if let [rest @ .., last] = kept
+            && let Some(previous) = rest.last()
+            && last.is_isolated_noise(previous.gap_to(*last), rest)
+        {
+            kept = rest;
+        } else {
+            break;
+        }
     }
     Some((kept.first()?.start, kept.last()?.end))
 }
@@ -189,6 +191,28 @@ mod tests {
     use super::*;
     use crate::takes::FULL_SCALE;
     use crate::testutil::{RATE, burst, burst_at, noise};
+
+    #[test]
+    fn noise_at_both_ends_is_trimmed() {
+        // 90 ms of noise 12 dB below the phrase, isolated at either end.
+        let mut levels = vec![SILENCE_DBFS; 200];
+        levels[0..9].fill(-21.0);
+        levels[49..149].fill(-9.0);
+        levels[189..198].fill(-21.0);
+        assert_eq!(speech_runs(&levels, -60.0), Some((49, 148)));
+    }
+
+    #[test]
+    fn weak_run_is_judged_against_the_loudest_run() {
+        // A 100 ms breath at -37 dBFS, then phrases at -40 and -20 dBFS. The
+        // breath is 17 dB below the loudest phrase, so it is trimmed even
+        // though it is louder than the quieter phrase.
+        let mut levels = vec![SILENCE_DBFS; 160];
+        levels[0..10].fill(-37.0);
+        levels[50..80].fill(-40.0);
+        levels[120..150].fill(-20.0);
+        assert_eq!(speech_runs(&levels, -60.0), Some((50, 149)));
+    }
 
     fn close(actual: f64, expected: f64) -> bool {
         (actual - expected).abs() <= 0.020
