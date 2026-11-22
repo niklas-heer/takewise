@@ -31,6 +31,8 @@ const LEVEL_HOLD_S: f64 = 0.5;
 const METER_RETRY_S: f64 = 2.0;
 /// How often saving a take that could not be saved is retried.
 const SAVE_RETRY_S: f64 = 2.0;
+/// A film halted this close to its end has reached it.
+const END_TOLERANCE_S: f64 = 0.25;
 
 /// What a tick or a stop produced, for the window to show.
 #[derive(Debug, Default)]
@@ -103,6 +105,12 @@ struct Take {
     write_error_shown: bool,
     /// Host time at which the film reaches the line's start, once scheduled.
     line_start_host_s: Option<f64>,
+    /// The film's duration and the project's `tail_s`: a take whose stop
+    /// lies past the film's end stops `tail_s` after the film ends.
+    film_end_s: f64,
+    tail_s: f64,
+    /// Host time at which the film reached its end, once it did.
+    film_ended_host_s: Option<f64>,
 }
 
 struct Playback {
@@ -296,6 +304,9 @@ impl Recorder {
             begin_error: None,
             write_error_shown: false,
             line_start_host_s: None,
+            film_end_s: project.film_duration(),
+            tail_s: rec.tail_s,
+            film_ended_host_s: None,
         }));
         Ok(())
     }
@@ -530,10 +541,7 @@ impl Recorder {
                     );
                 }
                 let failure = failure.or_else(|| media.capture_error());
-                let at_end = take
-                    .clock
-                    .film_at(now)
-                    .is_some_and(|film| film >= take.plan.capture_stop_film_s);
+                let at_end = reached_stop(take, now);
                 if failure.is_none() && !at_end {
                     return Update {
                         message,
@@ -616,6 +624,30 @@ impl Recorder {
             media.stop_capture();
         }
     }
+}
+
+/// Whether the take reached its stop: `tail_s` after the slot's end, or,
+/// when the film ends first, `tail_s` of host time after the film's end.
+/// Notes when the film reached its end (played to it, or halted near it).
+fn reached_stop(take: &mut Take, now: f64) -> bool {
+    let Some(film) = take.clock.film_at(now) else {
+        return false;
+    };
+    if take.film_ended_host_s.is_none() {
+        let tb = take.clock.history().timebase_at(now);
+        let halted = tb.is_some_and(|tb| tb.rate == 0.0);
+        let end = take.film_end_s;
+        if film >= end || (halted && film >= end - END_TOLERANCE_S) {
+            let ended = tb.filter(|tb| tb.rate > 0.0).map_or(now, |tb| {
+                tb.host_anchor_s + (end - tb.film_anchor_s) / tb.rate
+            });
+            take.film_ended_host_s = Some(ended.min(now));
+        }
+    }
+    film >= take.plan.capture_stop_film_s
+        || take
+            .film_ended_host_s
+            .is_some_and(|ended| now >= ended + take.tail_s)
 }
 
 /// Starts the film and the take at the same host time; returns the film's

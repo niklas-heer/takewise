@@ -964,3 +964,30 @@ fn the_take_follows_the_film_as_it_really_plays(cx: &mut TestAppContext) {
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
     assert_eq!(recorded(&f.dir).len(), 1);
 }
+
+#[gpui_kit::test]
+fn a_take_of_the_last_line_stops_after_the_films_end(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // d is the last line: its slot runs to the film's end (20.0), so slot
+    // end + tail (21.5) is never reached; film 6.0 at host 100.4.
+    press(cx, f.window, &["down", "down", "down"]);
+    begin(cx, &f, 100.0);
+    // The film reaches its end at host 114.4, and the player halts there.
+    f.media.set_now(114.4);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 20.0,
+        host_anchor_s: 114.4,
+    });
+    f.media.set_now(114.5);
+    frame(cx, f.window);
+    f.media.set_now(115.85);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    // tail_s (1.5) of host time after the film's end.
+    f.media.set_now(115.95);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(recorded(&f.dir).len(), 1);
+}
