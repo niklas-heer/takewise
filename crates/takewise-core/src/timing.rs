@@ -44,9 +44,17 @@ impl TimebaseHistory {
     /// Film time at `host_s` under the timebase valid at that host time;
     /// `None` before the first recorded timebase.
     pub fn film_at(&self, host_s: f64) -> Option<f64> {
+        self.timebase_at(host_s).map(|tb| tb.film_at(host_s))
+    }
+
+    /// The timebase valid at `host_s`; `None` before the first one.
+    pub fn timebase_at(&self, host_s: f64) -> Option<Timebase> {
         let idx = self.entries.partition_point(|(at, _)| *at <= host_s);
-        let (_, tb) = self.entries.get(idx.checked_sub(1)?)?;
-        Some(tb.film_at(host_s))
+        self.entries.get(idx.checked_sub(1)?).map(|(_, tb)| *tb)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

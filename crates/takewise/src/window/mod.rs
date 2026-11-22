@@ -5,6 +5,7 @@
 //! those short writes, never while recording. The microphone is never
 //! monitored: capture feeds the take and the level meter only.
 
+mod clock;
 mod lines;
 mod media;
 mod prompter;
@@ -29,6 +30,7 @@ use takewise_core::{
     check_input, clamp_mark, plan_take,
 };
 
+pub use clock::FilmClock;
 pub use media::{Media, RealMedia};
 use recorder::Recorder;
 use watch::Watcher;

@@ -18,6 +18,9 @@ pub trait Media {
     /// Plays from `film_s` at `host_s`, holding the frame until then, and
     /// returns the scheduled timebase.
     fn film_play_at(&mut self, film_s: f64, host_s: f64) -> Result<Timebase, String>;
+    /// The film's timebase as the player reports it now (stopped before a
+    /// scheduled start).
+    fn film_timebase(&self) -> Timebase;
     fn film_pause(&mut self);
     fn film_seek(&mut self, film_s: f64);
     fn film_set_gain_db(&mut self, db: f64);
@@ -66,6 +69,13 @@ impl RealMedia {
             capture: None,
         })
     }
+
+    /// Plays the film through the output device with this name.
+    pub fn set_output_device(&self, name: &str) -> Result<(), String> {
+        self.film
+            .set_output_device(name)
+            .map_err(|err| err.to_string())
+    }
 }
 
 impl Media for RealMedia {
@@ -81,6 +91,10 @@ impl Media for RealMedia {
         self.film
             .play_at(film_s, host_s)
             .map_err(|err| err.to_string())
+    }
+
+    fn film_timebase(&self) -> Timebase {
+        self.film.timebase()
     }
 
     fn film_pause(&mut self) {

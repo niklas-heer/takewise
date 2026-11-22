@@ -8,17 +8,18 @@ use std::sync::mpsc::{self, Receiver};
 
 use takewise_core::takes::FULL_SCALE;
 use takewise_core::{
-    Dropout, PartialTake, Project, RECORD_RATE, RecordedInput, Snapshot, TakeRef, TakeState,
-    Timebase, TimebaseHistory, WavLock, begin_take, commit_take, line_offset_s, plan_take,
+    Dropout, PartialTake, Project, RECORD_RATE, RecordPlan, RecordedInput, Snapshot, TakeRef,
+    TakeState, Timebase, WavLock, begin_take, commit_take, line_offset_s, plan_take,
     sample_film_time, update_take_meta, write_take_wav,
 };
 use takewise_media::CaptureBuffer;
 
+use super::clock::{FilmClock, START_LEAD_S};
 use super::media::Media;
 use super::writer::{Progress, TakeWriter, Written};
 
-/// How far ahead a start is scheduled, so the players are set up before it.
-pub const START_LEAD_S: f64 = 0.15;
+/// How long a take waits for its first buffer before it gives up.
+const FIRST_BUFFER_TIMEOUT_S: f64 = 2.0;
 /// How long the film plays muted after opening, so a cold output device does
 /// not shift the first take.
 pub const WARMUP_S: f64 = 0.3;
@@ -85,7 +86,11 @@ struct Take {
     channel: u16,
     latency_s: f64,
     offset_ms: f64,
-    history: TimebaseHistory,
+    plan: RecordPlan,
+    /// Host time the capture was started.
+    capture_started_host_s: f64,
+    /// Schedules the film once the first buffer arrived, then follows it.
+    clock: FilmClock,
     /// Receives the capture and keeps and writes the audio.
     writer: TakeWriter,
     /// The take on disk: begun once the first buffer places the take.
@@ -96,9 +101,8 @@ struct Take {
     begin_error: Option<String>,
     /// Whether the writer's error was shown.
     write_error_shown: bool,
-    /// Host time at which the film reaches the line's start.
-    line_start_host_s: f64,
-    stop_film_s: f64,
+    /// Host time at which the film reaches the line's start, once scheduled.
+    line_start_host_s: Option<f64>,
 }
 
 struct Playback {
@@ -184,7 +188,7 @@ impl Recorder {
     pub fn playhead_s(&self, media: &dyn Media) -> Option<f64> {
         let now = media.host_now_s();
         match &self.phase {
-            Phase::Recording(take) => take.history.film_at(now),
+            Phase::Recording(take) => take.clock.film_at(now),
             Phase::Playing(Playback {
                 started: Some(tb), ..
             }) => Some(tb.film_at(now)),
@@ -197,7 +201,7 @@ impl Recorder {
         let Phase::Recording(take) = &self.phase else {
             return None;
         };
-        let left = take.line_start_host_s - media.host_now_s();
+        let left = take.line_start_host_s? - media.host_now_s();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         (left > 0.0).then(|| left.ceil() as u32)
     }
@@ -232,9 +236,10 @@ impl Recorder {
         }
     }
 
-    /// Starts a take of line `idx`: the film plays from the pre-roll (holding
-    /// its first frame when the line starts within the pre-roll) and capture
-    /// starts now, with the count-in.
+    /// Starts a take of line `idx`: capture starts now; once its first
+    /// buffer arrives, the film is scheduled to play from the pre-roll
+    /// (holding its first frame when the line starts within the pre-roll),
+    /// with the count-in.
     pub fn start_take(
         &mut self,
         media: &mut dyn Media,
@@ -266,22 +271,13 @@ impl Recorder {
 
         let rec = &project.config.record;
         let plan = plan_take(line.start, snapshot.end, rec.preroll_s, rec.tail_s);
-        let now = media.host_now_s();
-        let begin = now + START_LEAD_S;
-        media.film_set_muted(false);
-        media.film_set_gain_db(rec.film_gain_db);
-        let tb = media.film_play_at(plan.film_from_s, begin + plan.hold_first_frame_s)?;
-        let mut history = TimebaseHistory::new();
-        // The scheduled mapping holds for every sample of this take, also
-        // for those whose latency-corrected time lies just before this call.
-        history.record(now - 1.0, tb);
-
         let (tx, rx) = mpsc::channel();
         if let Err(err) = media.start_capture(&device, input.channel, tx) {
-            media.film_pause();
             media.film_seek(self.park_s);
             return Err(format!("Cannot record from {device:?}: {err}"));
         }
+        media.film_set_muted(false);
+        media.film_set_gain_db(rec.film_gain_db);
         self.level = None;
         self.phase = Phase::Recording(Box::new(Take {
             line: line.id.clone(),
@@ -291,14 +287,15 @@ impl Recorder {
             channel: input.channel,
             latency_s,
             offset_ms: f64::from(input.latency_offset_ms),
-            history,
+            plan,
+            capture_started_host_s: media.host_now_s(),
+            clock: FilmClock::new(),
             writer: TakeWriter::spawn(rx),
             partial: None,
             first_film_s: None,
             begin_error: None,
             write_error_shown: false,
-            line_start_host_s: tb.host_anchor_s + (line.start - tb.film_anchor_s),
-            stop_film_s: plan.capture_stop_film_s,
+            line_start_host_s: None,
         }));
         Ok(())
     }
@@ -319,7 +316,7 @@ impl Recorder {
             channel,
             latency_s,
             offset_ms,
-            history,
+            clock,
             writer,
             partial,
             first_film_s,
@@ -332,9 +329,15 @@ impl Recorder {
         if written.samples.is_empty() {
             return Update::default();
         }
+        if !clock.started() {
+            return Update {
+                committed: None,
+                message: Some("Stopped before the film started; nothing was recorded.".to_owned()),
+            };
+        }
         let first_film_s = first_film_s.or_else(|| {
             let host = written.first_host_s?;
-            sample_film_time(&history, host, 0, RECORD_RATE, latency_s, offset_ms)
+            sample_film_time(clock.history(), host, 0, RECORD_RATE, latency_s, offset_ms)
         });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
         // The take keeps its film position: placed against the line as it is
@@ -494,6 +497,28 @@ impl Recorder {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
                 let progress = take.writer.progress();
+                let mut failure = None;
+                if !take.clock.started() {
+                    if progress.first_host_s.is_some() {
+                        let plan = take.plan;
+                        match take
+                            .clock
+                            .start(media, plan.film_from_s, plan.hold_first_frame_s)
+                        {
+                            Ok(tb) => {
+                                take.line_start_host_s =
+                                    Some(tb.host_anchor_s + (take.line_start - tb.film_anchor_s));
+                            }
+                            Err(err) => failure = Some(format!("the film cannot play: {err}")),
+                        }
+                    } else if now - take.capture_started_host_s > FIRST_BUFFER_TIMEOUT_S {
+                        failure = Some(format!(
+                            "No audio arrived from {:?}; check the input device.",
+                            take.device
+                        ));
+                    }
+                }
+                take.clock.track(media);
                 let mut message = begin_on_disk(take, dir, &progress);
                 if let Some(err) = progress.error.as_ref().filter(|_| !take.write_error_shown) {
                     take.write_error_shown = true;
@@ -504,11 +529,11 @@ impl Recorder {
                         )),
                     );
                 }
-                let failure = media.capture_error();
+                let failure = failure.or_else(|| media.capture_error());
                 let at_end = take
-                    .history
+                    .clock
                     .film_at(now)
-                    .is_some_and(|film| film >= take.stop_film_s);
+                    .is_some_and(|film| film >= take.plan.capture_stop_film_s);
                 if failure.is_none() && !at_end {
                     return Update {
                         message,
@@ -609,7 +634,7 @@ fn start_both(media: &mut dyn Media, playback: &Playback, now: f64) -> Result<Ti
 /// `first_host_s`.
 fn first_sample_film_s(take: &Take, first_host_s: f64) -> Option<f64> {
     sample_film_time(
-        &take.history,
+        take.clock.history(),
         first_host_s,
         0,
         RECORD_RATE,
@@ -622,7 +647,7 @@ fn first_sample_film_s(take: &Take, first_host_s: f64) -> Option<f64> {
 /// metadata and has the writer stream into the partial WAV. On failure the
 /// take goes on in memory; returns the message to show.
 fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<String> {
-    if take.partial.is_some() || take.begin_error.is_some() {
+    if take.partial.is_some() || take.begin_error.is_some() || !take.clock.started() {
         return None;
     }
     let first = first_sample_film_s(take, progress.first_host_s?).unwrap_or(take.line_start);

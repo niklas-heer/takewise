@@ -1,7 +1,7 @@
 //! The loopback calibration: a film of short beeps at known film times plays
 //! through the default output while the configured input records, with the
-//! same sample mapping as a take (and `latency_offset_ms` = 0). Where the
-//! recorded beeps land on the film gives the offset to store.
+//! same start routine and sample mapping as a take (and `latency_offset_ms`
+//! = 0). Where the recorded beeps land on the film gives the offset to store.
 //!
 //! The beep film is made with `ffmpeg` by the command line; the measurement
 //! runs inside Takewise.app (`calibrate-run`), which owns the microphone
@@ -14,12 +14,13 @@ use std::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use takewise_core::takes::FULL_SCALE;
 use takewise_core::{
-    AvailableInput, Project, RECORD_RATE, TimebaseHistory, check_input, sample_film_time,
+    Assembler, AvailableInput, Project, RECORD_RATE, TimebaseHistory, check_input, sample_film_time,
 };
 use takewise_media::{
-    Capture, CaptureBuffer, FilmPlayer, default_output, host_time_now_s, input_devices,
-    input_latency_s, pump_run_loop,
+    CaptureBuffer, default_output, host_time_now_s, input_devices, pump_run_loop,
 };
+
+use crate::window::{FilmClock, Media as _, RealMedia};
 
 /// Film times of the beeps; the first is 0.1 s, to test the film's start.
 pub const BEEPS: [f64; 10] = [0.1, 1.3, 2.6, 3.9, 5.2, 6.5, 7.8, 9.1, 10.4, 11.7];
@@ -216,39 +217,34 @@ pub fn offset_for(mean_ms: f64) -> i32 {
     (-mean_ms).round() as i32
 }
 
-/// The onsets in the captured buffers, placed with the take mapping.
+/// The onsets in the captured buffers, placed as a take places its samples:
+/// the buffers end to end with gaps filled (the take writer's
+/// [`Assembler`]), each sample at the first one's host time plus its index.
 fn onsets_of(buffers: &[CaptureBuffer], history: &TimebaseHistory, latency_s: f64) -> Vec<Onset> {
-    let samples: Vec<i32> = buffers
-        .iter()
-        .flat_map(|b| b.samples.iter().copied())
-        .collect();
-    let mut onsets = Vec::new();
-    let mut index = detect_onsets(&samples, RECORD_RATE).into_iter().peekable();
-    let mut first = 0;
-    for buffer in buffers {
-        let end = first + buffer.samples.len();
-        while let Some(&at) = index.peek().filter(|&&at| at < end) {
-            index.next();
-            let offset = at - first;
-            let host_s = buffer.host_time_s + offset as f64 / f64::from(RECORD_RATE) - latency_s;
-            if let Some(film_s) = sample_film_time(
-                history,
-                buffer.host_time_s,
-                offset,
-                RECORD_RATE,
-                latency_s,
-                0.0,
-            ) {
-                onsets.push(Onset { host_s, film_s });
-            }
-        }
-        first = end;
+    let mut gaps = Assembler::new(RECORD_RATE);
+    let mut samples: Vec<i32> = Vec::new();
+    for buffer in buffers.iter().filter(|b| !b.samples.is_empty()) {
+        let silence = gaps.push(buffer.host_time_s, buffer.samples.len());
+        samples.resize(samples.len() + silence, 0);
+        samples.extend_from_slice(&buffer.samples);
     }
-    onsets
+    let Some(first) = gaps.first_host_s() else {
+        return Vec::new();
+    };
+    detect_onsets(&samples, RECORD_RATE)
+        .into_iter()
+        .filter_map(|at| {
+            let host_s = first + at as f64 / f64::from(RECORD_RATE) - latency_s;
+            let film_s = sample_film_time(history, first, at, RECORD_RATE, latency_s, 0.0)?;
+            Some(Onset { host_s, film_s })
+        })
+        .collect()
 }
 
-/// Plays the beep film and records the project's input. Runs on the main
-/// thread inside Takewise.app.
+/// Plays the beep film and records the project's input through the window's
+/// media and its start routine ([`FilmClock`]): capture first, the film
+/// scheduled once audio arrives, its timebase read back while it plays.
+/// Runs on the main thread inside Takewise.app.
 pub fn measure(
     project: &Project,
     film: &Path,
@@ -268,46 +264,48 @@ pub fn measure(
         })
         .collect();
     check_input(Some(&device), &available)?;
-    let latency_s = input_latency_s(&device).map_err(|err| err.to_string())?;
-    let player = FilmPlayer::open(film).map_err(|err| err.to_string())?;
+    let mut media = RealMedia::open(film)?;
+    let latency_s = media.input_latency_s(&device)?;
     let output = match output {
         Some(name) => {
-            player
-                .set_output_device(name)
-                .map_err(|err| err.to_string())?;
+            media.set_output_device(name)?;
             name.to_owned()
         }
         None => default_output().map_or_else(|_| "unknown".to_owned(), |d| d.name),
     };
     let loading_until = host_time_now_s() + 10.0;
-    while !player.is_ready() {
+    while !media.film_ready() {
         if host_time_now_s() > loading_until {
             return Err("the beep film did not load".to_owned());
         }
         pump_run_loop(0.05);
     }
-    player.set_gain_db(0.0);
-    // Wake the output device, as before the first take.
-    player.set_muted(true);
-    player
-        .play_at(0.0, host_time_now_s())
-        .map_err(|err| err.to_string())?;
+    media.film_set_gain_db(0.0);
+    // Wake the output device, as the window does before the first take.
+    media.film_set_muted(true);
+    media.film_play_at(0.0, host_time_now_s())?;
     pump_run_loop(0.3);
-    player.pause();
-    player.set_muted(false);
-    player.seek(0.0);
+    media.film_pause();
+    media.film_set_muted(false);
+    media.film_seek(0.0);
     pump_run_loop(0.2);
 
     let (tx, rx) = mpsc::channel();
-    let capture = Capture::start(&device, config.channel, tx).map_err(|err| err.to_string())?;
+    media.start_capture(&device, config.channel, tx)?;
     let mut buffers: Vec<CaptureBuffer> = Vec::new();
-    let mut history = TimebaseHistory::new();
-    history.record(host_time_now_s() - 1.0, player.timebase());
+    let waiting_until = host_time_now_s() + 5.0;
+    while buffers.is_empty() {
+        if host_time_now_s() > waiting_until {
+            media.stop_capture();
+            return Err(format!("no audio arrived from {device:?}"));
+        }
+        pump_run_loop(0.01);
+        buffers.extend(rx.try_iter());
+    }
+    let mut clock = FilmClock::new();
     let mut expected = Vec::new();
     for (from, secs) in SEGMENTS {
-        let start = host_time_now_s() + 0.3;
-        let tb = player.play_at(from, start).map_err(|err| err.to_string())?;
-        history.record(host_time_now_s(), tb);
+        let start = clock.start(&mut media, from, 0.0)?.host_anchor_s;
         expected.extend(
             BEEPS
                 .iter()
@@ -320,23 +318,24 @@ pub fn measure(
         let until = start + secs;
         while host_time_now_s() < until {
             pump_run_loop(0.02);
+            clock.track(&media);
             buffers.extend(rx.try_iter());
         }
-        player.pause();
-        history.record(host_time_now_s(), player.timebase());
+        clock.stop(&mut media);
         let settle = host_time_now_s() + 0.4;
         while host_time_now_s() < settle {
             pump_run_loop(0.02);
             buffers.extend(rx.try_iter());
         }
-        if let Some(err) = capture.last_error() {
+        if let Some(err) = media.capture_error() {
+            media.stop_capture();
             return Err(format!("capture failed: {err}"));
         }
     }
-    capture.stop();
+    media.stop_capture();
     buffers.extend(rx.try_iter());
 
-    let onsets = onsets_of(&buffers, &history, latency_s);
+    let onsets = onsets_of(&buffers, clock.history(), latency_s);
     let placed = place_onsets(&onsets, &expected);
     let errors: Vec<f64> = placed.iter().map(|p| p.error_ms).collect();
     let stats = mean_sd(&errors);
@@ -463,6 +462,36 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![(0.1, 315), (1.3, -500), (1.3, 300)]);
+    }
+
+    #[test]
+    fn places_onsets_after_a_gap_at_their_time() {
+        // 0.5 s of noise, 0.1 s lost, then a beep 0.2 s into the next buffer.
+        let audio = recording(1.5, &[0.7]);
+        let buffers = [
+            CaptureBuffer {
+                host_time_s: 10.0,
+                samples: audio[..24_000].to_vec(),
+            },
+            CaptureBuffer {
+                host_time_s: 10.6,
+                samples: audio[24_000..].to_vec(),
+            },
+        ];
+        let mut history = TimebaseHistory::new();
+        history.record(
+            f64::NEG_INFINITY,
+            takewise_core::Timebase {
+                rate: 1.0,
+                film_anchor_s: 0.0,
+                host_anchor_s: 10.0,
+            },
+        );
+        let onsets = onsets_of(&buffers, &history, 0.05);
+        assert_eq!(onsets.len(), 1, "{onsets:?}");
+        // The beep's sample: host 10.6 + 0.2, heard 50 ms earlier.
+        assert!((onsets[0].host_s - 10.75).abs() < 0.000_5, "{onsets:?}");
+        assert!((onsets[0].film_s - 0.75).abs() < 0.000_5, "{onsets:?}");
     }
 
     #[test]

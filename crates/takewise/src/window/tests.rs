@@ -17,6 +17,7 @@ use takewise_core::{
 };
 use takewise_media::{CaptureBuffer, Frame};
 
+use super::clock::FilmClock;
 use super::{Media, RecordingWindow, bind_keys, load};
 
 const DEVICE: &str = "Test Mic";
@@ -32,6 +33,9 @@ struct Fake {
     capture_error: Option<String>,
     /// Every `film_play_at` call: (`film_s`, `host_s`).
     plays: Vec<(f64, f64)>,
+    /// The player's timebase as read back; by default the last scheduled
+    /// one once its start has passed, and stopped before.
+    timebase: Option<Timebase>,
 }
 
 #[derive(Clone)]
@@ -52,6 +56,7 @@ impl FakeMedia {
             sent: 0,
             capture_error: None,
             plays: Vec::new(),
+            timebase: None,
         })))
     }
 
@@ -95,6 +100,18 @@ impl Media for FakeMedia {
             film_anchor_s: film_s,
             host_anchor_s: host_s,
         })
+    }
+    fn film_timebase(&self) -> Timebase {
+        let fake = self.0.borrow();
+        if let Some(tb) = fake.timebase {
+            return tb;
+        }
+        let (film_s, host_s) = fake.plays.last().copied().unwrap_or((0.0, 0.0));
+        Timebase {
+            rate: if fake.now >= host_s { 1.0 } else { 0.0 },
+            film_anchor_s: film_s,
+            host_anchor_s: host_s,
+        }
     }
     fn film_pause(&mut self) {}
     fn film_seek(&mut self, _: f64) {}
@@ -310,45 +327,54 @@ fn message(cx: &mut TestAppContext, view: &Entity<RecordingWindow>) -> String {
     view.read_with(cx, |view, _| view.message.clone().unwrap_or_default())
 }
 
-/// Records one take of the line selected now: Space at host 100, one buffer
-/// of 0.1 s, Space at host 100.5.
-fn record_take(cx: &mut TestAppContext, f: &Fixture) {
-    f.media.set_now(100.0);
+/// Starts a take of the line selected now: Space at host `at`, a first
+/// buffer of 50 ms stamped `at + 0.05` (its first sample was heard at host
+/// `at`, after the 50 ms latency), and the frame at `at + 0.1` that sees it
+/// and schedules the film to start at `at + 0.4` (plus any held first frame).
+fn begin(cx: &mut TestAppContext, f: &Fixture, at: f64) {
+    f.media.set_now(at);
     press(cx, f.window, &["space"]);
-    f.media.send(100.2, 4800);
-    f.media.set_now(100.5);
+    f.media.send(at + 0.05, 2400);
+    settle(cx, f);
+    f.media.set_now(at + 0.1);
     frame(cx, f.window);
+}
+
+/// Records one take of the line selected now: begun at host 100, stopped
+/// with Space at host 100.5; 2400 samples.
+fn record_take(cx: &mut TestAppContext, f: &Fixture) {
+    begin(cx, f, 100.0);
+    f.media.set_now(100.5);
     press(cx, f.window, &["space"]);
+}
+
+fn last_play(f: &Fixture) -> (f64, f64) {
+    f.media.0.borrow().plays.last().copied().expect("a play")
 }
 
 #[gpui_kit::test]
 fn space_records_and_commits_a_take(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down", "down", "down"]); // d: start 8.0, pre-roll from 6.0
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
+    begin(cx, &f, 100.0);
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
-    // The film is scheduled from 6.0 at host 100.15.
-    let last_play = *f.media.0.borrow().plays.last().expect("a play");
-    assert_eq!(last_play, (6.0, 100.15));
-
-    // First sample: callback 100.2, minus 50 ms latency = host 100.15 =
-    // film 6.0, two seconds before the line.
-    f.media.send(100.2, 4800);
+    // The film is scheduled from 6.0 at host 100.4, 0.3 s after the frame
+    // that saw the first buffer.
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 6.0) && close(host_s, 100.4),
+        "{film_s} {host_s}"
+    );
     f.media.set_now(100.5);
-    frame(cx, f.window);
     press(cx, f.window, &["space"]);
 
     let takes = recorded(&f.dir);
     assert_eq!(takes.len(), 1, "one recorded event");
     let (line, take, event) = &takes[0];
     assert_eq!((line.as_str(), *take), ("d", 1));
-    assert!(
-        (event.line_offset_s - -2.0).abs() < 1e-9,
-        "{}",
-        event.line_offset_s
-    );
-    assert_eq!(event.samples, 4800);
+    // First sample: host 100.0 = film 5.6, 2.4 s before the line.
+    assert!(close(event.line_offset_s, -2.4), "{}", event.line_offset_s);
+    assert_eq!(event.samples, 2400);
     assert_eq!(event.device, DEVICE);
     assert_eq!(event.snapshot.text, "Fourth line.");
     assert!(f.dir.join("takes/d/001.wav").is_file());
@@ -363,25 +389,30 @@ fn first_line_take_starts_before_film_zero(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     // a: start 0.0; the film holds frame 0 for the whole 2 s pre-roll.
     record_take(cx, &f);
-    let last_play = f.media.0.borrow().plays.last().copied();
-    assert_eq!(last_play, Some((0.0, 102.15)));
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 0.0) && close(host_s, 102.4),
+        "{film_s} {host_s}"
+    );
     let takes = recorded(&f.dir);
-    // 100.2 - 0.05 = 100.15, two seconds before film 0 at 102.15.
-    assert!((takes[0].2.line_offset_s - -2.0).abs() < 1e-9);
+    // The first sample, at host 100.0, is 2.4 s before film 0 at 102.4.
+    assert!(
+        close(takes[0].2.line_offset_s, -2.4),
+        "{}",
+        takes[0].2.line_offset_s
+    );
 }
 
 #[gpui_kit::test]
 fn take_stops_itself_after_the_tail(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down", "down"]); // c: 1.5 .. 8.0, tail 1.5 => stop at film 9.5
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
-    f.media.send(100.2, 480);
-    // Film 0 at host 100.65 (hold 0.5 s), so film 9.5 at host 110.15.
-    f.media.set_now(110.1);
+    begin(cx, &f, 100.0);
+    // Film 0 at host 100.9 (hold 0.5 s), so film 9.5 at host 110.4.
+    f.media.set_now(110.35);
     frame(cx, f.window);
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
-    f.media.set_now(110.2);
+    f.media.set_now(110.45);
     frame(cx, f.window);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
     assert_eq!(recorded(&f.dir).len(), 1);
@@ -410,15 +441,14 @@ fn enter_chooses_selected_take(cx: &mut TestAppContext) {
 fn mark_start_clamps(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down"]); // b: start 1.0, between a (0.0) and c (1.5)
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
+    begin(cx, &f, 100.0);
     // During the count-in the playhead is before film zero; M clamps to just
     // after the previous line's start.
     press(cx, f.window, &["m"]);
     assert_eq!(start_of(&f.dir, "b"), 0.001);
-    // Film 0 is at host 101.15; at host 104 the playhead (2.85) is past the
+    // Film 0 is at host 101.4; at host 104.25 the playhead (2.85) is past the
     // slot's end (c's start), so M clamps to just before it.
-    f.media.set_now(104.0);
+    f.media.set_now(104.25);
     press(cx, f.window, &["m"]);
     assert_eq!(start_of(&f.dir, "b"), 1.499);
     press(cx, f.window, &["space"]);
@@ -439,9 +469,8 @@ fn stale_edit_is_refused_and_reported(cx: &mut TestAppContext) {
     // so the window still holds the old version).
     tw::set_line_field(&f.dir, "c", Field::Text("Agent text.".to_owned()), None).expect("edit");
     press(cx, f.window, &["down"]);
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
-    f.media.set_now(101.5);
+    begin(cx, &f, 100.0); // b: film 0 at host 101.4
+    f.media.set_now(101.75);
     press(cx, f.window, &["m"]);
 
     assert_eq!(start_of(&f.dir, "b"), 1.0, "the stale edit is not written");
@@ -478,15 +507,12 @@ fn edit_replaces_the_line_text(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn close_mid_take_commits(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
-    f.media.send(100.2, 4800);
-    f.media.set_now(100.3);
-    frame(cx, f.window);
+    begin(cx, &f, 100.0);
+    f.media.send(100.1, 4800);
     assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
     let takes = recorded(&f.dir);
     assert_eq!(takes.len(), 1, "the partial take is kept");
-    assert_eq!(takes[0].2.samples, 4800);
+    assert_eq!(takes[0].2.samples, 7200);
 }
 
 #[gpui_kit::test]
@@ -537,8 +563,11 @@ fn play_in_context_locks_the_take_to_the_film(cx: &mut TestAppContext) {
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     frame(cx, f.window); // the take has loaded: both start
-    let last_play = f.media.0.borrow().plays.last().copied();
-    assert_eq!(last_play, Some((6.0, 200.15)));
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 6.0) && close(host_s, 200.3),
+        "{film_s} {host_s}"
+    );
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
     press(cx, f.window, &["p"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
@@ -642,7 +671,7 @@ fn an_unsaved_take_is_kept_and_saved_later(cx: &mut TestAppContext) {
     frame(cx, f.window);
     let takes = recorded(&f.dir);
     assert_eq!(takes.len(), 1, "saved on retry");
-    assert_eq!(takes[0].2.samples, 4800);
+    assert_eq!(takes[0].2.samples, 2400);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
 }
 
@@ -681,14 +710,13 @@ fn opening_the_window_adopts_a_crashed_take(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_dropout_is_filled_and_counted(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
-    f.media.send(100.2, 4800); // 100.2 .. 100.3
-    f.media.send(100.35, 4800); // 50 ms lost before it
+    begin(cx, &f, 100.0); // first buffer: 100.05 .. 100.1
+    f.media.send(100.1, 2400); // .. 100.15
+    f.media.send(100.2, 2400); // 50 ms lost before it
     f.media.set_now(100.5);
     press(cx, f.window, &["space"]);
     let takes = recorded(&f.dir);
-    assert_eq!(takes[0].2.samples, 4800 + 2400 + 4800);
+    assert_eq!(takes[0].2.samples, 2400 * 4);
     assert_eq!(takes[0].2.dropouts, Some(1));
     let wav = f.dir.join("takes/a/001.wav");
     let (samples, _) = tw::read_take_wav(&wav).expect("take");
@@ -716,30 +744,23 @@ fn an_interruption_is_shown_with_the_saved_take(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_dropout_is_shown_after_the_take(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
-    press(cx, f.window, &["down", "down", "down"]); // d: pre-roll from film 6.0
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
-    f.media.send(100.2, 4800); // film 6.0 .. 6.1
-    f.media.send(101.25, 4800); // 0.95 s lost: at film 6.1
+    press(cx, f.window, &["down", "down", "down"]); // d
+    begin(cx, &f, 100.0); // first sample at film 5.6
+    f.media.send(100.1, 2400);
+    f.media.send(101.2, 2400); // lost from film 5.7 on
     f.media.set_now(101.5);
     press(cx, f.window, &["space"]);
     let shown = message(cx, &f.view);
     assert!(shown.contains("Recorded d take 1"), "{shown}");
-    assert!(shown.contains("Audio dropout at 0:06"), "{shown}");
+    assert!(shown.contains("Audio dropout at 0:05"), "{shown}");
 }
 
 #[gpui_kit::test]
 fn mark_during_a_take_keeps_its_film_position(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
-    f.media.set_now(100.0);
-    press(cx, f.window, &["space"]);
-    f.media.send(100.2, 4800); // first sample at film 6.0
-    settle(cx, &f);
-    f.media.set_now(100.3);
-    frame(cx, f.window);
-    // Film 6.0 is at host 100.15, so the playhead is at 9.0 at host 103.15.
-    f.media.set_now(103.15);
+    begin(cx, &f, 100.0); // first sample at film 5.6; film 6.0 at host 100.4
+    f.media.set_now(103.4); // the playhead is at 9.0
     press(cx, f.window, &["m"]);
     assert_eq!(start_of(&f.dir, "d"), 9.0);
     f.media.set_now(103.5);
@@ -749,8 +770,8 @@ fn mark_during_a_take_keeps_its_film_position(cx: &mut TestAppContext) {
     let event = &takes[0].2;
     assert_eq!(event.snapshot.start, 9.0, "the line as it is at commit");
     assert!(
-        (event.line_offset_s - -3.0).abs() < 1e-9,
-        "the take still starts at film 6.0: {}",
+        close(event.line_offset_s, -3.4),
+        "the take still starts at film 5.6: {}",
         event.line_offset_s
     );
 }
@@ -799,4 +820,147 @@ fn an_edit_of_a_removed_line_is_refused(cx: &mut TestAppContext) {
     );
     let shown = message(cx, &f.view);
     assert!(shown.contains("no longer in the script"), "{shown}");
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+#[test]
+fn the_film_clock_follows_the_players_timebase() {
+    let mut media = FakeMedia::new(&[(DEVICE, 48_000)]);
+    let mut clock = FilmClock::new();
+    clock.start(&mut media, 6.0, 0.0).expect("start");
+    let (film_s, host_s) = media.0.borrow().plays.last().copied().expect("a play");
+    assert!(
+        close(film_s, 6.0) && close(host_s, 100.3),
+        "{film_s} {host_s}"
+    );
+    // Before the start: the scheduled mapping, also for earlier samples.
+    assert!(close(clock.film_at(99.3).expect("mapped"), 5.0));
+
+    // The player really started 20 ms late.
+    media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.32,
+    });
+    media.set_now(100.4);
+    clock.track(&media);
+    assert!(close(clock.film_at(100.4).expect("mapped"), 6.08));
+    assert!(
+        close(clock.film_at(100.31).expect("mapped"), 5.99),
+        "from the start on"
+    );
+    assert!(
+        close(clock.film_at(100.2).expect("mapped"), 5.9),
+        "count-in unchanged"
+    );
+
+    // A stall at film 7.0, then playback goes on.
+    media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 7.0,
+        host_anchor_s: 101.32,
+    });
+    media.set_now(101.5);
+    clock.track(&media);
+    assert!(close(clock.film_at(101.9).expect("mapped"), 7.0));
+    media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 7.0,
+        host_anchor_s: 102.0,
+    });
+    media.set_now(102.5);
+    clock.track(&media);
+    assert!(close(clock.film_at(102.5).expect("mapped"), 7.5));
+}
+
+#[gpui_kit::test]
+fn the_film_starts_once_capture_delivers(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: pre-roll from 6.0
+    let plays_before = f.media.0.borrow().plays.len();
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.set_now(100.2);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().plays.len(),
+        plays_before,
+        "no film before audio"
+    );
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.recorder.count_in(&*view.media).is_none())
+    );
+
+    f.media.send(100.25, 2400);
+    settle(cx, &f);
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 6.0) && close(host_s, 100.6),
+        "{film_s} {host_s}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_take_without_audio_stops_with_a_message(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("No audio"), "{shown}");
+    assert_eq!(recorded(&f.dir).len(), 0);
+}
+
+#[gpui_kit::test]
+fn the_take_follows_the_film_as_it_really_plays(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down"]); // c: 1.5 .. 8.0, stop at film 9.5
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.05, 2400);
+    settle(cx, &f);
+    f.media.set_now(100.1);
+    frame(cx, f.window); // film 0 held 0.5 s: plays from host 100.9
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 0.0) && close(host_s, 100.9),
+        "{film_s} {host_s}"
+    );
+    // The film stalls at 5.0 (host 105.9) and stays there.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 5.0,
+        host_anchor_s: 105.9,
+    });
+    f.media.set_now(106.0);
+    frame(cx, f.window);
+    let playhead = f
+        .view
+        .read_with(cx, |view, _| view.recorder.playhead_s(&*view.media));
+    assert!(close(playhead.expect("playing"), 5.0), "{playhead:?}");
+    // By the schedule the tail ended at host 110.4; the stalled film has not.
+    f.media.set_now(111.0);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    // Playback goes on from 5.0 at host 111.0: film 9.5 at host 115.5.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 5.0,
+        host_anchor_s: 111.0,
+    });
+    f.media.set_now(115.4);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    f.media.set_now(115.6);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(recorded(&f.dir).len(), 1);
 }
