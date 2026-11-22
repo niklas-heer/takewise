@@ -196,6 +196,20 @@ pub fn mean_sd(values: &[f64]) -> Option<(f64, f64)> {
     Some((mean, var.sqrt()))
 }
 
+/// How far one beep may land from the mean error for the mean to be stored
+/// as the offset: the design's ±20 ms.
+pub const MAX_DEVIATION_MS: f64 = 20.0;
+
+/// The beeps that landed more than [`MAX_DEVIATION_MS`] from `mean_ms`: a
+/// placement this inconsistent is no basis for one fixed offset.
+pub fn outliers(placed: &[Placement], mean_ms: f64) -> Vec<Placement> {
+    placed
+        .iter()
+        .filter(|p| (p.error_ms - mean_ms).abs() > MAX_DEVIATION_MS)
+        .copied()
+        .collect()
+}
+
 /// The `latency_offset_ms` that cancels a mean error.
 #[allow(clippy::cast_possible_truncation)]
 pub fn offset_for(mean_ms: f64) -> i32 {
@@ -449,6 +463,26 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![(0.1, 315), (1.3, -500), (1.3, 300)]);
+    }
+
+    #[test]
+    fn finds_beeps_far_from_the_mean() {
+        let placed = |errors: &[f64]| -> Vec<Placement> {
+            errors
+                .iter()
+                .map(|&error_ms| Placement {
+                    film_s: 1.0,
+                    error_ms,
+                })
+                .collect()
+        };
+        let steady = placed(&[30.0, 32.0, 31.0, 29.0, 33.0, 31.0]);
+        assert_eq!(outliers(&steady, 31.0), Vec::<Placement>::new());
+        let scattered = placed(&[30.0, 32.0, 31.0, 29.0, 55.0, 31.0]);
+        let (mean, _) = mean_sd(&[30.0, 32.0, 31.0, 29.0, 55.0, 31.0]).unwrap();
+        let far = outliers(&scattered, mean);
+        assert_eq!(far.len(), 1);
+        assert!((far[0].error_ms - 55.0).abs() < 1e-9);
     }
 
     #[test]

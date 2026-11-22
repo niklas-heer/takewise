@@ -676,6 +676,28 @@ fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, C
         ));
     }
     let offset = calibrate::offset_for(mean);
+    let far = calibrate::outliers(&measurement.placed, mean);
+    if !far.is_empty() {
+        let list: Vec<String> = far
+            .iter()
+            .map(|p| format!("{:.1} s ({:+.1} ms)", p.film_s, p.error_ms))
+            .collect();
+        let why = format!(
+            "{} beep(s) landed more than {} ms from the mean error: {}; the placement is not consistent enough for one offset. Check the setup (wired headphones held to the mic, nothing else playing) and run it again.",
+            far.len(),
+            calibrate::MAX_DEVIATION_MS,
+            list.join(", ")
+        );
+        if write {
+            let _ = write!(text, "\nNot written: latency_offset_ms stays as it is.");
+            return Ok(Outcome::new(
+                json!({ "measurement": measurement, "latency_offset_ms": offset, "written": false }),
+                text,
+            )
+            .with_finding("inconsistent-beeps", why));
+        }
+        let _ = write!(text, "\nWarning: {why}");
+    }
     if write {
         tw::set_latency_offset(&dir, offset)?;
         let _ = write!(
