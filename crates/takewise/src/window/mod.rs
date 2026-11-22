@@ -161,6 +161,14 @@ pub fn run(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A line's text being edited (E): the line and the script version it was
+/// begun against stay fixed for the draft, whatever reloads happen.
+struct Draft {
+    input: Entity<InputState>,
+    line: String,
+    version: ScriptVersion,
+}
+
 pub struct RecordingWindow {
     dir: PathBuf,
     media: Box<dyn Media>,
@@ -177,7 +185,7 @@ pub struct RecordingWindow {
     input_problem: Option<String>,
     script_problem: Option<String>,
     inputs_checked_at: Option<f64>,
-    editing: Option<Entity<InputState>>,
+    editing: Option<Draft>,
     watcher: Option<Watcher>,
     focus: FocusHandle,
     subscriptions: Vec<Subscription>,
@@ -515,14 +523,23 @@ impl RecordingWindow {
         let duration = self.project.film_duration();
         let at = clamp_mark(script, self.line, playhead, duration);
         let start = clamp_mark(script, self.line, (at * 1000.0).round() / 1000.0, duration);
-        self.write_field(&id, Field::Start(start), &format!("start {start:.3} s"));
+        let version = self.version;
+        let what = format!("start {start:.3} s");
+        self.write_field(&id, Field::Start(start), &what, &version, "Try again.");
     }
 
-    /// Writes one field of a line against the version the window loaded;
-    /// a file changed on disk is reloaded and the edit refused. Returns
-    /// whether it was written.
-    fn write_field(&mut self, id: &str, field: Field, what: &str) -> bool {
-        match tw::set_line_field(&self.dir, id, field, Some(&self.version)) {
+    /// Writes one field of a line against `version`; a file changed on disk
+    /// since is reloaded and the edit refused, with `again` saying what to
+    /// do. Returns whether it was written.
+    fn write_field(
+        &mut self,
+        id: &str,
+        field: Field,
+        what: &str,
+        version: &ScriptVersion,
+        again: &str,
+    ) -> bool {
+        match tw::set_line_field(&self.dir, id, field, Some(version)) {
             Ok(_) => {
                 self.reload();
                 self.message = Some(format!("Saved {id}: {what}."));
@@ -532,7 +549,7 @@ impl RecordingWindow {
                 self.reload();
                 self.message = Some(format!(
                     "script.toml changed on disk, so {id}'s {what} was not saved; \
-                     the window reloaded the script. Try again."
+                     the window reloaded the script. {again}"
                 ));
                 false
             }
@@ -551,6 +568,7 @@ impl RecordingWindow {
             return;
         };
         let text = line.text.clone();
+        let id = line.id.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
         let subscription = cx.subscribe_in(&input, window, |view, _, event, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
@@ -559,21 +577,36 @@ impl RecordingWindow {
         });
         self.subscriptions.push(subscription);
         input.update(cx, |input, cx| input.focus(window, cx));
-        self.editing = Some(input);
+        self.editing = Some(Draft {
+            input,
+            line: id,
+            version: self.version,
+        });
         cx.notify();
     }
 
+    /// Saves the draft to the line it was begun on, against the version it
+    /// was begun with: a script changed since refuses it, and a line removed
+    /// since is never replaced by another.
     fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = &self.editing else {
+        let Some(draft) = &self.editing else {
             return;
         };
-        let text = input.read(cx).value().trim().to_owned();
-        let Some(id) = self.line_id().map(str::to_owned) else {
-            return;
-        };
-        if text.is_empty() {
+        let text = draft.input.read(cx).value().trim().to_owned();
+        let (id, version) = (draft.line.clone(), draft.version);
+        if self.project.script.position(&id).is_none() {
+            self.message = Some(format!(
+                "{id} is no longer in the script, so the edit was not saved; press Esc."
+            ));
+        } else if text.is_empty() {
             self.message = Some("A line's text cannot be empty.".to_owned());
-        } else if self.write_field(&id, Field::Text(text), "text") {
+        } else if self.write_field(
+            &id,
+            Field::Text(text),
+            "text",
+            &version,
+            "Press Esc, then E to edit the new version.",
+        ) {
             self.close_editor(window, cx);
         }
         cx.notify();
@@ -651,7 +684,7 @@ impl Render for RecordingWindow {
             recording,
             blocked: self.blocked(),
             message: self.message.as_deref(),
-            editor: self.editing.as_ref(),
+            editor: self.editing.as_ref().map(|draft| &draft.input),
         };
         let key_context = if self.editing.is_some() {
             EDITING

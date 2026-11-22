@@ -754,3 +754,49 @@ fn mark_during_a_take_keeps_its_film_position(cx: &mut TestAppContext) {
         event.line_offset_s
     );
 }
+
+/// Presses E on the current line, lets `between` change the project (then
+/// the window reloads, as its watcher would), types `text` and presses Enter.
+fn edit_with_reload(cx: &mut TestAppContext, f: &Fixture, text: &str, between: impl FnOnce(&Path)) {
+    press(cx, f.window, &["e"]);
+    between(&f.dir);
+    f.view.update(cx, |view, _| view.reload());
+    press(cx, f.window, &["cmd-a"]);
+    act(cx, f.window, |window, cx| window.input(text, cx));
+    press(cx, f.window, &["enter"]);
+}
+
+#[gpui_kit::test]
+fn an_edit_is_saved_against_the_version_it_began_with(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    edit_with_reload(cx, &f, "New words.", |dir| {
+        tw::set_line_field(dir, "c", Field::Text("Agent text.".to_owned()), None).expect("edit");
+    });
+    let script = Project::open(&f.dir).expect("project").script;
+    assert_eq!(script.lines[0].text, "First line.", "the draft is refused");
+    assert_eq!(script.lines[2].text, "Agent text.");
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("changed on disk"), "{shown}");
+}
+
+#[gpui_kit::test]
+fn an_edit_of_a_removed_line_is_refused(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    edit_with_reload(cx, &f, "New words.", |dir| {
+        let without_a = SCRIPT.replacen(
+            "[[line]]\nid = \"a\"\nstart = 0.0\ntext = \"First line.\"\n\n",
+            "",
+            1,
+        );
+        assert_ne!(without_a, SCRIPT);
+        fs::write(dir.join("script.toml"), without_a).expect("script");
+    });
+    let script = Project::open(&f.dir).expect("project").script;
+    assert_eq!(script.lines[0].id, "b");
+    assert_eq!(
+        script.lines[0].text, "Second line.",
+        "never written to another line"
+    );
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("no longer in the script"), "{shown}");
+}

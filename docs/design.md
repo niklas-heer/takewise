@@ -154,7 +154,7 @@ The clock mapping is the spike's job to prove. The model: capture buffers carry 
 - **Record (Space):** the film starts `preroll_s` before the line's start; a 3-2-1 count-in shows on screen; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is never monitored.
 - **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…". The top-ranked take gets a hollow star (proposed); a chosen take gets a filled one.
 - **Enter** chooses the selected take, **R** records another, **P** plays the line in context (pre-roll, take, tail) with the selected take locked to the film, **↑/↓** move between lines and **←/→** between takes.
-- **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place. Both write `script.toml` as described above.
+- **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place; the draft belongs to the line and the `script.toml` version it was begun on, so a script changed meanwhile refuses it, and a line removed meanwhile is never replaced by another. Both write `script.toml` as described above.
 - When the input device is missing or not running at 48 kHz, the screen says so, names the available devices, and does not record. On the RØDECaster Duo the mic appears in the two-channel devices "Main Stereo" and "Chat"; which channel carries the mic depends on RØDE Central's routing, so the level meter is how the narrator confirms the choice.
 
 ## Checks
