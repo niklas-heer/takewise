@@ -1,0 +1,690 @@
+//! Transcription with whisper.cpp's `whisper-cli`.
+//!
+//! A take is converted to 16 kHz mono 16-bit PCM with `ffmpeg`, then
+//! transcribed with
+//! `whisper-cli -m <model> -f <wav> -l <language> -nfa -dtw <preset> -ojf -of <out> -np`.
+//! The script is never passed as a prompt, so the model does not hear what
+//! it expects.
+//!
+//! **Word times come from DTW, not from the token offsets.** Verified with
+//! whisper.cpp 1.9.5 and `ggml-large-v3-turbo.bin` on `say` takes with 0.5,
+//! 1.5 and 2.5 s of leading silence: the full JSON's token `offsets` (from
+//! whisper's timestamp tokens, the same with or without `-ml 1 -sow`) put the
+//! first word at 0.00 s in nearly every take with a second or more of
+//! pre-roll, and drift by seconds after it, so early-start checks would be
+//! wrong. The DTW times (`t_dtw`, in centiseconds) move exactly with the
+//! pre-roll, stay in order, and land 0.1 to 0.4 s after each word's real
+//! onset, so a measured early start reads a little late, never early. DTW
+//! needs the model's alignment-head preset (`-dtw large.v3.turbo`, from the
+//! model file name) and is silently disabled with flash attention, so `-nfa`
+//! is required; it costs about 0.2 s on a 6 s take. When a word token comes
+//! back without a DTW time, the transcription fails (and the take gets a
+//! `listen` verdict) rather than falling back to the offsets.
+//!
+//! A word is the run of tokens from one starting with a space; tokens without
+//! letters or digits (punctuation) join the word's text but not its timing.
+//! A word starts at its first token's DTW time and ends after the summed
+//! duration of its tokens' offsets (durations are sound even where the
+//! offsets' positions are not), or at the next word's start, whichever is
+//! first. Confidence is the lowest token probability in the word.
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde::Deserialize;
+
+use crate::check::Transcript;
+use crate::ledger::Word;
+use crate::project::CheckConfig;
+
+/// Words this far outside the energy speech range are dropped as
+/// hallucinations (whisper likes to hear "Thank you." in silence).
+pub const SPEECH_MARGIN_S: f64 = 0.3;
+/// The models directory used when `$TAKEWISE_MODELS` is not set, under `$HOME`.
+pub const DEFAULT_MODELS_DIR: &str = ".local/share/takewise/models";
+/// Searched after `$PATH`, since an app started from Finder gets a minimal one.
+const FALLBACK_TOOL_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+/// whisper.cpp's DTW alignment-head presets.
+const DTW_PRESETS: [&str; 12] = [
+    "tiny",
+    "tiny.en",
+    "base",
+    "base.en",
+    "small",
+    "small.en",
+    "medium",
+    "medium.en",
+    "large.v1",
+    "large.v2",
+    "large.v3",
+    "large.v3.turbo",
+];
+
+/// Turns a take into words. Implementations fail soft: a failure is a
+/// [`Transcript::Failed`] with the reason, never a panic or an error.
+pub trait Transcriber {
+    fn transcribe(&self, wav: &Path) -> Transcript;
+}
+
+/// Why transcription cannot be set up at all.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error(
+        "{tool} not found on PATH or in /opt/homebrew/bin; install it with `brew install {formula}`"
+    )]
+    MissingTool {
+        tool: &'static str,
+        formula: &'static str,
+    },
+    #[error(
+        "whisper model {} not found; download it into $TAKEWISE_MODELS or ~/{DEFAULT_MODELS_DIR}",
+        .0.display()
+    )]
+    MissingModel(PathBuf),
+    #[error(
+        "no word-timing (DTW) preset for whisper model {0:?}; use a standard whisper.cpp model such as ggml-large-v3-turbo.bin"
+    )]
+    UnsupportedModel(String),
+}
+
+impl SetupError {
+    /// A stable, kebab-case code for JSON output.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SetupError::MissingTool { .. } => "missing-tool",
+            SetupError::MissingModel(_) => "missing-model",
+            SetupError::UnsupportedModel(_) => "unsupported-model",
+        }
+    }
+}
+
+/// The real transcriber: `ffmpeg` and `whisper-cli` run as child processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhisperCli {
+    pub whisper: PathBuf,
+    pub ffmpeg: PathBuf,
+    pub model: PathBuf,
+    pub language: String,
+    /// The DTW preset matching the model, such as `large.v3.turbo`.
+    pub dtw_preset: String,
+}
+
+impl WhisperCli {
+    /// Checks only that the model's file name has a DTW preset; the paths
+    /// are not looked at until [`Transcriber::transcribe`].
+    pub fn new(
+        whisper: PathBuf,
+        ffmpeg: PathBuf,
+        model: PathBuf,
+        language: &str,
+    ) -> Result<WhisperCli, SetupError> {
+        let name = model
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let preset = dtw_preset(&name).ok_or(SetupError::UnsupportedModel(name))?;
+        Ok(WhisperCli {
+            whisper,
+            ffmpeg,
+            model,
+            language: language.to_owned(),
+            dtw_preset: preset.to_owned(),
+        })
+    }
+
+    /// Finds `whisper-cli` and `ffmpeg` on `$PATH` (then in
+    /// `/opt/homebrew/bin` and `/usr/local/bin`) and the configured model in
+    /// `$TAKEWISE_MODELS` or `~/.local/share/takewise/models`.
+    pub fn discover(config: &CheckConfig) -> Result<WhisperCli, SetupError> {
+        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        dirs.extend(FALLBACK_TOOL_DIRS.iter().map(PathBuf::from));
+        Self::discover_in(config, &dirs, &models_dir())
+    }
+
+    /// [`WhisperCli::discover`] with explicit search directories.
+    pub fn discover_in(
+        config: &CheckConfig,
+        tool_dirs: &[PathBuf],
+        models_dir: &Path,
+    ) -> Result<WhisperCli, SetupError> {
+        let find = |tool: &'static str, formula: &'static str| {
+            tool_dirs
+                .iter()
+                .map(|dir| dir.join(tool))
+                .find(|path| path.is_file())
+                .ok_or(SetupError::MissingTool { tool, formula })
+        };
+        let whisper = find("whisper-cli", "whisper-cpp")?;
+        let ffmpeg = find("ffmpeg", "ffmpeg")?;
+        let model = models_dir.join(&config.whisper_model);
+        if !model.is_file() {
+            return Err(SetupError::MissingModel(model));
+        }
+        WhisperCli::new(whisper, ffmpeg, model, &config.language)
+    }
+
+    /// The model's file name, for the `checker` field.
+    pub fn model_name(&self) -> String {
+        self.model
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    fn run(&self, wav: &Path) -> Result<Vec<Word>, String> {
+        let tmp = tempfile::Builder::new()
+            .prefix("takewise-whisper-")
+            .tempdir()
+            .map_err(|err| format!("could not create a temporary directory: {err}"))?;
+        let pcm = tmp.path().join("take.wav");
+        let out = tmp.path().join("take");
+        run_tool(
+            Command::new(&self.ffmpeg)
+                .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
+                .arg(wav)
+                .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
+                .arg(&pcm),
+            &self.ffmpeg,
+        )?;
+        run_tool(
+            Command::new(&self.whisper)
+                .arg("-m")
+                .arg(&self.model)
+                .arg("-f")
+                .arg(&pcm)
+                .args(["-l", &self.language, "-nfa", "-dtw", &self.dtw_preset])
+                .arg("-ojf")
+                .arg("-of")
+                .arg(&out)
+                .arg("-np"),
+            &self.whisper,
+        )?;
+        let json_path = out.with_extension("json");
+        let text = std::fs::read_to_string(&json_path).map_err(|err| {
+            format!(
+                "could not read whisper-cli output {}: {err}",
+                json_path.display()
+            )
+        })?;
+        parse_full_json(&text)
+    }
+}
+
+impl Transcriber for WhisperCli {
+    fn transcribe(&self, wav: &Path) -> Transcript {
+        match self.run(wav) {
+            Ok(words) => Transcript::Words(words),
+            Err(message) => Transcript::Failed(message),
+        }
+    }
+}
+
+/// `$TAKEWISE_MODELS`, or `~/.local/share/takewise/models`.
+pub fn models_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("TAKEWISE_MODELS") {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(DEFAULT_MODELS_DIR)
+}
+
+/// Runs a tool to completion; a failure to start it or a nonzero exit is an
+/// error naming the tool and quoting the end of its stderr.
+fn run_tool(command: &mut Command, tool: &Path) -> Result<(), String> {
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("could not run {}: {err}", tool.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines
+        .get(lines.len().saturating_sub(3)..)
+        .unwrap_or_default();
+    let mut message = format!("{} failed ({})", tool.display(), output.status);
+    if !tail.is_empty() {
+        let _ = write!(message, ": {}", tail.join(" / "));
+    }
+    Err(message)
+}
+
+/// The DTW preset for a model file name: `ggml-large-v3-turbo-q5_0.bin` is
+/// `large.v3.turbo`. `None` for a name that is not a standard model.
+pub fn dtw_preset(model_file: &str) -> Option<&'static str> {
+    let name = model_file.strip_suffix(".bin").unwrap_or(model_file);
+    let name = name.strip_prefix("ggml-").unwrap_or(name);
+    // Drop a quantization suffix such as `-q5_0` or `-q8_0`.
+    let name = match name.rfind("-q") {
+        Some(at) if name[at + 2..].starts_with(|c: char| c.is_ascii_digit()) => &name[..at],
+        _ => name,
+    };
+    let dotted = name.replace('-', ".");
+    DTW_PRESETS.iter().copied().find(|preset| *preset == dotted)
+}
+
+#[derive(Deserialize)]
+struct FullJson {
+    transcription: Vec<Segment>,
+}
+
+#[derive(Deserialize)]
+struct Segment {
+    tokens: Vec<Token>,
+}
+
+#[derive(Deserialize)]
+struct Token {
+    text: String,
+    offsets: Offsets,
+    p: f32,
+    t_dtw: i64,
+}
+
+#[derive(Deserialize)]
+struct Offsets {
+    from: i64,
+    to: i64,
+}
+
+/// A word being assembled from tokens.
+struct Partial {
+    text: String,
+    start_cs: i64,
+    duration_ms: i64,
+    confidence: f32,
+}
+
+/// Parses `whisper-cli -ojf -dtw …` output into words (see the module doc).
+pub fn parse_full_json(text: &str) -> Result<Vec<Word>, String> {
+    let json: FullJson = serde_json::from_str(text)
+        .map_err(|err| format!("could not parse whisper-cli output: {err}"))?;
+    let mut partials: Vec<Partial> = Vec::new();
+    // Punctuation after a space (an opening quote) waits for the next word.
+    let mut prefix = String::new();
+    for token in json.transcription.iter().flat_map(|s| &s.tokens) {
+        let special = token.text.starts_with("[_") && token.text.ends_with(']');
+        if special {
+            continue;
+        }
+        let wordy = token.text.chars().any(char::is_alphanumeric);
+        let spaced = token.text.starts_with(char::is_whitespace);
+        if !wordy {
+            match partials.last_mut() {
+                Some(word) if !spaced && prefix.is_empty() => word.text.push_str(&token.text),
+                _ => prefix.push_str(&token.text),
+            }
+            continue;
+        }
+        if token.t_dtw < 0 {
+            return Err(format!(
+                "whisper-cli gave no word times (DTW) for {:?}; is it whisper.cpp 1.7 or later?",
+                token.text.trim()
+            ));
+        }
+        let duration_ms = (token.offsets.to - token.offsets.from).max(0);
+        match partials.last_mut() {
+            Some(word) if !spaced && prefix.is_empty() => {
+                word.text.push_str(&token.text);
+                word.duration_ms += duration_ms;
+                word.confidence = word.confidence.min(token.p);
+            }
+            _ => partials.push(Partial {
+                text: std::mem::take(&mut prefix) + &token.text,
+                start_cs: token.t_dtw,
+                duration_ms,
+                confidence: token.p,
+            }),
+        }
+    }
+    let starts: Vec<f64> = partials.iter().map(|p| p.start_cs as f64 / 100.0).collect();
+    Ok(partials
+        .iter()
+        .enumerate()
+        .map(|(i, partial)| {
+            let start = starts[i];
+            let mut end = start + partial.duration_ms as f64 / 1000.0;
+            if let Some(&next) = starts.get(i + 1) {
+                end = end.min(next).max(start);
+            }
+            Word {
+                text: partial.text.trim().to_owned(),
+                start,
+                end,
+                confidence: Some(partial.confidence),
+            }
+        })
+        .collect())
+}
+
+/// Drops words entirely outside the energy speech range widened by
+/// [`SPEECH_MARGIN_S`] on both sides; keeps everything without a range.
+pub fn keep_within(words: Vec<Word>, speech: Option<(f64, f64)>) -> Vec<Word> {
+    let Some((start, end)) = speech else {
+        return words;
+    };
+    words
+        .into_iter()
+        .filter(|w| w.end >= start - SPEECH_MARGIN_S && w.start <= end + SPEECH_MARGIN_S)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+    use crate::words::{align, normalize};
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/whisper-jfk.json"
+    );
+
+    fn word(text: &str, start: f64, end: f64) -> Word {
+        Word {
+            text: text.to_owned(),
+            start,
+            end,
+            confidence: None,
+        }
+    }
+
+    /// Writes an executable shell script.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A fake ffmpeg that creates its last argument, the output file.
+    fn fake_ffmpeg(dir: &Path) -> PathBuf {
+        script(dir, "ffmpeg", r#"for a; do last=$a; done; : > "$last""#)
+    }
+
+    /// A fake whisper-cli that records its arguments in `args.txt` and runs
+    /// `then` with `$out` set to its `-of` argument.
+    fn fake_whisper(dir: &Path, then: &str) -> PathBuf {
+        let args = dir.join("args.txt");
+        script(
+            dir,
+            "whisper-cli",
+            &format!(
+                r#"echo "$@" > "{}"
+while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
+{then}"#,
+                args.display()
+            ),
+        )
+    }
+
+    fn cli(dir: &Path, whisper: PathBuf) -> WhisperCli {
+        WhisperCli::new(
+            whisper,
+            fake_ffmpeg(dir),
+            dir.join("ggml-large-v3-turbo.bin"),
+            "en",
+        )
+        .unwrap()
+    }
+
+    fn failure(transcript: Transcript) -> String {
+        match transcript {
+            Transcript::Failed(message) => message,
+            Transcript::Words(words) => panic!("expected a failure, got {words:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_full_json_words() {
+        let words = parse_full_json(&fs::read_to_string(FIXTURE).unwrap()).unwrap();
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            text.join(" "),
+            "And so, my fellow Americans, ask not what your country can do for you, \
+             ask what you can do for your country."
+        );
+        // Starts are DTW times (centiseconds in the JSON), not segment offsets.
+        assert!((words[0].start - 0.50).abs() < 1e-9, "{:?}", words[0]);
+        assert!((words[1].start - 0.86).abs() < 1e-9, "{:?}", words[1]);
+        for pair in words.windows(2) {
+            assert!(pair[0].start <= pair[1].start, "{pair:?}");
+            assert!(pair[0].end >= pair[0].start, "{pair:?}");
+            assert!(pair[0].end <= pair[1].start + 1e-9, "{pair:?}");
+        }
+        let last = words.last().unwrap();
+        assert!(last.end > last.start && last.end < 11.0, "{last:?}");
+        assert!(
+            words
+                .iter()
+                .all(|w| w.confidence.is_some_and(|p| (0.0..=1.0).contains(&p)))
+        );
+        // The transcript aligns with the speech it came from.
+        let expected = normalize(
+            "And so, my fellow Americans, ask not what your country can do for you; \
+             ask what you can do for your country.",
+        );
+        assert_eq!(align(&expected, &words), []);
+    }
+
+    #[test]
+    fn parses_words_split_over_tokens() {
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": "[_BEG_]", "offsets": {"from": 0, "to": 0}, "p": 0.2, "t_dtw": -1},
+            {"text": " Kind", "offsets": {"from": 0, "to": 460}, "p": 0.6, "t_dtw": 124},
+            {"text": "red", "offsets": {"from": 460, "to": 800}, "p": 0.7, "t_dtw": 142},
+            {"text": " open", "offsets": {"from": 2000, "to": 2290}, "p": 0.9, "t_dtw": 256},
+            {"text": "-", "offsets": {"from": 2290, "to": 2380}, "p": 0.4, "t_dtw": 256},
+            {"text": "source", "offsets": {"from": 2450, "to": 3120}, "p": 0.8, "t_dtw": 298},
+            {"text": ".", "offsets": {"from": 3120, "to": 3280}, "p": 0.4, "t_dtw": 322},
+            {"text": " \"", "offsets": {"from": 3280, "to": 3290}, "p": 0.5, "t_dtw": 330},
+            {"text": "Try", "offsets": {"from": 3290, "to": 3560}, "p": 0.9, "t_dtw": 340},
+            {"text": "[_TT_264]", "offsets": {"from": 5280, "to": 5280}, "p": 0.04, "t_dtw": -1}
+        ]}]}"#;
+        let words = parse_full_json(json).unwrap();
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["Kindred", "open-source.", "\"Try"]);
+        assert!((words[0].start - 1.24).abs() < 1e-9);
+        // Kindred lasts 0.8 s by its tokens' durations; the next word
+        // starts later, so that duration stands.
+        assert!((words[0].end - 2.04).abs() < 1e-9, "{:?}", words[0]);
+        // open-source would last 0.96 s by its word tokens, but Try starts
+        // first.
+        assert!((words[1].end - 3.40).abs() < 1e-9, "{:?}", words[1]);
+        assert_eq!(words[0].confidence, Some(0.6));
+    }
+
+    #[test]
+    fn parses_without_dtw_times_fails() {
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": " Hello", "offsets": {"from": 0, "to": 460}, "p": 0.6, "t_dtw": -1}
+        ]}]}"#;
+        let err = parse_full_json(json).unwrap_err();
+        assert!(err.contains("word times"), "{err}");
+    }
+
+    #[test]
+    fn drops_words_outside_speech() {
+        let words = vec![
+            word("um", 0.1, 0.4),
+            word("Nobody", 1.1, 1.5),
+            word("misses", 1.5, 1.9),
+            word("birthday.", 2.0, 2.6),
+            word("Thank", 4.0, 4.3),
+            word("you.", 4.3, 4.6),
+        ];
+        let kept = keep_within(words.clone(), Some((1.0, 2.5)));
+        let text: Vec<&str> = kept.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["Nobody", "misses", "birthday."]);
+        // Within 0.3 s of the speech still counts.
+        let kept = keep_within(words.clone(), Some((0.6, 4.1)));
+        assert_eq!(kept.len(), 6);
+        // Without a speech range nothing is dropped.
+        assert_eq!(keep_within(words.clone(), None), words);
+    }
+
+    #[test]
+    fn transcribes_with_dtw_and_no_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whisper = fake_whisper(tmp.path(), &format!(r#"cp "{FIXTURE}" "$out.json""#));
+        let cli = cli(tmp.path(), whisper);
+        let Transcript::Words(words) = cli.transcribe(&tmp.path().join("take.wav")) else {
+            panic!("expected words");
+        };
+        assert_eq!(words.len(), 22);
+        let args = fs::read_to_string(tmp.path().join("args.txt")).unwrap();
+        for expected in ["-nfa", "-dtw large.v3.turbo", "-ojf", "-l en", "-np"] {
+            assert!(args.contains(expected), "{expected} missing from {args}");
+        }
+        assert!(!args.contains("prompt"), "{args}");
+        // The temporary directory is gone.
+        let out = args.split_whitespace().skip_while(|a| *a != "-of").nth(1);
+        let out = PathBuf::from(out.unwrap());
+        assert!(!out.parent().unwrap().exists(), "{}", out.display());
+    }
+
+    #[test]
+    fn missing_binary_fails_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = cli(tmp.path(), tmp.path().join("no-such-whisper-cli"));
+        let message = failure(cli.transcribe(&tmp.path().join("take.wav")));
+        assert!(message.contains("no-such-whisper-cli"), "{message}");
+
+        let mut cli = cli;
+        cli.whisper = fake_whisper(tmp.path(), "exit 0");
+        cli.ffmpeg = tmp.path().join("no-such-ffmpeg");
+        let message = failure(cli.transcribe(&tmp.path().join("take.wav")));
+        assert!(message.contains("no-such-ffmpeg"), "{message}");
+    }
+
+    #[test]
+    fn nonzero_exit_fails_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whisper = fake_whisper(tmp.path(), "echo 'error: failed to load model' >&2; exit 3");
+        let message = failure(cli(tmp.path(), whisper).transcribe(&tmp.path().join("t.wav")));
+        assert!(message.contains("failed to load model"), "{message}");
+        assert!(message.contains('3'), "{message}");
+    }
+
+    #[test]
+    fn garbage_json_fails_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whisper = fake_whisper(tmp.path(), r#"echo 'not json' > "$out.json""#);
+        let message = failure(cli(tmp.path(), whisper).transcribe(&tmp.path().join("t.wav")));
+        assert!(message.contains("whisper-cli output"), "{message}");
+
+        let whisper = fake_whisper(tmp.path(), "exit 0");
+        let message = failure(cli(tmp.path(), whisper).transcribe(&tmp.path().join("t.wav")));
+        assert!(message.contains("whisper-cli output"), "{message}");
+    }
+
+    #[test]
+    fn dtw_presets_follow_model_names() {
+        assert_eq!(
+            dtw_preset("ggml-large-v3-turbo.bin"),
+            Some("large.v3.turbo")
+        );
+        assert_eq!(
+            dtw_preset("ggml-large-v3-turbo-q5_0.bin"),
+            Some("large.v3.turbo")
+        );
+        assert_eq!(dtw_preset("ggml-large-v3.bin"), Some("large.v3"));
+        assert_eq!(dtw_preset("ggml-base.en.bin"), Some("base.en"));
+        assert_eq!(dtw_preset("ggml-small-q8_0.bin"), Some("small"));
+        assert_eq!(dtw_preset("my-finetune.bin"), None);
+    }
+
+    #[test]
+    fn discover_finds_tools_and_reports_what_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let models = tmp.path().join("models");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&models).unwrap();
+        let config = CheckConfig::default();
+        let dirs = [tmp.path().join("empty"), bin.clone()];
+
+        let err = WhisperCli::discover_in(&config, &dirs, &models).unwrap_err();
+        assert_eq!(err.code(), "missing-tool");
+        assert!(err.to_string().contains("whisper-cli"), "{err}");
+
+        fake_whisper(&bin, "exit 0");
+        let err = WhisperCli::discover_in(&config, &dirs, &models).unwrap_err();
+        assert!(err.to_string().contains("ffmpeg"), "{err}");
+
+        fake_ffmpeg(&bin);
+        let err = WhisperCli::discover_in(&config, &dirs, &models).unwrap_err();
+        assert_eq!(err.code(), "missing-model");
+        assert!(err.to_string().contains("ggml-large-v3-turbo.bin"), "{err}");
+
+        fs::write(models.join("ggml-large-v3-turbo.bin"), "").unwrap();
+        let cli = WhisperCli::discover_in(&config, &dirs, &models).unwrap();
+        assert_eq!(cli.whisper, bin.join("whisper-cli"));
+        assert_eq!(cli.ffmpeg, bin.join("ffmpeg"));
+        assert_eq!(cli.model, models.join("ggml-large-v3-turbo.bin"));
+        assert_eq!(cli.language, "en");
+        assert_eq!(cli.dtw_preset, "large.v3.turbo");
+
+        let custom = CheckConfig {
+            whisper_model: "custom.bin".to_owned(),
+            ..CheckConfig::default()
+        };
+        fs::write(models.join("custom.bin"), "").unwrap();
+        let err = WhisperCli::discover_in(&custom, &dirs, &models).unwrap_err();
+        assert_eq!(err.code(), "unsupported-model");
+    }
+
+    /// Speaks a line with macOS `say` after 1.5 s of silence and checks the
+    /// real whisper-cli hears every word and places the first one after the
+    /// silence. Run with `cargo test -p takewise-core -- --ignored`.
+    #[test]
+    #[ignore = "needs say, ffmpeg, whisper-cli and the model"]
+    fn real_whisper_transcribes_say_speech() {
+        const LINE: &str = "Kindred is free and open source. Try the demo; the link's below.";
+        const PREROLL_S: f64 = 1.5;
+        let cli = WhisperCli::discover(&CheckConfig::default()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let spoken = tmp.path().join("spoken.aiff");
+        let take = tmp.path().join("take.wav");
+        let status = std::process::Command::new("say")
+            .arg("-o")
+            .arg(&spoken)
+            .arg(LINE)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new(&cli.ffmpeg)
+            .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
+            .arg(&spoken)
+            .args(["-af", "adelay=1500:all=1,apad=pad_dur=1", "-ar", "48000"])
+            .args(["-ac", "1", "-c:a", "pcm_s24le"])
+            .arg(&take)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let started = std::time::Instant::now();
+        let transcript = cli.transcribe(&take);
+        let elapsed = started.elapsed();
+        let Transcript::Words(words) = transcript else {
+            panic!("{transcript:?}");
+        };
+        eprintln!("transcribed in {elapsed:.2?}: {words:?}");
+        assert_eq!(align(&normalize(LINE), &words), []);
+        let first = words[0].start;
+        assert!(
+            (PREROLL_S - 0.1..=PREROLL_S + 0.5).contains(&first),
+            "first word at {first}"
+        );
+    }
+}

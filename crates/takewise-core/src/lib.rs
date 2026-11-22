@@ -17,6 +17,7 @@ pub mod takes;
 #[cfg(test)]
 mod testutil;
 pub mod timing;
+pub mod whisper;
 pub mod words;
 
 pub use edit::{
