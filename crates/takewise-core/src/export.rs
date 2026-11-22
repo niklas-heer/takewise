@@ -1,13 +1,16 @@
 //! Export: one narration WAV aligned to the film's first frame, and a manifest.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result, io};
-use crate::fsutil::{with_temp, write_atomic};
+use crate::fsutil::{lock, rename_temp, write_temp};
 use crate::project::Project;
 use crate::script::{Line, validate};
 use crate::speech::analyze;
@@ -60,8 +63,18 @@ pub struct ManifestLine {
 struct Manifest<'a> {
     v: u32,
     film: ManifestFilm<'a>,
+    /// The WAV this manifest describes; a mismatch means the pair is torn.
+    narration: ManifestNarration,
     sample_rate: u32,
     lines: &'a [ManifestLine],
+}
+
+#[derive(Serialize)]
+struct ManifestNarration {
+    /// Relative to the manifest.
+    file: &'static str,
+    size: u64,
+    sha256: String,
 }
 
 #[derive(Serialize)]
@@ -109,9 +122,12 @@ impl Refusals {
 }
 
 /// Writes `export/narration.wav` (film length, mono 24-bit) and
-/// `export/manifest.json` from each line's chosen take, or refuses and writes
-/// nothing.
+/// `export/manifest.json` from each line's chosen take, under the project
+/// lock. On refusal it writes nothing and removes an earlier manifest, so no
+/// stale pair looks valid; the export is regenerable and takes are untouched.
 pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<ExportReport> {
+    let _guard = lock(&project.dir)?;
+    let dir = project.dir.join(EXPORT_DIR);
     let mut refused = Vec::new();
     let problems = validate(&project.script, project.film_duration());
     if !problems.is_empty() {
@@ -142,6 +158,7 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
     }
     refused.extend(overlaps(&placed));
     if !refused.is_empty() {
+        remove_if_present(&dir.join(MANIFEST_FILE))?;
         return Ok(ExportReport {
             lines: Vec::new(),
             refused,
@@ -151,14 +168,21 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
     let rate = project.config.sample_rate;
     let film_len = to_usize(seconds_to_samples(project.film_duration(), rate));
     let out = mix(&placed, film_len, rate);
-    let dir = project.dir.join(EXPORT_DIR);
     fs::create_dir_all(&dir).map_err(io(&dir))?;
-    with_temp(&dir.join(NARRATION_FILE), |file| {
+    let wav_path = dir.join(NARRATION_FILE);
+    let wav_temp = write_temp(&wav_path, |file| {
         let copy = file.try_clone()?;
         encode_wav(copy, &out, rate)
             .map(drop)
             .map_err(|err| std::io::Error::other(err.to_string()))
     })?;
+    let narration = match describe_wav(&wav_temp) {
+        Ok(narration) => narration,
+        Err(err) => {
+            let _ = fs::remove_file(&wav_temp);
+            return Err(io(&wav_path)(err));
+        }
+    };
 
     let lines: Vec<ManifestLine> = placed.into_iter().map(|p| p.line).collect();
     let info = &project.config.film_info;
@@ -170,10 +194,25 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
             size: info.size,
             modified: &info.modified,
         },
+        narration,
         sample_rate: rate,
         lines: &lines,
     };
-    write_manifest(&dir.join(MANIFEST_FILE), &manifest)?;
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let manifest_temp = match write_manifest(&manifest_path, &manifest) {
+        Ok(temp) => temp,
+        Err(err) => {
+            let _ = fs::remove_file(&wav_temp);
+            return Err(err);
+        }
+    };
+    // The WAV first, the manifest last: a crash in between leaves a manifest
+    // whose hash does not match the WAV.
+    if let Err(err) = rename_temp(&wav_temp, &wav_path) {
+        let _ = fs::remove_file(&manifest_temp);
+        return Err(err);
+    }
+    rename_temp(&manifest_temp, &manifest_path)?;
     Ok(ExportReport {
         lines,
         refused: Vec::new(),
@@ -300,13 +339,36 @@ fn scale(sample: i32, gain: f64) -> i32 {
     (f64::from(sample) * gain).round() as i32
 }
 
-fn write_manifest(path: &Path, manifest: &Manifest<'_>) -> Result<()> {
+/// Writes the manifest to a temp file next to `path` and returns its path.
+fn write_manifest(path: &Path, manifest: &Manifest<'_>) -> Result<PathBuf> {
     let mut json = serde_json::to_vec_pretty(manifest).map_err(|err| Error::Parse {
         path: path.to_path_buf(),
         message: err.to_string(),
     })?;
     json.push(b'\n');
-    write_atomic(path, &json)
+    write_temp(path, |file| file.write_all(&json))
+}
+
+fn describe_wav(path: &Path) -> std::io::Result<ManifestNarration> {
+    let bytes = fs::read(path)?;
+    let sha256 = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    Ok(ManifestNarration {
+        file: NARRATION_FILE,
+        size: to_u64(bytes.len()),
+        sha256,
+    })
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(io(path)(err)),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +599,76 @@ mod tests {
         .unwrap();
         let report = run(&dir, false);
         assert_eq!(refused_codes(&report), vec!["missing-file"]);
+    }
+
+    #[test]
+    fn manifest_records_narration_size_and_hash() {
+        use sha2::{Digest as _, Sha256};
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        assert!(run(&dir, false).refused.is_empty());
+        let wav = fs::read(dir.join("export/narration.wav")).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
+        let narration = &manifest["narration"];
+        assert_eq!(narration["file"], "narration.wav");
+        assert_eq!(narration["size"], wav.len());
+        let hash = Sha256::digest(&wav)
+            .iter()
+            .fold(String::new(), |mut hex, b| {
+                std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}")).unwrap();
+                hex
+            });
+        assert_eq!(narration["sha256"], hash);
+        let leftovers: Vec<_> = fs::read_dir(dir.join("export"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 2, "no temp files left: {leftovers:?}");
+    }
+
+    #[test]
+    fn refusal_after_export_removes_the_manifest() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        assert!(run(&dir, false).refused.is_empty());
+        assert!(dir.join("export/manifest.json").exists());
+
+        // A silent second take is chosen: export now refuses.
+        let silent = take(&dir, "hook", None);
+        choose(&dir, &silent);
+        assert_eq!(refused_codes(&run(&dir, false)), vec!["no-speech"]);
+        assert!(
+            !dir.join("export/manifest.json").exists(),
+            "no stale manifest stays behind to vouch for the old WAV"
+        );
+        assert!(dir.join("takes/hook/001.wav").exists(), "takes are kept");
+    }
+
+    #[test]
+    fn export_waits_for_the_project_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let guard = crate::fsutil::lock(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let other = dir.clone();
+        let handle = std::thread::spawn(move || {
+            let report = run(&other, false);
+            tx.send(report).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "export must wait for the lock"
+        );
+        drop(guard);
+        let report = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(report.refused.is_empty());
+        handle.join().unwrap();
     }
 
     #[test]

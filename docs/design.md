@@ -197,7 +197,9 @@ One binary, `takewise`. Every command takes the project directory and supports `
 
 For each line, the chosen take is used; a line without one makes `export` fail with the line ids, unless `--use-proposed` uses the proposed take (the manifest records `by: "proposed"`); a line with no takes at all always fails. A used take in which no speech is detected also fails export, naming the line. From the take, the source range is its speech, extended by 150 ms on either side and clipped to the take. A source sample `i` lands at destination sample `round((line.start + line_offset_s) × 48000) + i`; trimming never shifts the speech. Ranges are cropped to `[0, film length)`. When two lines' destination ranges overlap, export fails and names both lines, so the narrator can choose another take or move a start. Each placed range gets 10 ms fades.
 
-`manifest.json` lists the film (path, duration, size, modified) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and, once milestone 3 adds transcription, word times in film seconds.
+Export holds the project lock and writes both files to temp names, then renames the WAV first and the manifest last. A refused export writes nothing and removes an existing `manifest.json`, so no stale pair looks valid (the export is regenerable; takes are never touched).
+
+`manifest.json` lists the film (path, duration, size, modified), the WAV it describes (`narration`: file, size, SHA-256) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and, once milestone 3 adds transcription, word times in film seconds.
 
 For Resolve, an agent imports `narration.wav` onto a new audio track at the timeline start, or places the individual takes at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the WAV against the loopback beeps and imports it into Resolve once.
 

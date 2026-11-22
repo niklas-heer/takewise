@@ -2,7 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Result, io};
@@ -42,6 +42,17 @@ pub(crate) fn with_temp(
     path: &Path,
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<()> {
+    let temp = write_temp(path, write)?;
+    rename_temp(&temp, path)
+}
+
+/// Writes through `write` into a new temp file next to `path` and fsyncs it;
+/// returns the temp file's path for `rename_temp`. Nothing is left behind if
+/// writing fails.
+pub(crate) fn write_temp(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<PathBuf> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path
@@ -59,14 +70,21 @@ pub(crate) fn with_temp(
             .create_new(true)
             .open(&temp)?;
         write(&mut file)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)
+        file.sync_all()
     })();
     if let Err(err) = result {
         let _ = fs::remove_file(&temp);
         return Err(io(path)(err));
     }
-    Ok(())
+    Ok(temp)
+}
+
+/// Renames a temp file from `write_temp` over `path`, removing it on failure.
+pub(crate) fn rename_temp(temp: &Path, path: &Path) -> Result<()> {
+    fs::rename(temp, path).map_err(|err| {
+        let _ = fs::remove_file(temp);
+        io(path)(err)
+    })
 }
 
 #[cfg(test)]
