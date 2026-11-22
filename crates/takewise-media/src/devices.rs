@@ -95,6 +95,16 @@ pub(crate) fn find_input(name_wanted: &str) -> Result<cpal::Device> {
     Err(Error::NoInputDevice(name_wanted.to_owned()))
 }
 
+/// The output device with exactly this name.
+pub(crate) fn find_output(name_wanted: &str) -> Result<cpal::Device> {
+    for device in cpal::default_host().output_devices()? {
+        if name(&device).is_ok_and(|name| name == name_wanted) {
+            return Ok(device);
+        }
+    }
+    Err(Error::NoOutputDevice(name_wanted.to_owned()))
+}
+
 /// The device's CoreAudio UID.
 pub(crate) fn uid(device: &cpal::Device) -> Result<String> {
     Ok(device.id()?.id().to_owned())

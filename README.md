@@ -4,7 +4,7 @@ A macOS app for recording voiceover narration over a finished film.
 
 Takewise shows the script as a teleprompter timed to the picture, records several takes per line, and judges each take against the script: wrong words, overrun timing and sound problems. The chosen takes, with their timings, are written to a plain folder that agents and DaVinci Resolve can pick up.
 
-Status: milestone 1 of [the design](docs/design.md). The project folder, the ledger, speech detection, export and the `takewise` command line work. The recording window arrives in milestone 2 and the word checks in milestone 3.
+Status: milestone 2 of [the design](docs/design.md). The project folder, the ledger, speech detection, export, the `takewise` command line, the recording window and the loopback calibration work. The word checks arrive in milestone 3.
 
 ## Requirements
 
@@ -29,13 +29,15 @@ takewise judge promo.takewise hook 2 --verdict keep --reason "clear, warm" --by 
 takewise choose promo.takewise hook 2 --by claude-opus-5-5
 takewise export promo.takewise                          # export/narration.wav and export/manifest.json
 takewise record promo.takewise                          # open the recording window in Takewise.app
+takewise calibrate promo.takewise --write               # loopback test: store latency_offset_ms
 takewise doctor promo.takewise                          # tools, the model, the film, input devices and the output
 ```
 
 - `status --strict` exits 1 while a line has no chosen take or any problem exists; `--repair` adopts takes a crash left without a ledger event; `--refresh-film` re-measures a film that changed.
 - `script set` takes exactly one of `--text`, `--start`, `--end`, `--note`, `--clear-end` and `--clear-note`. Pass `--expect <script_version>` from `status --json` to refuse the edit if the script changed since you read it.
 - `export` uses each line's chosen take and refuses, naming the lines, when one has none, when a take has no detectable speech, or when two lines overlap. `--use-proposed` fills unchosen lines with the proposed take.
-- `record` refuses a script with validation problems (exit 1) and exits 2 when no `Takewise.app` is found. The recording window itself is still being built in milestone 2.
+- `record` refuses a script with validation problems (exit 1) and exits 2 when no `Takewise.app` is found. In the window: Space records or stops a take of the current line (pre-roll, a count-in, the line filling at an even pace across its slot), Enter chooses the selected take, R records another, P plays the line in context with the take locked to the film, M sets the line's start to the playhead while the film plays, E edits the line's text, ↑/↓ move between lines and ←/→ between takes. The window records only from the project's `[input] device` at 48 kHz and says why when it cannot. It reloads when `script.toml` or `takes.jsonl` change, and refuses an edit made against a script that changed on disk. Closing it mid-take keeps the take.
+- `calibrate` plays ten short beeps (made with `ffmpeg`) with seeks through the default output, or `--output <device>`, while the project's input records them in Takewise.app; hold the headphones to the microphone. It prints where the beeps landed (mean and standard deviation in ms) and with `--write` stores the offset that cancels the mean in `[input] latency_offset_ms`, keeping `project.toml`'s comments. Fewer than six detected beeps exits 1. Calibrate once per input and output pair.
 - `doctor` lists the input devices with their sample rates and channels, checks the project's input device (chosen, connected, at 48 kHz), and warns when the output is Bluetooth.
 - `check` exits 2 until milestone 3.
 

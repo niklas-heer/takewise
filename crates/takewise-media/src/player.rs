@@ -221,6 +221,20 @@ impl FilmPlayer {
         unsafe { self.av.player.setMuted(muted) };
     }
 
+    /// Plays through the output device with this name instead of the
+    /// system's default output.
+    pub fn set_output_device(&self, name: &str) -> Result<()> {
+        let uid = crate::devices::uid(&crate::devices::find_output(name)?)?;
+        // SAFETY: a main-thread AVPlayer setter (macOS only) with a CoreAudio
+        // device UID.
+        unsafe {
+            self.av
+                .player
+                .setAudioOutputDeviceUniqueID(Some(&NSString::from_str(&uid)));
+        };
+        Ok(())
+    }
+
     pub fn current_film_s(&self) -> f64 {
         self.av.current_s()
     }

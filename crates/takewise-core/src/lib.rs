@@ -17,7 +17,9 @@ pub mod takes;
 mod testutil;
 pub mod timing;
 
-pub use edit::{Field, ScriptVersion, script_version, set_film_info, set_line_field};
+pub use edit::{
+    Field, ScriptVersion, script_version, set_film_info, set_latency_offset, set_line_field,
+};
 pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport, ExportWarning, ManifestLine, Refusal, export};
 pub use fsutil::{ProjectLock, lock, write_atomic};

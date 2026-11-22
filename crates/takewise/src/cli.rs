@@ -13,6 +13,7 @@ use takewise_core::{
 };
 use takewise_media::{DeviceInfo, Transport};
 
+use crate::calibrate;
 use crate::film;
 use crate::output::Outcome;
 
@@ -44,6 +45,30 @@ enum Command {
     /// The recording window itself; `record` starts it inside the app bundle.
     #[command(hide = true)]
     Window { dir: PathBuf },
+    /// Measure the input and output latency with a loopback test: hold the
+    /// headphones to the microphone; beeps play and are recorded. Runs
+    /// inside Takewise.app like `record`.
+    Calibrate {
+        dir: PathBuf,
+        /// Store the measured offset as `[input] latency_offset_ms`.
+        #[arg(long)]
+        write: bool,
+        /// Play through this output device instead of the system's default
+        /// (the device the narrator's headphones hang on).
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// The measurement itself; `calibrate` runs it inside the app bundle.
+    #[command(hide = true)]
+    CalibrateRun {
+        dir: PathBuf,
+        #[arg(long)]
+        film: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        output: Option<String>,
+    },
     /// Lines, takes, verdicts, proposed and chosen takes, and problems.
     Status {
         dir: PathBuf,
@@ -197,6 +222,13 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
     match cli.command {
         Command::Init { dir, film } => init(&dir, &film),
         Command::Record { dir } => record(&dir),
+        Command::Calibrate { dir, write, output } => calibrate(&dir, write, output.as_deref()),
+        Command::CalibrateRun {
+            dir,
+            film,
+            out,
+            output,
+        } => calibrate_run(&dir, &film, &out, output.as_deref()),
         Command::Window { dir } => {
             crate::window::run(&dir).map_err(CliError::Setup)?;
             Ok(Outcome::new(json!({}), String::new()))
@@ -569,16 +601,24 @@ fn record(dir: &Path) -> Result<Outcome, CliError> {
             ),
         );
     }
-    let bundle = find_bundle()?;
     let dir = std::path::absolute(dir)
         .map_err(|err| CliError::Setup(format!("{}: {err}", dir.display())))?;
+    let bundle = run_in_bundle(&["window".as_ref(), dir.as_os_str()])?;
+    Ok(Outcome::new(
+        json!({ "bundle": bundle }),
+        format!("Recording window closed ({}).", bundle.display()),
+    ))
+}
+
+/// Runs `takewise <args>` inside Takewise.app and waits for it to quit.
+fn run_in_bundle(args: &[&std::ffi::OsStr]) -> Result<PathBuf, CliError> {
+    let bundle = find_bundle()?;
     let status = std::process::Command::new("open")
         .arg("-n")
         .arg("-W")
         .arg(&bundle)
         .arg("--args")
-        .arg("window")
-        .arg(&dir)
+        .args(args)
         .status()
         .map_err(|err| CliError::Setup(format!("could not run `open`: {err}")))?;
     if !status.success() {
@@ -587,10 +627,131 @@ fn record(dir: &Path) -> Result<Outcome, CliError> {
             bundle.display()
         )));
     }
+    Ok(bundle)
+}
+
+/// Makes the beep film, measures inside Takewise.app, reports the placement
+/// error and with `--write` stores the offset that cancels it.
+fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, CliError> {
+    let project = Project::open(dir)?;
+    if project.config.input.device.is_none() {
+        return Err(CliError::Setup(
+            "no input device chosen; set [input] device in project.toml (`takewise doctor` lists them)"
+                .to_owned(),
+        ));
+    }
+    let dir = std::path::absolute(dir)
+        .map_err(|err| CliError::Setup(format!("{}: {err}", dir.display())))?;
+    let work = std::env::temp_dir().join(format!("takewise-calibrate-{}", std::process::id()));
+    std::fs::create_dir_all(&work)
+        .map_err(|err| CliError::Setup(format!("{}: {err}", work.display())))?;
+    let measured = measure_in_bundle(&dir, &work, output);
+    let _ = std::fs::remove_dir_all(&work);
+    let measurement = measured?;
+
+    let placed = measurement.placed.len();
+    let mut text = format!(
+        "Input {:?}, output {:?}: {placed} of {} beeps placed",
+        measurement.input, measurement.output, measurement.expected
+    );
+    let (Some(mean), Some(sd)) = (measurement.mean_ms, measurement.sd_ms) else {
+        return Ok(
+            Outcome::new(json!({ "measurement": measurement }), text).with_finding(
+                "too-few-beeps",
+                "no beeps detected; hold the headphones to the mic and raise the volume",
+            ),
+        );
+    };
+    let _ = write!(
+        text,
+        ", mean error {mean:+.1} ms, standard deviation {sd:.1} ms."
+    );
+    if placed < calibrate::MIN_BEEPS {
+        return Ok(Outcome::new(json!({ "measurement": measurement }), text).with_finding(
+            "too-few-beeps",
+            format!(
+                "only {placed} beeps detected (need {}); hold the headphones to the mic and raise the volume",
+                calibrate::MIN_BEEPS
+            ),
+        ));
+    }
+    let offset = calibrate::offset_for(mean);
+    if write {
+        tw::set_latency_offset(&dir, offset)?;
+        let _ = write!(
+            text,
+            "\nWrote latency_offset_ms = {offset} to project.toml."
+        );
+    } else {
+        let _ = write!(
+            text,
+            "\nlatency_offset_ms should be {offset}; run with --write to store it."
+        );
+    }
     Ok(Outcome::new(
-        json!({ "bundle": bundle }),
-        format!("Recording window closed ({}).", bundle.display()),
+        json!({ "measurement": measurement, "latency_offset_ms": offset, "written": write }),
+        text,
     ))
+}
+
+fn measure_in_bundle(
+    dir: &Path,
+    work: &Path,
+    output: Option<&str>,
+) -> Result<calibrate::Measurement, CliError> {
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        measurement: Option<calibrate::Measurement>,
+        error: Option<String>,
+    }
+    let film = calibrate::make_beep_film(work).map_err(CliError::Setup)?;
+    let out = work.join("result.json");
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "calibrate-run".as_ref(),
+        dir.as_os_str(),
+        "--film".as_ref(),
+        film.as_os_str(),
+        "--out".as_ref(),
+        out.as_os_str(),
+    ];
+    if let Some(output) = output {
+        args.push(std::ffi::OsStr::new("--output"));
+        args.push(std::ffi::OsStr::new(output));
+    }
+    run_in_bundle(&args)?;
+    let text = std::fs::read_to_string(&out).map_err(|err| {
+        CliError::Setup(format!(
+            "the measurement in Takewise.app gave no result ({err}); was the microphone allowed?"
+        ))
+    })?;
+    let reply: Reply = serde_json::from_str(&text)
+        .map_err(|err| CliError::Setup(format!("unreadable measurement: {err}")))?;
+    match (reply.measurement, reply.error) {
+        (Some(measurement), _) => Ok(measurement),
+        (None, error) => Err(CliError::Setup(format!(
+            "calibration failed: {}",
+            error.unwrap_or_else(|| "no reason given".to_owned())
+        ))),
+    }
+}
+
+/// Inside Takewise.app: measure and write the result for `calibrate`.
+fn calibrate_run(
+    dir: &Path,
+    film: &Path,
+    out: &Path,
+    output: Option<&str>,
+) -> Result<Outcome, CliError> {
+    let result = Project::open(dir)
+        .map_err(|err| err.to_string())
+        .and_then(|project| calibrate::measure(&project, film, output));
+    let reply = match result {
+        Ok(measurement) => json!({ "measurement": measurement }),
+        Err(error) => json!({ "error": error }),
+    };
+    std::fs::write(out, reply.to_string())
+        .map_err(|err| CliError::Setup(format!("{}: {err}", out.display())))?;
+    Ok(Outcome::new(json!({}), String::new()))
 }
 
 /// Takewise.app: the bundle this binary runs in, else `$TAKEWISE_APP`

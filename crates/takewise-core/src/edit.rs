@@ -156,6 +156,32 @@ pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
     write_atomic(&path, doc.to_string().as_bytes())
 }
 
+/// Sets `[input] latency_offset_ms` in `project.toml` under the lock,
+/// keeping the rest of the file, its comments and layout as they are.
+pub fn set_latency_offset(dir: &Path, offset_ms: i32) -> Result<()> {
+    let path = dir.join(PROJECT_FILE);
+    let _guard = lock(dir)?;
+    let text = fs::read_to_string(&path).map_err(io(&path))?;
+    let parse_error = |message: String| Error::Parse {
+        path: path.clone(),
+        message,
+    };
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|err: toml_edit::TomlError| parse_error(err.to_string()))?;
+    let table = doc
+        .entry("input")
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| parse_error("input is not a table".to_owned()))?;
+    set_value(
+        table,
+        "latency_offset_ms",
+        Some(Value::from(i64::from(offset_ms))),
+    );
+    write_atomic(&path, doc.to_string().as_bytes())
+}
+
 /// Replaces, inserts or removes `key`, keeping the old value's surrounding
 /// whitespace and trailing comment.
 fn set_value(table: &mut Table, key: &str, new: Option<Value>) {
@@ -300,6 +326,55 @@ text = "Third."
             "{problems:?}"
         );
         assert_eq!(script_text(&dir), SCRIPT);
+    }
+
+    #[test]
+    fn write_preserves_project_toml_comments() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let commented = original.replacen(
+            "[input]\n",
+            "# the RODECaster's chat mix\n[input]\ndevice = \"Chat\"  # by name\n",
+            1,
+        );
+        let commented = commented.replacen(
+            "latency_offset_ms = 0",
+            "latency_offset_ms = 0  # from the loopback test",
+            1,
+        );
+        fs::write(&path, &commented).unwrap();
+
+        set_latency_offset(&dir, -32).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            commented.replace(
+                "latency_offset_ms = 0  # from",
+                "latency_offset_ms = -32  # from"
+            )
+        );
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.input.latency_offset_ms, -32);
+        assert_eq!(config.input.device.as_deref(), Some("Chat"));
+    }
+
+    #[test]
+    fn set_latency_offset_adds_a_missing_input_table() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let start = original.find("[input]").unwrap();
+        let end = original[start..]
+            .find("\n\n")
+            .map_or(original.len(), |i| start + i + 2);
+        fs::write(&path, format!("{}{}", &original[..start], &original[end..])).unwrap();
+
+        set_latency_offset(&dir, 12).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.input.latency_offset_ms, 12);
+        assert_eq!(config.input.channel, 1);
     }
 
     #[test]

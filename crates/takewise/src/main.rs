@@ -1,5 +1,6 @@
 //! `takewise`: record narration over a film; the command line for agents.
 
+mod calibrate;
 mod cli;
 mod film;
 mod output;

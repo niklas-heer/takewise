@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub enum Error {
     #[error("no input device named {0:?}")]
     NoInputDevice(String),
+    #[error("no output device named {0:?}")]
+    NoOutputDevice(String),
     #[error("no default {0} device")]
     NoDefaultDevice(&'static str),
     #[error("{0:?} cannot record 48 kHz audio")]
