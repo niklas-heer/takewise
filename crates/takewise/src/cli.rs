@@ -417,6 +417,13 @@ fn status_text(project: &Project, data: &StatusData) -> String {
         for take in &repair.adopted {
             let _ = writeln!(text, "repaired: adopted {} take {}", take.line, take.take);
         }
+        for path in &repair.metadata_without_audio {
+            let _ = writeln!(
+                text,
+                "repair: {} has no audio; kept, not adopted",
+                path.display()
+            );
+        }
     }
     if !data.state.problems.is_empty() {
         text.push_str("problems:\n");

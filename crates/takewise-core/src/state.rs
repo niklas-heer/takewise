@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use crate::ledger::{Checked, EventKind, Judged, Ledger, Recorded, Snapshot, Verdict};
 use crate::project::Project;
 use crate::script::{Problem, validate};
-use crate::takes::{TakeRef, scan};
+use crate::takes::{TakeRef, interrupted_commit, scan};
 
 /// Everything `status` shows, derived from the script, the ledger and the
 /// files under `takes/`.
@@ -228,6 +228,25 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
     orphans.sort();
     orphans.dedup();
 
+    let (partials, unadopted) = recovery_problems(project, ledger, &mut problems);
+
+    State {
+        lines,
+        orphans,
+        partials,
+        unadopted,
+        problems,
+    }
+}
+
+/// Reports what a crash can leave behind: unparseable ledger lines, partial
+/// files, takes without a `recorded` event, and metadata without audio.
+/// Returns the partial files and the unadopted WAVs.
+fn recovery_problems(
+    project: &Project,
+    ledger: &Ledger,
+    problems: &mut Vec<Problem>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if ledger.torn_tail {
         problems.push(Problem::new(
             None,
@@ -249,6 +268,26 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
                 .unlogged_wavs(ledger)
                 .map(|f| f.path.clone())
                 .collect();
+            for meta in files.unlogged_metadata(ledger) {
+                let (code, message) = if interrupted_commit(&project.dir, meta).is_some() {
+                    (
+                        "interrupted-commit",
+                        format!(
+                            "take {} was interrupted while being saved; run `status --repair` to finish it",
+                            meta.take
+                        ),
+                    )
+                } else {
+                    (
+                        "metadata-without-audio",
+                        format!(
+                            "{} has no audio and no recorded event; it is kept",
+                            meta.path.display()
+                        ),
+                    )
+                };
+                problems.push(Problem::new(Some(&meta.line), code, message));
+            }
             (files.partials, unadopted)
         }
         Err(err) => {
@@ -276,14 +315,7 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
             ),
         ));
     }
-
-    State {
-        lines,
-        orphans,
-        partials,
-        unadopted,
-        problems,
-    }
+    (partials, unadopted)
 }
 
 #[cfg(test)]
@@ -605,6 +637,38 @@ text = "Today we start."
             }]
         );
         assert!(line(&state, "opening").takes.is_empty());
+    }
+
+    #[test]
+    fn fold_reports_interrupted_commits_and_lone_metadata() {
+        let (_tmp, project) = setup(TWO_LINES);
+        let input = crate::takes::RecordedInput {
+            sample_rate: 48_000,
+            device: "Test Mic".to_owned(),
+            channel: 1,
+            line_offset_s: -2.0,
+            snapshot: snap(&project, "hook"),
+        };
+        let partial = crate::takes::begin_take(&project.dir, "hook", &input).unwrap();
+        crate::takes::write_take_wav(&partial.wav, &[1; 10], 48_000).unwrap();
+        fs::rename(&partial.meta, project.dir.join("takes/hook/001.json")).unwrap();
+        fs::create_dir_all(project.dir.join("takes/today")).unwrap();
+        fs::write(project.dir.join("takes/today/001.json"), "{}").unwrap();
+
+        let state = fold_now(&project);
+        let codes: Vec<(Option<&str>, &str)> = state
+            .problems
+            .iter()
+            .map(|p| (p.line.as_deref(), p.code))
+            .collect();
+        assert!(
+            codes.contains(&(Some("hook"), "interrupted-commit")),
+            "{codes:?}"
+        );
+        assert!(
+            codes.contains(&(Some("today"), "metadata-without-audio")),
+            "{codes:?}"
+        );
     }
 
     #[test]

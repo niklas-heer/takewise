@@ -30,6 +30,18 @@ pub struct RecordedInput {
     pub snapshot: Snapshot,
 }
 
+/// A take's `NNN.json`: the recording input plus the name of the partial
+/// file the audio was recorded into, so that a commit interrupted between its
+/// two renames can be completed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TakeMeta {
+    #[serde(flatten)]
+    input: RecordedInput,
+    /// `.<uuid>.wav.partial`, in the take's line directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial_wav: Option<String>,
+}
+
 /// A take being recorded: write the audio to `wav`, then `commit_take`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartialTake {
@@ -52,6 +64,9 @@ pub struct RepairReport {
     pub unadopted: Vec<PathBuf>,
     /// Leftover `.partial` files, relative to the project; kept.
     pub partials: Vec<PathBuf>,
+    /// `NNN.json` files without a `recorded` event whose audio is in neither
+    /// `NNN.wav` nor the partial file they name; kept.
+    pub metadata_without_audio: Vec<PathBuf>,
 }
 
 fn line_dir(dir: &Path, line_id: &str) -> Result<PathBuf> {
@@ -68,8 +83,13 @@ pub fn begin_take(dir: &Path, line_id: &str, input: &RecordedInput) -> Result<Pa
     fs::create_dir_all(&line_dir).map_err(io(&line_dir))?;
     let id = uuid::Uuid::new_v4();
     let meta = line_dir.join(format!(".{id}.json.partial"));
-    let wav = line_dir.join(format!(".{id}.wav.partial"));
-    let json = serde_json::to_vec_pretty(input).map_err(|err| Error::Parse {
+    let wav_name = format!(".{id}.wav.partial");
+    let wav = line_dir.join(&wav_name);
+    let take_meta = TakeMeta {
+        input: input.clone(),
+        partial_wav: Some(wav_name),
+    };
+    let json = serde_json::to_vec_pretty(&take_meta).map_err(|err| Error::Parse {
         path: meta.clone(),
         message: err.to_string(),
     })?;
@@ -92,7 +112,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 /// renames the metadata to `NNN.json` and the audio to `NNN.wav`, and appends
 /// the `recorded` event.
 pub fn commit_take(dir: &Path, partial: PartialTake) -> Result<TakeRef> {
-    let input = read_input(&partial.meta)?;
+    let input = read_meta(&partial.meta)?.input;
     let (sample_rate, samples) = wav_header(&partial.wav)?;
     let line_dir = line_dir(dir, &partial.line)?;
 
@@ -150,7 +170,7 @@ fn recorded_event(
     )
 }
 
-fn read_input(path: &Path) -> Result<RecordedInput> {
+fn read_meta(path: &Path) -> Result<TakeMeta> {
     let bytes = fs::read(path).map_err(io(path))?;
     serde_json::from_slice(&bytes).map_err(|err| Error::Parse {
         path: path.to_path_buf(),
@@ -311,11 +331,41 @@ impl TakeFiles {
             .filter(|f| f.is_wav && ledger.recorded(&f.line, f.take).is_none())
     }
 
+    /// `NNN.json` files with neither an `NNN.wav` nor a `recorded` event.
+    pub fn unlogged_metadata<'a>(
+        &'a self,
+        ledger: &'a Ledger,
+    ) -> impl Iterator<Item = &'a NumberedFile> {
+        self.numbered.iter().filter(|f| {
+            !f.is_wav
+                && !self.has_wav(&f.line, f.take)
+                && ledger.recorded(&f.line, f.take).is_none()
+        })
+    }
+
+    fn has_wav(&self, line: &str, take: u32) -> bool {
+        self.numbered
+            .iter()
+            .any(|f| f.is_wav && f.line == line && f.take == take)
+    }
+
     fn has_meta(&self, line: &str, take: u32) -> bool {
         self.numbered
             .iter()
             .any(|f| !f.is_wav && f.line == line && f.take == take)
     }
+}
+
+/// The partial audio file an unlogged `NNN.json` names, when it still exists:
+/// a commit interrupted between its two renames.
+pub(crate) fn interrupted_commit(dir: &Path, meta: &NumberedFile) -> Option<PathBuf> {
+    let name = read_meta(&dir.join(&meta.path)).ok()?.partial_wav?;
+    let is_plain_name = Path::new(&name).file_name() == Some(std::ffi::OsStr::new(&name));
+    if !is_plain_name || !name.ends_with(".wav.partial") {
+        return None;
+    }
+    let wav = dir.join(&meta.path).with_file_name(name);
+    wav.is_file().then_some(wav)
 }
 
 /// Lists the files under `takes/`.
@@ -365,25 +415,38 @@ pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
 }
 
 /// Adopts `NNN.wav` files that lack a `recorded` event from their `NNN.json`
-/// (marked `recovered`), and reports the rest. Never deletes anything.
+/// (marked `recovered`), completes commits interrupted between renaming the
+/// metadata and the audio, and reports the rest. Never deletes anything.
 pub fn repair(dir: &Path) -> Result<RepairReport> {
     let _guard = lock(dir)?;
     let ledger = ledger::read(dir)?;
+    let mut adopted = BTreeSet::new();
+    let mut metadata_without_audio = Vec::new();
+    for meta in scan(dir)?.unlogged_metadata(&ledger) {
+        match interrupted_commit(dir, meta) {
+            Some(partial_wav) => {
+                let wav = dir.join(meta.path.with_extension("wav"));
+                fs::rename(&partial_wav, &wav).map_err(io(&wav))?;
+            }
+            None => metadata_without_audio.push(meta.path.clone()),
+        }
+    }
+
     let files = scan(dir)?;
     let mut report = RepairReport {
         partials: files.partials.clone(),
+        metadata_without_audio,
         ..RepairReport::default()
     };
-    let mut adopted = BTreeSet::new();
     for wav in files.unlogged_wavs(&ledger) {
         if !files.has_meta(&wav.line, wav.take) {
             report.unadopted.push(wav.path.clone());
             continue;
         }
         let meta = dir.join(&wav.path).with_extension("json");
-        let adopt = read_input(&meta).and_then(|input| {
+        let adopt = read_meta(&meta).and_then(|meta| {
             let (sample_rate, samples) = wav_header(&dir.join(&wav.path))?;
-            Ok((input, sample_rate, samples))
+            Ok((meta.input, sample_rate, samples))
         });
         match adopt {
             Ok((input, sample_rate, samples)) => {
@@ -538,6 +601,73 @@ mod tests {
         let again = repair(dir).unwrap();
         assert!(again.adopted.is_empty(), "repair is idempotent");
         assert_eq!(read(dir).unwrap().events.len(), 2);
+    }
+
+    /// Does what `commit_take` does up to its first rename, then "crashes".
+    fn crash_after_metadata_rename(dir: &Path, take: u32) -> PartialTake {
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        write_take_wav(&partial.wav, &[7; 480], 48_000).unwrap();
+        fs::rename(
+            &partial.meta,
+            dir.join(format!("takes/hook/{take:03}.json")),
+        )
+        .unwrap();
+        partial
+    }
+
+    #[test]
+    fn repair_completes_commit_interrupted_between_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record(dir, "hook", 10);
+        let partial = crash_after_metadata_rename(dir, 2);
+
+        // Until repaired, the number stays taken.
+        assert_eq!(record(dir, "hook", 10).take, 3);
+
+        let report = repair(dir).unwrap();
+        assert_eq!(
+            report.adopted,
+            vec![TakeRef {
+                line: "hook".to_owned(),
+                take: 2
+            }]
+        );
+        assert!(report.partials.is_empty(), "{report:?}");
+        assert!(!partial.wav.exists());
+        assert_eq!(
+            read_take_wav(&dir.join("takes/hook/002.wav")).unwrap(),
+            (vec![7; 480], 48_000)
+        );
+        let ledger = read(dir).unwrap();
+        let rec = ledger
+            .recorded("hook", 2)
+            .expect("recorded event for take 2");
+        assert!(rec.recovered);
+        assert_eq!(rec.samples, 480);
+        assert_eq!(rec.file, "takes/hook/002.wav");
+        assert_eq!(rec.snapshot, input().snapshot);
+
+        let again = repair(dir).unwrap();
+        assert!(again.adopted.is_empty(), "repair is idempotent");
+        assert_eq!(read(dir).unwrap().events.len(), 3);
+    }
+
+    #[test]
+    fn repair_reports_metadata_without_audio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let partial = crash_after_metadata_rename(dir, 1);
+        fs::rename(&partial.wav, dir.join("takes/hook/elsewhere.wav")).unwrap();
+
+        let report = repair(dir).unwrap();
+        assert!(report.adopted.is_empty());
+        assert_eq!(
+            report.metadata_without_audio,
+            vec![PathBuf::from("takes/hook/001.json")]
+        );
+        assert!(dir.join("takes/hook/001.json").exists(), "kept");
+        assert!(read(dir).unwrap().events.is_empty());
     }
 
     #[test]
