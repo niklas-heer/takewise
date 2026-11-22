@@ -155,7 +155,7 @@ The clock mapping is the spike's job to prove. The model: capture buffers carry 
 - **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…". The top-ranked take gets a hollow star (proposed); a chosen take gets a filled one.
 - **Enter** chooses the selected take, **R** records another, **P** plays the line in context (pre-roll, take, tail) with the selected take locked to the film, **↑/↓** move between lines and **←/→** between takes.
 - **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place. Both write `script.toml` as described above.
-- When the input device is missing or not running at 48 kHz, the screen says so, names the available devices, and does not record.
+- When the input device is missing or not running at 48 kHz, the screen says so, names the available devices, and does not record. On the RØDECaster Duo the mic appears in the two-channel devices "Main Stereo" and "Chat"; which channel carries the mic depends on RØDE Central's routing, so the level meter is how the narrator confirms the choice.
 
 ## Checks
 
@@ -209,9 +209,15 @@ A Cargo workspace:
 - `takewise-media`: the macOS bridges, the only crate allowed `unsafe` (each block with a `SAFETY` comment): film playback with AVPlayer, video frames for GPUI, take playback locked to the film, audio capture from a chosen device and channel, and the clock mapping.
 - `takewise`: the binary, CLI subcommands and the GPUI recording window.
 
-**Playback.** AVPlayer plays the film. Frames reach GPUI through `AVPlayerItemVideoOutput` as `CVPixelBuffer`s drawn with GPUI's surface element if the pinned GPUI exposes it, otherwise through an `AVPlayerLayer` placed under GPUI's view. The spike decides.
+The media path below was proven by the milestone 0 spike on 2026-11-22 (decision "Play, capture and align media through AVPlayer, GPUI surfaces and cpal").
 
-**Microphone permission.** macOS grants the microphone to the app that owns the process. A bare binary started from a terminal or an agent harness inherits that host's permission, which is fragile. The spike decides whether `takewise record` must launch a bundled `Takewise.app` (with `NSMicrophoneUsageDescription`) so the permission belongs to Takewise.
+**Playback.** AVPlayer plays the film. `AVPlayerItemVideoOutput` delivers NV12 full-range `CVPixelBuffer`s (Metal-compatible, IOSurface-backed), polled once per frame and drawn with GPUI's `surface()` element; text draws on top of it. A second AVPlayer started at the same host time plays a take locked to the film (within 0.01 ms in the spike).
+
+**Capture.** cpal opens an input stream only (so the mic can never be monitored) on the named device and takes one channel. Each buffer's film time is `timebase(callback_host_time + i / sample_rate − L_in) + latency_offset_ms`, where `L_in` is the device's input latency plus safety offset plus stream latency from CoreAudio (`objc2-core-audio`). cpal's own capture timestamp is not used, because it leaves out the stream latency. AVPlayer's clock already accounts for output latency, so it is not subtracted. Changes of the player timebase (seeks, rate changes) are kept as a history, so a buffer is mapped with the timebase that was valid when it was captured. Before the first take after opening, the film plays briefly muted, so a cold output device does not shift the first take.
+
+**Calibration.** One loopback measures only the total of input and output latency, so `latency_offset_ms` is calibrated per device pair with the loopback test. In the spike, beeps landed 31.5 ms late (standard deviation 0.01 ms) on the MacBook's speakers and mic, at film time 0.1 s and after seeks; CoreAudio's reported latencies alone left −19.5 ms, a calibrated offset under 1 ms.
+
+**Microphone permission.** A bare binary inherits the permission of the app that launched it, and capture hangs while that app's prompt is unanswered. `takewise record` therefore launches a signed `Takewise.app` (with `NSMicrophoneUsageDescription`) so the permission belongs to Takewise; release builds are Developer ID signed, since ad hoc permission grants reset on every rebuild. The other CLI commands stay a plain binary.
 
 **Transcription.** Shell out to `whisper-cli` with JSON output and word timestamps rather than linking whisper.cpp, so builds stay simple. `takewise doctor` reports a missing binary or model.
 
@@ -225,7 +231,7 @@ A Cargo workspace:
 
 ## Constraints
 
-- Stable Rust pinned like Focal (`rust-toolchain.toml`), edition 2024, Focal's lint baseline, `unsafe` denied outside `takewise-media`.
+- Stable Rust 1.99.0 pinned in `rust-toolchain.toml` (gpui-pre 0.3.12, which gpui-kit 0.10.0 pins, needs it), edition 2024, Focal's lint baseline, `unsafe` denied outside `takewise-media`.
 - mise for tasks (`build`, `test`, `check`, `run`, `clean`), vrdx decision records in `decisions/`.
 - MIT license.
 
