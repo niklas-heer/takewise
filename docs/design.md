@@ -21,7 +21,7 @@ Takewise is a small macOS app for exactly that job: speak a script over a finish
 ## Non-goals for v1
 
 - A script editor beyond fixing a line's text and setting its start. Agents write `script.toml`.
-- Waveform editing, effects, mixing, multiple voices or tracks, a settings screen.
+- Waveform editing, mixing, multiple voices or tracks. (Export cleanup, below, is a fixed processing profile, not an effects rack.)
 - Splicing single words into a take. Retakes replace whole lines; long lines are split into two.
 - Judging delivery with an audio model inside Takewise. Agents do that from outside and record it with `takewise judge`.
 - Retiming the film to the voice. The manifest gives agents the measured timings to do that.
@@ -34,7 +34,7 @@ Takewise is a small macOS app for exactly that job: speak a script over a finish
 
 - Becoming a DAW. Takewise ends at chosen takes plus timings.
 - Anything choosing a take on its own. Checks and judgments flag and rank; only the narrator (Enter) or an explicit `takewise choose` commits a choice.
-- Software monitoring of the narrator's own voice. Takewise never plays the mic input back.
+- Monitoring the narrator's voice without being asked. Monitoring is off until the narrator turns it on (changed 2026-11-23, see "Setup and sound").
 - Needing Resolve, a network connection or a cloud account to record and check.
 
 ## Approaches
@@ -223,13 +223,54 @@ The media path below was proven by the milestone 0 spike on 2026-11-22 (decision
 
 **Transcription.** Shell out to `whisper-cli` with JSON output and word timestamps rather than linking whisper.cpp, so builds stay simple. `takewise doctor` reports a missing binary or model.
 
+## Setup and sound
+
+Added 2026-11-23 at Niklas's request. The aim is outcomes good enough to use without post-production, while staying easy: the app guides the narrator to a good setup instead of expecting audio knowledge.
+
+**Audio panel** (toggled with **A**, usable while the film plays): input device, input channel and output device as pickers. Every channel of the selected input shows its own live meter, so the channel that carries the mic is obvious. Film volume and monitor volume are sliders, also on keys (**-**/**=** film, **Shift-** and **Shift=** monitor), and can change during a take. Device choices are saved in `project.toml`; the last choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`.
+
+**Monitoring.** Off by default; **H** toggles it. When on, the mic plays to the output with the smallest buffer the device allows, and the panel shows the resulting delay in milliseconds. When the input device offers hardware monitoring (the RØDECaster does, with no delay), the panel says so and recommends it instead. Monitoring never changes what is recorded.
+
+**Meters.** The input meter shows peak with a 1.5 s hold, a shaded target band from −18 to −6 dBFS, and a clip light that turns red at −0.5 dBFS and stays red until clicked or until the next take starts. A take that clipped says so in its row.
+
+**Long lines.** Up to three lines of text show at full size. A longer line scrolls smoothly so that the words under the pace fill stay on the middle row.
+
+**Setup check** (**C**, offered when a project is first opened and when the input or output device changes):
+
+1. *Devices:* choose input, channel and output; Bluetooth output and inputs not at 48 kHz are flagged.
+2. *Room:* five seconds of silence. Reports the noise floor (quiet below −60 dBFS, acceptable to −50, noisy above) and mains hum (strong peaks at 50 or 60 Hz and their harmonics), with tips.
+3. *Voice:* the narrator reads a test sentence. Reports peak and average level and any clipping, and suggests a gain change in dB so peaks land near −10 dBFS; flags plosives (bursts of energy below 120 Hz, "turn the mic slightly off-axis or add a pop filter") and proximity boom (a high ratio of energy below 200 Hz to 200 Hz–4 kHz, "move a little further from the mic").
+4. *Clarity (optional):* the test sentence is transcribed and compared with the text.
+5. *Latency (optional):* the loopback calibration, offered when the device pair has no calibration yet.
+
+Results are saved under `[setup]` in `project.toml` with the date and the devices, and `takewise status` shows when the setup was last checked and whether the devices still match.
+
+**Noise per take.** A `checked` event records the take's noise floor (already measured). A new verdict rule after rule 6: a noise floor above −50 dBFS gives `listen` ("background noise at −46 dBFS").
+
+**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed.
+
+**Export cleanup and formats.** Takes are always recorded as 48 kHz, 24-bit WAV, the lossless original, and are never modified. Export settings live in `[export]` in `project.toml` and can be overridden on the command line:
+
+```toml
+[export]
+format = "wav"        # wav or flac
+bit_depth = 24        # 16 or 24
+sample_rate = 48000   # 48000 or 44100
+processing = "clean"  # raw or clean
+loudness_lufs = -16.0 # target integrated loudness for clean
+true_peak_db = -1.0
+```
+
+`clean` applies, per take, a high-pass at 80 Hz and noise reduction using the noise floor measured in that take's pre-roll, then normalizes the whole narration to the target loudness with a true-peak limit (two-pass loudness measurement). It runs through `ffmpeg` filters, which Takewise already needs. `raw` is the current behaviour. The manifest records the profile used and the measured loudness. Sample positions in the manifest refer to the exported file's sample rate.
+
 ## Milestones
 
 0. **Media spike (throwaway):** a GPUI window plays the film with a text overlay; capture records from a chosen device and channel with host timestamps; a take plays back locked to the film; the loopback test places beeps within ±20 ms at film zero and after seeks; microphone permission for a bare binary versus a bundle is settled. Decides surface versus layer, the capture API and how latency is accounted for.
 1. **Core and CLI:** format, validation, lock and write protocol, ledger and folding, the energy speech detector, `init` (film info through `ffprobe`), `status`, `script set`, `choose`, `judge`, `export`, and `doctor` limited to tools, model and film (devices arrive with milestone 2); tests with fixtures.
 2. **Recording window:** the screen above on the spike's media path: record, play in context, choose, mark start, edit text, level meter. After this milestone Niklas can narrate a film; agents can judge takes from the folder.
 3. **Checks:** whisper-cli integration, alignment, verdict rules, ranking, `check`; thresholds tuned on real takes; verdicts in the window.
-4. **Ship:** app bundle, README with the Resolve recipe, agent instructions.
+4. **Setup and sound:** the audio panel, optional monitoring, meters with clip lights, scrolling long lines, the setup check, the noise rule, export cleanup and export formats (section "Setup and sound").
+5. **Ship:** app bundle, README with the Resolve recipe, agent instructions.
 
 ## Constraints
 
