@@ -122,7 +122,7 @@ The app, the CLI and agents editing by hand may all touch the folder.
 - `judged`: an outside judgment: `snapshot` judged against, `by` (free text, for example `claude-opus-5-5`), `verdict`, optional `score` 0–1, `reason`.
 - `chosen`: `by` (`narrator` or the agent's name).
 
-Snapshots store the resolved slot end, so moving a neighbour also changes them. Folding: a take's effective verdict is its latest `judged` event whose snapshot matches the current line, otherwise its latest matching `checked` event, otherwise none (`unchecked`). A judgment or check against old text or an old slot is shown as stale; checks are re-run, judgments are not. A line's choice is its latest `chosen` event. No other event kinds in v1.
+Snapshots store the resolved slot end, so moving a neighbour also changes them. Folding: a take's effective verdict is its latest `judged` event whose snapshot matches the current line (text exactly, start and end within 1 µs), otherwise its latest matching `checked` event, otherwise none (`unchecked`). A judgment or check against old text or an old slot is shown as stale; checks are re-run, judgments are not. A line's choice is its latest `chosen` event. No other event kinds in v1.
 
 ## Timing model
 

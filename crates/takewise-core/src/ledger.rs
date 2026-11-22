@@ -53,6 +53,19 @@ pub struct Snapshot {
     pub end: f64,
 }
 
+/// How far apart two snapshot times may be and still count as the same.
+pub const SNAPSHOT_TIME_TOLERANCE_S: f64 = 1e-6;
+
+impl Snapshot {
+    /// The same text exactly and the same start and end within a microsecond,
+    /// so that times surviving a JSON or TOML round trip still match.
+    pub fn matches(&self, other: &Snapshot) -> bool {
+        self.text == other.text
+            && (self.start - other.start).abs() <= SNAPSHOT_TIME_TOLERANCE_S
+            && (self.end - other.end).abs() <= SNAPSHOT_TIME_TOLERANCE_S
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recorded {
     /// Relative to the project directory, such as `takes/hook/001.wav`.

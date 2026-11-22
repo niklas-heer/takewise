@@ -132,13 +132,13 @@ fn fold_take(
         match &event.kind {
             EventKind::Checked(checked) => {
                 latest_checked = Some(checked);
-                if checked.snapshot == *current {
+                if checked.snapshot.matches(current) {
                     matching_checked = Some(checked);
                 }
             }
             EventKind::Judged(judged) => {
                 latest_judged = Some(judged);
-                if judged.snapshot == *current {
+                if judged.snapshot.matches(current) {
                     matching_judged = Some(judged);
                 }
             }
@@ -150,8 +150,8 @@ fn fold_take(
         (None, Some(checked)) => (Some(checked.verdict), Some("check".to_owned())),
         (None, None) => (None, None),
     };
-    let stale_check = latest_checked.is_some_and(|c| c.snapshot != *current)
-        || latest_judged.is_some_and(|j| j.snapshot != *current);
+    let stale_check = latest_checked.is_some_and(|c| !c.snapshot.matches(current))
+        || latest_judged.is_some_and(|j| !j.snapshot.matches(current));
     let state = TakeState {
         take,
         file: rec.file.clone(),
@@ -467,6 +467,54 @@ text = "Today we start."
         assert_eq!(take.effective, None);
         assert_eq!(take.verdict_source, None);
         assert!(take.stale_check);
+    }
+
+    #[test]
+    fn judgment_survives_json_roundtrip_of_awkward_times() {
+        // Times like these come from `M` (mark start at the playhead).
+        let script = "[[line]]\nid = \"hook\"\nstart = 1.1372262625247673\ntext = \"Hello there.\"\n\n[[line]]\nid = \"today\"\nstart = 37.903460614113676\ntext = \"Today we start.\"\n";
+        let (_tmp, project) = setup(script);
+        for id in ["hook", "today"] {
+            recorded(&project, id, 1);
+            let judgment = crate::takes::Judgment {
+                by: "claude".to_owned(),
+                verdict: Verdict::Keep,
+                score: None,
+                reason: "fine".to_owned(),
+            };
+            crate::takes::judge_take(&project.dir, id, 1, judgment).unwrap();
+        }
+        let state = fold_now(&project);
+        for id in ["hook", "today"] {
+            let take = &line(&state, id).takes[0];
+            assert!(!take.stale_check, "{id}: {take:?}");
+            assert_eq!(take.effective, Some(Verdict::Keep), "{id}");
+        }
+    }
+
+    #[test]
+    fn snapshot_times_match_within_a_microsecond() {
+        let a = Snapshot {
+            text: "Hello.".to_owned(),
+            start: 1.0,
+            end: 2.0,
+        };
+        let close = Snapshot {
+            start: 1.0 + 5e-7,
+            end: 2.0 - 5e-7,
+            ..a.clone()
+        };
+        assert!(a.matches(&close));
+        let moved = Snapshot {
+            start: 1.000_01,
+            ..a.clone()
+        };
+        assert!(!a.matches(&moved));
+        let edited = Snapshot {
+            text: "Hello!".to_owned(),
+            ..a.clone()
+        };
+        assert!(!a.matches(&edited));
     }
 
     #[test]
