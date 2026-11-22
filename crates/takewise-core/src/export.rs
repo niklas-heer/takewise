@@ -256,6 +256,13 @@ fn place(
     let mut src0 = (seconds_to_samples(speech_start, rate) - margin).max(0);
     let mut src1 = (seconds_to_samples(speech_end, rate) + margin).min(len);
     let take_start_film = line.start + take.line_offset_s;
+    let speech_film = (take_start_film + speech_start, take_start_film + speech_end);
+    if speech_film.1 <= 0.0 || speech_film.0 >= project.film_duration() {
+        return Err((
+            "speech-outside-film",
+            "chosen takes whose speech lies entirely outside the film",
+        ));
+    }
     let offset = seconds_to_samples(take_start_film, rate);
     let (mut dest0, mut dest1) = (offset + src0, offset + src1);
     if dest0 < 0 {
@@ -286,7 +293,7 @@ fn place(
             chosen_by: by,
             source_samples: [to_u64(src0), to_u64(src1)],
             dest_samples: [to_u64(dest0), to_u64(dest1)],
-            speech_film_s: [take_start_film + speech_start, take_start_film + speech_end],
+            speech_film_s: [speech_film.0, speech_film.1],
         },
         samples,
         src: src0,
@@ -521,6 +528,20 @@ mod tests {
         let audio = narration(&dir);
         assert_eq!(audio.len(), FILM_SAMPLES);
         assert!(onset(&audio) < 960, "speech is placed right from film zero");
+    }
+
+    #[test]
+    fn export_refuses_speech_entirely_before_film_zero() {
+        let script = "[[line]]\nid = \"hook\"\nstart = 0.0\ntext = \"Hello.\"\n";
+        let (_tmp, dir) = setup(script);
+        // Speech runs from -1.5 s to -0.1 s film time; only the 150 ms
+        // margin would reach past film zero.
+        let t = take(&dir, "hook", Some((0.5, 1.9)));
+        choose(&dir, &t);
+        let report = run(&dir, false);
+        assert_eq!(refused_codes(&report), vec!["speech-outside-film"]);
+        assert_eq!(report.refused[0].lines, vec!["hook".to_owned()]);
+        assert!(!dir.join("export/narration.wav").exists());
     }
 
     #[test]
