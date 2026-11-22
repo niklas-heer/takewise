@@ -1,0 +1,26 @@
+# The Rust toolchain itself is pinned in rust-toolchain.toml.
+# whisper-cli (Homebrew formula whisper-cpp) and ffmpeg are runtime dependencies; see README.md.
+
+[tasks.build]
+description = "Build the takewise binary (debug)"
+run = "cargo build -p takewise"
+
+[tasks.run]
+description = "Run takewise: mise run run -- status my-film.takewise"
+run = "cargo run -p takewise --"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --workspace"
+
+[tasks.check]
+description = "Format check, Clippy and tests"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace",
+]
+
+[tasks.clean]
+description = "Remove debug build output (release builds are kept)"
+run = "cargo clean --profile dev"

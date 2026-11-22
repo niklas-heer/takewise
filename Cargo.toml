@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/niklas-heer/takewise"
+
+[workspace.lints.rust]
+# Denied everywhere but takewise-media, the macOS bridge crate
+# (see the decision "Build Takewise in Rust with GPUI").
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+todo = "deny"
+dbg_macro = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+cast_precision_loss = "allow"
+redundant_closure_for_method_calls = "allow"
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true
