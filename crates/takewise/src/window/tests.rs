@@ -1058,3 +1058,28 @@ fn a_stall_during_the_take_is_recorded(cx: &mut TestAppContext) {
         "{shown}"
     );
 }
+
+#[gpui_kit::test]
+fn a_text_edit_during_a_take_keeps_the_text_it_was_read_from(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    begin(cx, &f, 100.0);
+    // An agent changes the text and the start while the narrator reads.
+    tw::set_line_field(&f.dir, "d", Field::Text("Agent text.".to_owned()), None).expect("edit");
+    tw::set_line_field(&f.dir, "d", Field::Start(9.0), None).expect("move");
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+
+    let takes = recorded(&f.dir);
+    let snapshot = &takes[0].2.snapshot;
+    assert_eq!(
+        snapshot.text, "Fourth line.",
+        "the text read during the take"
+    );
+    assert_eq!(snapshot.start, 9.0, "the slot as it is at commit");
+    f.view.update(cx, |view, _| view.reload());
+    f.view.read_with(cx, |view, _| {
+        let take = &view.line_state().expect("line").takes[0];
+        assert!(take.recorded_against_old_text, "{take:?}");
+    });
+}

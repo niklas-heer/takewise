@@ -362,12 +362,17 @@ impl Recorder {
         let shift_note = film_shift_ms.map(|ms| {
             format!("The film stalled during the take; placement may be off by {ms:.0} ms.")
         });
-        // The take keeps its film position: placed against the line as it is
-        // now, which M or an agent may have moved during the take.
-        let snapshot = Project::open(dir)
-            .ok()
-            .and_then(|project| project.snapshot(&line))
-            .unwrap_or(snapshot);
+        // The take keeps its film position: placed against the line's slot
+        // as it is now, which M or an agent may have moved during the take.
+        // The text stays the one read during the take, so an edit made
+        // meanwhile shows the take as recorded against old text.
+        let snapshot = match Project::open(dir).ok().and_then(|p| p.snapshot(&line)) {
+            Some(now) => Snapshot {
+                text: snapshot.text,
+                ..now
+            },
+            None => snapshot,
+        };
         let first_film_s = first_film_s.unwrap_or(line_start);
         #[allow(clippy::cast_possible_truncation)]
         let input = RecordedInput {
