@@ -9,6 +9,10 @@ run = "cargo build -p takewise"
 description = "Run takewise: mise run run -- status my-film.takewise"
 run = "cargo run -p takewise --"
 
+[tasks.bundle]
+description = "Build build/Takewise.app (release); set TAKEWISE_SIGN_IDENTITY to sign with Developer ID"
+run = "scripts/bundle"
+
 [tasks.test]
 description = "Run all tests"
 run = "cargo test --workspace"

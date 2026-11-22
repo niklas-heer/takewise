@@ -14,6 +14,8 @@ Status: milestone 1 of [the design](docs/design.md). The project folder, the led
 
 Build with `mise run build`; run with `mise run run -- <command>`.
 
+Recording runs inside `Takewise.app`, so the microphone permission belongs to Takewise rather than to the terminal that started it. Build the bundle with `mise run bundle` (a release build in `build/Takewise.app`). Set `TAKEWISE_SIGN_IDENTITY` to a "Developer ID Application: …" identity to sign it with the hardened runtime; without it the bundle is signed ad hoc and macOS asks for the microphone again after each rebuild. `takewise record` looks for the bundle it runs in, then `$TAKEWISE_APP`, then `/Applications/Takewise.app`, then the repository's `build/Takewise.app`.
+
 ## Command line
 
 Every command takes the project directory. With `--json` it prints one JSON object on stdout: `{"ok":true,"data":…}`, or `{"ok":false,"error":{"code":…,"message":…}}` with the data that led to it. Exit codes: 0 success, 1 a finding (an export that refuses, `status --strict` with problems, a failed `doctor` check), 2 a usage or setup error.
@@ -26,13 +28,16 @@ takewise script set promo.takewise hook --start 1.5     # change one field of on
 takewise judge promo.takewise hook 2 --verdict keep --reason "clear, warm" --by claude-opus-5-5 --score 0.8
 takewise choose promo.takewise hook 2 --by claude-opus-5-5
 takewise export promo.takewise                          # export/narration.wav and export/manifest.json
-takewise doctor promo.takewise                          # whisper-cli, the model, ffprobe and the film
+takewise record promo.takewise                          # open the recording window in Takewise.app
+takewise doctor promo.takewise                          # tools, the model, the film, input devices and the output
 ```
 
 - `status --strict` exits 1 while a line has no chosen take or any problem exists; `--repair` adopts takes a crash left without a ledger event; `--refresh-film` re-measures a film that changed.
 - `script set` takes exactly one of `--text`, `--start`, `--end`, `--note`, `--clear-end` and `--clear-note`. Pass `--expect <script_version>` from `status --json` to refuse the edit if the script changed since you read it.
 - `export` uses each line's chosen take and refuses, naming the lines, when one has none, when a take has no detectable speech, or when two lines overlap. `--use-proposed` fills unchosen lines with the proposed take.
-- `record` and `check` exit 2 until milestones 2 and 3.
+- `record` refuses a script with validation problems (exit 1) and exits 2 when no `Takewise.app` is found. The recording window itself is still being built in milestone 2.
+- `doctor` lists the input devices with their sample rates and channels, checks the project's input device (chosen, connected, at 48 kHz), and warns when the output is Bluetooth.
+- `check` exits 2 until milestone 3.
 
 The project folder is plain TOML, JSONL and WAV; see [Project folder](docs/design.md#project-folder) in the design.
 

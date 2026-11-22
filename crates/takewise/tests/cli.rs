@@ -431,15 +431,58 @@ fn unknown_project_exit_2() {
 }
 
 #[test]
-fn record_and_check_are_stubs_exit_2() {
+fn record_without_bundle_explains() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = init(tmp.path());
+    let nowhere = tmp.path().join("Nowhere.app");
     takewise()
         .arg("record")
         .arg(&dir)
+        .env("TAKEWISE_APP", &nowhere)
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("milestone 2"));
+        .stderr(predicate::str::contains("mise run bundle"));
+    let (code, value) = json(
+        takewise()
+            .arg("record")
+            .arg(&dir)
+            .env("TAKEWISE_APP", &nowhere),
+    );
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "setup", "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Nowhere.app"),
+        "{value}"
+    );
+}
+
+#[test]
+fn record_refuses_an_invalid_script() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    std::fs::write(
+        dir.join("script.toml"),
+        "[[line]]\nid = \"Bad Id\"\nstart = 1.0\ntext = \"Hello.\"\n",
+    )
+    .unwrap();
+    let (code, value) = json(
+        takewise()
+            .arg("record")
+            .arg(&dir)
+            .env("TAKEWISE_APP", tmp.path().join("Nowhere.app")),
+    );
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(value["error"]["code"], "invalid-script", "{value}");
+    assert_eq!(value["data"]["problems"][0]["code"], "bad-id", "{value}");
+}
+
+#[test]
+fn check_is_a_stub_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
     let (code, value) = json(takewise().arg("check").arg(&dir));
     assert_eq!(code, 2);
     assert!(

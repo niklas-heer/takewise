@@ -1,0 +1,40 @@
+#!/bin/bash
+# Build Takewise.app into build/Takewise.app (release build).
+#   TAKEWISE_SIGN_IDENTITY  "Developer ID Application: …" for a hardened,
+#                           timestamped signature, which keeps the microphone
+#                           grant across rebuilds. Without it the app is signed
+#                           ad hoc and macOS asks for the microphone again after
+#                           every rebuild.
+#   TAKEWISE_BUILD          The build number (CFBundleVersion), default 1.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+[[ $# -eq 0 ]] || { echo "Usage: scripts/bundle (configure with TAKEWISE_SIGN_IDENTITY)" >&2; exit 64; }
+identity="${TAKEWISE_SIGN_IDENTITY:-}"
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/takewise/Cargo.toml | head -1)"
+build="${TAKEWISE_BUILD:-1}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$build" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid version $version ($build)." >&2; exit 65; }
+
+cargo build --release -p takewise
+
+mkdir -p build
+staging="$(mktemp -d "$root/build/.Takewise.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+app="$staging/Takewise.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp target/release/takewise "$app/Contents/MacOS/takewise"
+sed -e "s/<string>VERSION</<string>$version</" -e "s/<string>BUILD</<string>$build</" \
+  packaging/Info.plist > "$app/Contents/Info.plist"
+plutil -lint -s "$app/Contents/Info.plist"
+
+if [[ -n "$identity" ]]; then
+  codesign --force --sign "$identity" --options runtime --timestamp \
+    --entitlements packaging/Takewise.entitlements "$app"
+else
+  codesign --force --sign - --entitlements packaging/Takewise.entitlements "$app"
+fi
+codesign --verify --strict "$app"
+
+rm -rf build/Takewise.app
+mv "$app" build/Takewise.app
+echo "Built $root/build/Takewise.app ($version, build $build, ${identity:-ad hoc})"

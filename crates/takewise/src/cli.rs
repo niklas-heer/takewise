@@ -38,8 +38,12 @@ enum Command {
         #[arg(long)]
         film: PathBuf,
     },
-    /// Open the recording window (milestone 2).
+    /// Open the recording window, which runs inside Takewise.app so the
+    /// microphone permission belongs to Takewise.
     Record { dir: PathBuf },
+    /// The recording window itself; `record` starts it inside the app bundle.
+    #[command(hide = true)]
+    Window { dir: PathBuf },
     /// Lines, takes, verdicts, proposed and chosen takes, and problems.
     Status {
         dir: PathBuf,
@@ -192,8 +196,9 @@ impl From<tw::Error> for CliError {
 pub fn run(cli: Cli) -> Result<Outcome, CliError> {
     match cli.command {
         Command::Init { dir, film } => init(&dir, &film),
-        Command::Record { .. } => Err(CliError::NotYet(
-            "recording arrives in milestone 2; until then takes can only be added through takewise-core".to_owned(),
+        Command::Record { dir } => record(&dir),
+        Command::Window { .. } => Err(CliError::NotYet(
+            "the recording window is not built yet; it arrives later in milestone 2".to_owned(),
         )),
         Command::Status {
             dir,
@@ -229,7 +234,8 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             script_set(&dir, &line, field, expect.as_ref())
         }
         Command::Check { .. } => Err(CliError::NotYet(
-            "checks arrive in milestone 3; agents can add judgments with `takewise judge` now".to_owned(),
+            "checks arrive in milestone 3; agents can add judgments with `takewise judge` now"
+                .to_owned(),
         )),
         Command::Judge {
             dir,
@@ -252,7 +258,12 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
                 format!("Judged {line} take {take}: {}", judgment.verdict.as_str()),
             ))
         }
-        Command::Choose { dir, line, take, by } => {
+        Command::Choose {
+            dir,
+            line,
+            take,
+            by,
+        } => {
             match tw::choose_take(&dir, &line, take, &by) {
                 Err(err @ tw::Error::MissingFile { .. }) => {
                     return Ok(Outcome::new(json!({ "line": line, "take": take }), "")
@@ -536,6 +547,102 @@ fn tool_check(name: &'static str, install: &str) -> Check {
             detail: format!("not on PATH; install with `{install}`"),
         },
     }
+}
+
+/// Validates the project, then runs the recording window inside
+/// Takewise.app and waits for it to close.
+fn record(dir: &Path) -> Result<Outcome, CliError> {
+    let project = Project::open(dir)?;
+    let problems = tw::validate(&project.script, project.film_duration());
+    if !problems.is_empty() {
+        let mut text = String::new();
+        for problem in &problems {
+            let line = problem.line.as_deref().unwrap_or("-");
+            let _ = writeln!(text, "{line}: {}", problem.message);
+        }
+        let count = problems.len();
+        return Ok(
+            Outcome::new(json!({ "problems": problems }), text).with_finding(
+                "invalid-script",
+                format!("fix the script before recording ({count} problem(s))"),
+            ),
+        );
+    }
+    let bundle = find_bundle()?;
+    let dir = std::path::absolute(dir)
+        .map_err(|err| CliError::Setup(format!("{}: {err}", dir.display())))?;
+    let status = std::process::Command::new("open")
+        .arg("-n")
+        .arg("-W")
+        .arg(&bundle)
+        .arg("--args")
+        .arg("window")
+        .arg(&dir)
+        .status()
+        .map_err(|err| CliError::Setup(format!("could not run `open`: {err}")))?;
+    if !status.success() {
+        return Err(CliError::Setup(format!(
+            "`open {}` failed ({status})",
+            bundle.display()
+        )));
+    }
+    Ok(Outcome::new(
+        json!({ "bundle": bundle }),
+        format!("Recording window closed ({}).", bundle.display()),
+    ))
+}
+
+/// Takewise.app: the bundle this binary runs in, else `$TAKEWISE_APP`
+/// (which must then exist), else `/Applications/Takewise.app`, else the
+/// repository's `build/Takewise.app`.
+fn find_bundle() -> Result<PathBuf, CliError> {
+    let is_bundle = |app: &Path| app.join("Contents/MacOS/takewise").is_file();
+    if let Some(app) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(enclosing_bundle)
+    {
+        return Ok(app);
+    }
+    if let Some(app) = std::env::var_os("TAKEWISE_APP") {
+        let app = PathBuf::from(app);
+        return if is_bundle(&app) {
+            Ok(app)
+        } else {
+            Err(CliError::Setup(format!(
+                "TAKEWISE_APP is {}, which is not a Takewise.app; build one with `mise run bundle`",
+                app.display()
+            )))
+        };
+    }
+    let repo_build = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap_or(Path::new("."))
+        .join("build/Takewise.app");
+    let candidates = [PathBuf::from("/Applications/Takewise.app"), repo_build];
+    candidates
+        .iter()
+        .find(|app| is_bundle(app))
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Setup(format!(
+                "Takewise.app is in neither {} nor {}; run `mise run bundle` or set TAKEWISE_APP",
+                candidates[0].display(),
+                candidates[1].display()
+            ))
+        })
+}
+
+/// `X.app` when `exe` is `X.app/Contents/MacOS/<binary>`.
+fn enclosing_bundle(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && app.extension()? == "app")
+        .then(|| app.to_owned())
 }
 
 /// What `doctor` found out about the audio devices.
