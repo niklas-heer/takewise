@@ -79,8 +79,13 @@ impl Capture {
                     samples,
                 });
             },
-            move |err| {
-                *error_sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(err.to_string());
+            move |err: cpal::Error| {
+                // Overloads and other glitches only lose some audio, which
+                // the gap in the buffers' host times shows; the take goes on.
+                if ends_capture(err.kind()) {
+                    *error_sink.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(err.to_string());
+                }
             },
             Some(Duration::from_secs(2)),
         )?;
@@ -88,8 +93,10 @@ impl Capture {
         Ok(Self { stream, error })
     }
 
-    /// The last error the stream reported (for example the device was
-    /// unplugged), if any. Buffers stop arriving after such an error.
+    /// The error that ended the stream (the device was unplugged, or its
+    /// sample rate or format changed), if any. Buffers stop arriving after
+    /// it. Overloads (xruns) are not errors here: they leave a gap in the
+    /// buffers' host times.
     pub fn last_error(&self) -> Option<String> {
         self.error
             .lock()
@@ -105,6 +112,17 @@ impl Capture {
     }
 }
 
+/// Whether a stream error ends the capture: the device is gone, or its
+/// sample rate or format changed under the stream.
+fn ends_capture(kind: cpal::ErrorKind) -> bool {
+    matches!(
+        kind,
+        cpal::ErrorKind::DeviceNotAvailable
+            | cpal::ErrorKind::StreamInvalidated
+            | cpal::ErrorKind::UnsupportedConfig
+    )
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn to_24_bit(sample: f32) -> i32 {
     (f64::from(sample.clamp(-1.0, 1.0)) * f64::from(FULL_SCALE)).round() as i32
@@ -113,6 +131,26 @@ fn to_24_bit(sample: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_lost_device_or_format_ends_a_capture() {
+        use cpal::ErrorKind;
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::UnsupportedConfig,
+        ] {
+            assert!(ends_capture(kind), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::Xrun,
+            ErrorKind::DeviceChanged,
+            ErrorKind::RealtimeDenied,
+            ErrorKind::BackendError,
+        ] {
+            assert!(!ends_capture(kind), "{kind:?}");
+        }
+    }
 
     #[test]
     fn converts_to_the_24_bit_range() {
