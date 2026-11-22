@@ -424,3 +424,49 @@ fn doctor_reports_checks() {
     let film = checks.iter().find(|c| c["name"] == "film").unwrap();
     assert_eq!(film["ok"], true, "{film}");
 }
+
+#[test]
+fn status_version_matches_the_script_it_shows() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use takewise_core::ScriptVersion;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    let texts = [
+        SCRIPT.to_owned(),
+        SCRIPT.replace("Hello there.", "Hi there."),
+    ];
+    fs::write(dir.join("script.toml"), &texts[0]).unwrap();
+
+    // Another writer keeps replacing script.toml while status runs.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (dir, texts, stop) = (dir.clone(), texts.clone(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut n = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let staged = dir.join(".script.toml.test");
+                fs::write(&staged, &texts[n % 2]).unwrap();
+                fs::rename(&staged, dir.join("script.toml")).unwrap();
+            }
+        })
+    };
+    let mut mismatches = Vec::new();
+    for _ in 0..30 {
+        let data = status(&dir);
+        let shown = data["lines"][0]["text"].as_str().unwrap();
+        let source = texts.iter().find(|t| t.contains(shown)).unwrap();
+        let expected = ScriptVersion::of(source.as_bytes()).to_string();
+        if data["script_version"] != expected.as_str() {
+            mismatches.push(shown.to_owned());
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        mismatches.is_empty(),
+        "status issued a version for a different script than it showed: {mismatches:?}"
+    );
+}

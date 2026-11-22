@@ -11,7 +11,9 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
-use crate::project::{FilmInfo, PROJECT_FILE, SCRIPT_FILE, parse_script, read_config};
+use crate::project::{
+    FilmInfo, PROJECT_FILE, SCRIPT_FILE, parse_script, read_config, read_script_bytes,
+};
 use crate::script::validate;
 
 /// One field of one line.
@@ -62,15 +64,6 @@ impl FromStr for ScriptVersion {
 /// The version of `script.toml` as it is on disk now (an absent file hashes as empty).
 pub fn script_version(dir: &Path) -> Result<ScriptVersion> {
     Ok(ScriptVersion::of(&read_script_bytes(dir)?))
-}
-
-fn read_script_bytes(dir: &Path) -> Result<Vec<u8>> {
-    let path = dir.join(SCRIPT_FILE);
-    match fs::read(&path) {
-        Ok(bytes) => Ok(bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(io(&path)(err)),
-    }
 }
 
 /// Changes one field of the line `line_id` in `script.toml`, keeping every

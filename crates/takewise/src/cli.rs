@@ -302,13 +302,13 @@ struct FilmStatus {
 }
 
 fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<Outcome, CliError> {
-    let mut project = Project::open(dir)?;
     let repair = if repair { Some(tw::repair(dir)?) } else { None };
     if refresh_film {
-        let info = film::probe(&project.film_path())?;
+        let info = film::probe(&Project::open(dir)?.film_path())?;
         tw::set_film_info(dir, &info)?;
-        project = Project::open(dir)?;
     }
+    // The script is read once: the version issued is the one folded.
+    let (project, script_version) = Project::open_versioned(dir)?;
     let ledger = tw::read(dir)?;
     let mut state = tw::fold(&project, &ledger);
 
@@ -332,7 +332,7 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
     }
 
     let data = StatusData {
-        script_version: tw::script_version(dir)?.to_string(),
+        script_version: script_version.to_string(),
         film: FilmStatus {
             path: film_path,
             info: project.config.film_info.clone(),

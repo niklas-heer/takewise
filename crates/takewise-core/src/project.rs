@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::edit::ScriptVersion;
 use crate::error::{Error, Result, io};
 use crate::script::Script;
 
@@ -160,6 +161,26 @@ impl Project {
         })
     }
 
+    /// Reads `project.toml` and `script.toml`, and returns the version of the
+    /// exact script bytes that were parsed, so the two always agree.
+    pub fn open_versioned(dir: &Path) -> Result<(Project, ScriptVersion)> {
+        let config = read_config(dir)?;
+        let bytes = read_script_bytes(dir)?;
+        let version = ScriptVersion::of(&bytes);
+        let path = dir.join(SCRIPT_FILE);
+        let text = String::from_utf8(bytes).map_err(|err| Error::Parse {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        let script = parse_script(&path, &text)?;
+        let project = Project {
+            dir: dir.to_path_buf(),
+            config,
+            script,
+        };
+        Ok((project, version))
+    }
+
     /// The film's path, with a relative `film` resolved against the project.
     pub fn film_path(&self) -> PathBuf {
         if self.config.film.is_absolute() {
@@ -209,6 +230,16 @@ pub fn read_script(dir: &Path) -> Result<Script> {
         Err(err) => return Err(io(&path)(err)),
     };
     parse_script(&path, &text)
+}
+
+/// The bytes of `script.toml`; an absent file is empty.
+pub(crate) fn read_script_bytes(dir: &Path) -> Result<Vec<u8>> {
+    let path = dir.join(SCRIPT_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(io(&path)(err)),
+    }
 }
 
 pub(crate) fn parse_script(path: &Path, text: &str) -> Result<Script> {
@@ -268,6 +299,18 @@ mod tests {
         Project::init(tmp.path(), Path::new("film.mp4"), info()).unwrap();
         let err = Project::init(tmp.path(), Path::new("film.mp4"), info()).unwrap_err();
         assert!(matches!(err, Error::AlreadyExists(_)), "{err:?}");
+    }
+
+    #[test]
+    fn open_versioned_hashes_the_bytes_it_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        Project::init(tmp.path(), Path::new("film.mp4"), info()).unwrap();
+        let text = "[[line]]\nid = \"hook\"\nstart = 1.0\ntext = \"Hi.\"\n";
+        fs::write(tmp.path().join(SCRIPT_FILE), text).unwrap();
+        let (project, version) = Project::open_versioned(tmp.path()).unwrap();
+        assert_eq!(project.script.lines[0].id, "hook");
+        assert_eq!(version, ScriptVersion::of(text.as_bytes()));
+        assert_eq!(project, Project::open(tmp.path()).unwrap());
     }
 
     #[test]
