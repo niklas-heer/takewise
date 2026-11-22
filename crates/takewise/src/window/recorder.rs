@@ -248,6 +248,7 @@ impl Recorder {
                 channel: input.channel,
                 line_offset_s: 0.0,
                 snapshot,
+                dropouts: None,
             },
             latency_s,
             offset_ms: f64::from(input.latency_offset_ms),

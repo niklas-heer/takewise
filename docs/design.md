@@ -117,7 +117,7 @@ The app, the CLI and agents editing by hand may all touch the folder.
 
 `takes.jsonl` is append-only. Each line is one event: `{"v": 1, "at": RFC 3339, "kind": …, "line": id, "take": n, …}`.
 
-- `recorded`: `file`, `sample_rate`, `samples`, `device`, `channel`, `line_offset_s` (film time of the take's first sample minus the line's start, at record time; negative because capture begins with pre-roll), and a `snapshot` of the line at record time (`text`, `start`, `end`).
+- `recorded`: `file`, `sample_rate`, `samples`, `device`, `channel`, `line_offset_s` (film time of the take's first sample minus the line's start, at record time; negative because capture begins with pre-roll), a `snapshot` of the line at record time (`text`, `start`, `end`), and optionally `dropouts`: how many gaps the capture had (buffers arriving later than the previous one ended, by more than 1 ms), each filled with silence so later audio keeps its timing. Takes recorded before it existed, and takes recovered after a crash, have no `dropouts`; readers treat it as unknown.
 - `checked`: `snapshot` checked against (text and slot), transcript with word times, word differences, `speech` (start and end in source seconds, from the energy detector), `overrun_s`, `peak_dbfs`, `clipped_samples`, `noise_floor_dbfs`, `verdict` (`keep`, `retake`, `listen`), `reasons` (list of `{code, message}`), `checker` (whisper model and Takewise version).
 - `judged`: an outside judgment: `snapshot` judged against, `by` (free text, for example `claude-opus-5-5`), `verdict`, optional `score` 0–1, `reason`.
 - `chosen`: `by` (`narrator` or the agent's name).

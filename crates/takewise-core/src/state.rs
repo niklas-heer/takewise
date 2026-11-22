@@ -486,6 +486,7 @@ text = "Today we start."
                 line_offset_s: -2.0,
                 snapshot: snap(project, line),
                 recovered: false,
+                dropouts: None,
             }),
         );
         append(&project.dir, &event).unwrap();
@@ -864,6 +865,7 @@ text = "Today we start."
             channel: 1,
             line_offset_s: -2.0,
             snapshot: snap(&project, "hook"),
+            dropouts: None,
         };
         let partial = crate::takes::begin_take(&project.dir, "hook", &input).unwrap();
         crate::takes::write_take_wav(&partial.wav, &[1; 10], 48_000).unwrap();
@@ -905,6 +907,7 @@ text = "Today we start."
                 channel: 1,
                 line_offset_s: -2.0,
                 snapshot: snap(&project, "hook"),
+                dropouts: None,
             },
         )
         .unwrap();

@@ -37,6 +37,6 @@ pub use takes::{
     choose_take, commit_take, judge_take, read_take_wav, repair, update_take_meta, write_take_wav,
 };
 pub use timing::{
-    RecordPlan, Timebase, TimebaseHistory, clamp_mark, line_offset_s, pace_fill, plan_take,
-    sample_film_time,
+    Assembler, Dropout, GAP_TOLERANCE_S, RecordPlan, Timebase, TimebaseHistory, clamp_mark,
+    line_offset_s, pace_fill, plan_take, sample_film_time,
 };

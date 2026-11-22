@@ -79,6 +79,9 @@ pub struct Recorded {
     pub snapshot: Snapshot,
     #[serde(default)]
     pub recovered: bool,
+    /// Gaps in the captured audio (filled with silence), when counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropouts: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -281,6 +284,7 @@ mod tests {
                 line_offset_s: -2.0,
                 snapshot: snapshot(),
                 recovered: false,
+                dropouts: None,
             }),
         )
     }

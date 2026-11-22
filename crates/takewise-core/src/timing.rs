@@ -70,6 +70,83 @@ pub fn sample_film_time(
         .map(|film| film + offset_ms / 1000.0)
 }
 
+/// How far a buffer may start from where the previous one ended before the
+/// difference counts as a gap.
+pub const GAP_TOLERANCE_S: f64 = 0.001;
+
+/// A stretch of captured audio that never arrived and was filled with
+/// silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dropout {
+    /// Index of the first silent sample in the take.
+    pub at_sample: u64,
+    /// How many samples were missing.
+    pub missing: u64,
+}
+
+/// Places capture buffers end to end. A buffer that starts later than the
+/// previous one ended (by its host time, beyond [`GAP_TOLERANCE_S`]) had
+/// audio lost before it, such as after an overload: the gap is filled with
+/// silence so later audio keeps its timing, and counted.
+#[derive(Debug, Clone)]
+pub struct Assembler {
+    sample_rate: u32,
+    first_host_s: Option<f64>,
+    next_host_s: Option<f64>,
+    samples: u64,
+    dropouts: Vec<Dropout>,
+}
+
+impl Assembler {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            first_host_s: None,
+            next_host_s: None,
+            samples: 0,
+            dropouts: Vec::new(),
+        }
+    }
+
+    /// Takes a buffer of `len` samples whose first sample has host time
+    /// `host_s`; returns how many samples of silence go before it.
+    pub fn push(&mut self, host_s: f64, len: usize) -> usize {
+        let rate = f64::from(self.sample_rate);
+        let mut silence = 0;
+        match self.next_host_s {
+            None => self.first_host_s = Some(host_s),
+            Some(next) if host_s - next > GAP_TOLERANCE_S => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let missing = ((host_s - next) * rate).round() as usize;
+                self.dropouts.push(Dropout {
+                    at_sample: self.samples,
+                    missing: missing as u64,
+                });
+                self.samples += missing as u64;
+                silence = missing;
+            }
+            Some(_) => {}
+        }
+        self.samples += len as u64;
+        self.next_host_s = Some(host_s + len as f64 / rate);
+        silence
+    }
+
+    /// Host time of the first sample, once a buffer arrived.
+    pub fn first_host_s(&self) -> Option<f64> {
+        self.first_host_s
+    }
+
+    /// Samples placed so far, silence included.
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    pub fn dropouts(&self) -> &[Dropout] {
+        &self.dropouts
+    }
+}
+
 /// How one take plays the film and when it stops.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordPlan {
@@ -285,5 +362,36 @@ mod tests {
         assert!(close(clamp_mark(&script, 0, -1.0, 20.0), 0.0));
         // The last line is bounded by its explicit end.
         assert!(close(clamp_mark(&script, 2, 15.0, 20.0), 11.999));
+    }
+
+    #[test]
+    fn assembler_keeps_contiguous_buffers_together() {
+        let mut gaps = Assembler::new(48_000);
+        assert_eq!(gaps.push(10.0, 480), 0);
+        // 0.5 ms of timestamp jitter is no gap.
+        assert_eq!(gaps.push(10.0105, 480), 0);
+        assert_eq!(gaps.push(10.0195, 480), 0);
+        assert_eq!(gaps.samples(), 1440);
+        assert_eq!(gaps.dropouts(), &[]);
+        assert_eq!(gaps.first_host_s(), Some(10.0));
+    }
+
+    #[test]
+    fn assembler_fills_gaps_with_silence() {
+        let mut gaps = Assembler::new(48_000);
+        gaps.push(10.0, 480);
+        // The next buffer was due at 10.01 but came 25 ms later.
+        assert_eq!(gaps.push(10.035, 480), 1200);
+        assert_eq!(gaps.samples(), 480 + 1200 + 480);
+        assert_eq!(
+            gaps.dropouts(),
+            &[Dropout {
+                at_sample: 480,
+                missing: 1200
+            }]
+        );
+        // Timing continues from the late buffer.
+        assert_eq!(gaps.push(10.045, 480), 0);
+        assert_eq!(gaps.dropouts().len(), 1);
     }
 }

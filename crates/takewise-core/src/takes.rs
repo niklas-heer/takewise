@@ -28,6 +28,9 @@ pub struct RecordedInput {
     pub channel: u16,
     pub line_offset_s: f64,
     pub snapshot: Snapshot,
+    /// Gaps in the captured audio, once counted (when the take is stopped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropouts: Option<u32>,
 }
 
 /// A take's `NNN.json`: the recording input plus the name of the partial
@@ -189,6 +192,7 @@ fn recorded_event(
             line_offset_s: input.line_offset_s,
             snapshot: input.snapshot,
             recovered,
+            dropouts: input.dropouts,
         }),
     )
 }
@@ -737,6 +741,7 @@ mod tests {
                 start: 10.0,
                 end: 15.0,
             },
+            dropouts: None,
         }
     }
 
@@ -1113,5 +1118,27 @@ mod tests {
         // Once recording ends (here: a crash), the take is adopted.
         drop(wav);
         assert_eq!(repair(dir).unwrap().adopted.len(), 1);
+    }
+
+    #[test]
+    fn dropouts_reach_the_recorded_event_only_when_known() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        record(dir, "hook", 10);
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        write_take_wav(&partial.wav, &[1; 10], 48_000).unwrap();
+        let counted = RecordedInput {
+            dropouts: Some(2),
+            ..input()
+        };
+        update_take_meta(&partial, &counted).unwrap();
+        commit_take(dir, partial).unwrap();
+        let ledger = read(dir).unwrap();
+        assert_eq!(ledger.recorded("hook", 1).unwrap().dropouts, None);
+        assert_eq!(ledger.recorded("hook", 2).unwrap().dropouts, Some(2));
+        let text = fs::read_to_string(dir.join("takes.jsonl")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines[0].contains("dropouts"), "{}", lines[0]);
+        assert!(lines[1].contains("\"dropouts\":2"), "{}", lines[1]);
     }
 }

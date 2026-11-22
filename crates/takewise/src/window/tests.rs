@@ -503,6 +503,7 @@ fn recorded_input_round_trips(cx: &mut TestAppContext) {
         channel: 1,
         line_offset_s: -2.0,
         snapshot,
+        dropouts: None,
     };
     let partial = tw::begin_take(&f.dir, "a", &input).expect("begin");
     tw::write_take_wav(&partial.wav, &[0; 480], 48_000).expect("wav");

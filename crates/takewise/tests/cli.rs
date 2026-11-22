@@ -71,6 +71,7 @@ fn record_take(dir: &Path, line: &str) -> TakeRef {
         channel: 1,
         line_offset_s: -2.0,
         snapshot: project.snapshot(line).unwrap(),
+        dropouts: None,
     };
     let partial = begin_take(dir, line, &input).unwrap();
     let mut audio = vec![0i32; 5 * RATE as usize];
@@ -338,6 +339,7 @@ fn status_strict_exit_codes() {
         channel: 1,
         line_offset_s: -2.0,
         snapshot: project.snapshot("hook").unwrap(),
+        dropouts: None,
     };
     begin_take(&dir, "hook", &input).unwrap();
     let (code, value) = json(takewise().arg("status").arg(&dir).arg("--strict"));
