@@ -173,7 +173,7 @@ All local, run after each take and by `takewise check`. Recording and choosing w
   6. Only substitutions (likely mishearings of names or numbers) → `listen`, naming them.
   7. Otherwise → `keep`.
   Thresholds are tuned on real takes (the Kindred narration recorded on 2026-11-22), not only on synthetic `say` fixtures.
-- **Ranking** among a line's takes, using effective verdicts: `keep` before `listen` and `unchecked` (equal) before `retake`; then fewer word differences; then smaller overrun; then outside `score`; then newest. The top take is proposed, never chosen automatically.
+- **Ranking** among a line's takes, using effective verdicts: takes whose file is missing rank last and are never proposed; then `keep` before `listen` and `unchecked` (equal) before `retake`; then fewer word differences; then smaller overrun; then outside `score`; then newest. The top take is proposed, never chosen automatically.
 
 ## CLI
 

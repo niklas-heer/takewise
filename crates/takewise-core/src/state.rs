@@ -98,6 +98,8 @@ impl Project {
 /// Ranking inputs for one take.
 struct Rank {
     take: u32,
+    /// The take's WAV is not on disk.
+    missing: bool,
     verdict: u8,
     diffs: usize,
     overrun: f64,
@@ -105,12 +107,14 @@ struct Rank {
 }
 
 impl Rank {
-    /// `Less` means `self` ranks ahead: keep, then listen and unchecked
-    /// equally, then retake; then fewer word differences; then smaller
-    /// overrun; then higher outside score; then newer.
+    /// `Less` means `self` ranks ahead: takes on disk before missing ones;
+    /// then keep, then listen and unchecked equally, then retake; then fewer
+    /// word differences; then smaller overrun; then higher outside score;
+    /// then newer.
     fn cmp(&self, other: &Rank) -> Ordering {
-        self.verdict
-            .cmp(&other.verdict)
+        self.missing
+            .cmp(&other.missing)
+            .then(self.verdict.cmp(&other.verdict))
             .then(self.diffs.cmp(&other.diffs))
             .then(self.overrun.total_cmp(&other.overrun))
             .then(match (self.score, other.score) {
@@ -176,6 +180,7 @@ fn fold_take(
     };
     let rank = Rank {
         take,
+        missing: state.missing,
         verdict: match effective {
             Some(Verdict::Keep) => 0,
             Some(Verdict::Listen) | None => 1,
@@ -219,7 +224,12 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         }
         let chosen = latest_valid_choice(&line.id, choices, &seen, &mut notices);
         takes.sort_by_key(|t| t.take);
-        let proposed = ranks.iter().min_by(|a, b| a.cmp(b)).map(|r| r.take);
+        // A take whose file is missing is never proposed.
+        let proposed = ranks
+            .iter()
+            .filter(|r| !r.missing)
+            .min_by(|a, b| a.cmp(b))
+            .map(|r| r.take);
         let chosen_take = chosen.as_ref().map(|(take, _)| *take);
         take_findings(&line.id, &takes, chosen_take, &mut problems, &mut notices);
         lines.push(LineState {
@@ -454,7 +464,16 @@ text = "Today we start."
         project.snapshot(line).unwrap()
     }
 
+    /// A `recorded` event and its WAV.
     fn recorded(project: &Project, line: &str, take: u32) {
+        let path = project.dir.join(format!("takes/{line}/{take:03}.wav"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::takes::write_take_wav(&path, &[0; 10], 48_000).unwrap();
+        recorded_event(project, line, take);
+    }
+
+    /// A `recorded` event only, as if its WAV went missing.
+    fn recorded_event(project: &Project, line: &str, take: u32) {
         let event = Event::new(
             line,
             take,
@@ -695,6 +714,22 @@ text = "Today we start."
         judged(&project, "hook", 2, Verdict::Keep, Some(0.9));
         judged(&project, "hook", 3, Verdict::Keep, Some(0.4));
         assert_eq!(line(&fold_now(&project), "hook").proposed, Some(2));
+    }
+
+    #[test]
+    fn takes_with_missing_files_rank_last_and_are_never_proposed() {
+        let (_tmp, project) = setup(TWO_LINES);
+        recorded_event(&project, "hook", 1);
+        recorded(&project, "hook", 2);
+        recorded_event(&project, "hook", 3);
+        checked(&project, "hook", 1, Verdict::Keep, 0, None);
+        checked(&project, "hook", 2, Verdict::Retake, 0, None);
+        checked(&project, "hook", 3, Verdict::Keep, 0, None);
+        assert_eq!(line(&fold_now(&project), "hook").proposed, Some(2));
+
+        recorded_event(&project, "today", 1);
+        checked(&project, "today", 1, Verdict::Keep, 0, None);
+        assert_eq!(line(&fold_now(&project), "today").proposed, None);
     }
 
     #[test]
