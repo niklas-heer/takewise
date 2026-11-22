@@ -14,8 +14,14 @@ const SPEECH_MIN_DBFS: f64 = -55.0;
 const FRAMES_PER_SECOND: u32 = 100;
 /// Gaps shorter than this between speech runs are bridged (in 10 ms frames).
 const MERGE_GAP_FRAMES: usize = 30;
-/// Runs shorter than this after merging are dropped (in 10 ms frames).
+/// Runs with fewer voiced frames than this after merging are dropped (in
+/// 10 ms frames); bridged silence does not count.
 const MIN_RUN_FRAMES: usize = 8;
+/// A first or last run with fewer voiced frames than this (in 10 ms frames)
+/// is dropped when at least `ISOLATION_GAP_FRAMES` separate it from the next
+/// run: a breath, a click or a chair, not the first or last word.
+const WEAK_RUN_FRAMES: usize = 15;
+const ISOLATION_GAP_FRAMES: usize = 40;
 const CLIP_DBFS: f64 = -0.1;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -91,29 +97,67 @@ fn percentile(values: &[f64], q: f64) -> Option<f64> {
     sorted.get(idx).copied()
 }
 
-/// The first and last frame of speech, after bridging short gaps and
-/// dropping short runs.
+/// A stretch of speech frames with short gaps bridged.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    start: usize,
+    end: usize,
+    /// Frames above the threshold, not counting bridged gaps.
+    voiced: usize,
+}
+
+impl Run {
+    /// Frames of silence between this run and a later one.
+    fn gap_to(self, later: Run) -> usize {
+        later.start - self.end - 1
+    }
+
+    fn is_weak(self) -> bool {
+        self.voiced < WEAK_RUN_FRAMES
+    }
+}
+
+/// The first and last frame of speech: bridges short gaps, drops runs with
+/// too few voiced frames, then drops weak runs isolated at either end.
 fn speech_runs(levels: &[f64], threshold: f64) -> Option<(usize, usize)> {
-    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
     for (idx, _) in levels.iter().enumerate().filter(|(_, db)| **db > threshold) {
         match runs.last_mut() {
-            Some((_, end)) if idx - *end - 1 < MERGE_GAP_FRAMES => *end = idx,
-            _ => runs.push((idx, idx)),
+            Some(run) if idx - run.end - 1 < MERGE_GAP_FRAMES => {
+                run.end = idx;
+                run.voiced += 1;
+            }
+            _ => runs.push(Run {
+                start: idx,
+                end: idx,
+                voiced: 1,
+            }),
         }
     }
-    let mut kept = runs
+    let mut kept: &[Run] = &runs
         .into_iter()
-        .filter(|(start, end)| end - start + 1 >= MIN_RUN_FRAMES);
-    let first = kept.next()?;
-    let last = kept.next_back().unwrap_or(first);
-    Some((first.0, last.1))
+        .filter(|run| run.voiced >= MIN_RUN_FRAMES)
+        .collect::<Vec<_>>();
+    while let [first, next, ..] = kept {
+        if !(first.is_weak() && first.gap_to(*next) >= ISOLATION_GAP_FRAMES) {
+            break;
+        }
+        kept = &kept[1..];
+    }
+    while let [.., previous, last] = kept {
+        if !(last.is_weak() && previous.gap_to(*last) >= ISOLATION_GAP_FRAMES) {
+            break;
+        }
+        kept = &kept[..kept.len() - 1];
+    }
+    Some((kept.first()?.start, kept.last()?.end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::takes::FULL_SCALE;
-    use crate::testutil::{RATE, burst, noise};
+    use crate::testutil::{RATE, burst, burst_at, noise};
 
     fn close(actual: f64, expected: f64) -> bool {
         (actual - expected).abs() <= 0.020
@@ -160,6 +204,45 @@ mod tests {
         burst(&mut take, 1.0, 2.2);
         let (start, _) = analyze(&take, RATE, 0.5).speech.unwrap();
         assert!(close(start, 1.0), "the isolated click is dropped: {start}");
+    }
+
+    #[test]
+    fn bridged_clicks_are_not_speech() {
+        // Two 10 ms clicks 150 ms apart bridge into one 160 ms run, but only
+        // 20 ms of it is voiced.
+        let mut take = noise(3.0);
+        burst(&mut take, 1.0, 1.01);
+        burst(&mut take, 1.15, 1.16);
+        assert_eq!(analyze(&take, RATE, 0.5).speech, None);
+    }
+
+    #[test]
+    fn isolated_noise_before_speech_is_not_the_start() {
+        // A 90 ms bump (a breath, a chair) 1 s before the real speech.
+        let mut take = noise(4.0);
+        burst_at(&mut take, 0.91, 1.0, -37.0);
+        burst(&mut take, 2.0, 3.0);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 2.0), "start {start}");
+        assert!(close(end, 3.0), "end {end}");
+    }
+
+    #[test]
+    fn isolated_noise_after_speech_is_not_the_end() {
+        let mut take = noise(4.0);
+        burst(&mut take, 1.0, 2.0);
+        burst_at(&mut take, 3.0, 3.09, -37.0);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 1.0) && close(end, 2.0), "{start}..{end}");
+    }
+
+    #[test]
+    fn a_short_word_alone_is_still_speech() {
+        // A single 100 ms word with nothing else is kept.
+        let mut take = noise(3.0);
+        burst(&mut take, 1.0, 1.1);
+        let (start, end) = analyze(&take, RATE, 0.5).speech.unwrap();
+        assert!(close(start, 1.0) && close(end, 1.1), "{start}..{end}");
     }
 
     #[test]

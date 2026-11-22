@@ -20,10 +20,25 @@ pub fn noise(seconds: f64) -> Vec<i32> {
 
 /// Replaces `from..to` seconds of `take` with a 440 Hz tone at half scale.
 pub fn burst(take: &mut [i32], from: f64, to: f64) {
+    tone(take, from, to, 0.5);
+}
+
+/// Replaces `from..to` seconds of `take` with a 440 Hz tone whose RMS level
+/// is `rms_dbfs`.
+pub fn burst_at(take: &mut [i32], from: f64, to: f64, rms_dbfs: f64) {
+    tone(
+        take,
+        from,
+        to,
+        10f64.powf(rms_dbfs / 20.0) * std::f64::consts::SQRT_2,
+    );
+}
+
+fn tone(take: &mut [i32], from: f64, to: f64, peak: f64) {
     let (a, b) = (samples(from), samples(to).min(take.len()));
     for (i, sample) in take[a..b].iter_mut().enumerate() {
         let t = i as f64 / f64::from(RATE);
-        *sample = round((t * 440.0 * std::f64::consts::TAU).sin() * 0.5 * f64::from(FULL_SCALE));
+        *sample = round((t * 440.0 * std::f64::consts::TAU).sin() * peak * f64::from(FULL_SCALE));
     }
 }
 
