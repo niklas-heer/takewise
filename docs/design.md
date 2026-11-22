@@ -168,7 +168,7 @@ All local, run after each take and by `takewise check`. Recording and choosing w
   1. No speech detected → `retake` ("no speech").
   2. Clipping → `retake`.
   3. One or more missing or extra words → `retake`, naming them.
-  4. Overrun beyond 0.25 s or early start beyond 0.3 s → `retake`, with the amount.
+  4. Overrun beyond 0.25 s or early start beyond 0.3 s → `retake`, with the amount. Early start is measured from the first transcribed word when transcription succeeded, because the energy detector also counts a breath shortly before the words (seen on the real Kindred take, line 4: 0.52 s early).
   5. Transcription failed or unavailable → `listen` ("words not checked").
   6. Only substitutions (likely mishearings of names or numbers) → `listen`, naming them.
   7. Otherwise → `keep`.
