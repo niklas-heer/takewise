@@ -252,10 +252,18 @@ pub fn read_take_wav(path: &Path) -> Result<(Vec<i32>, u32)> {
     Ok((samples, spec.sample_rate))
 }
 
-/// Records a choice of a recorded take of a current line.
+/// Records a choice of a recorded take of a current line whose file exists.
 pub fn choose_take(dir: &Path, line: &str, take: u32, by: &str) -> Result<()> {
     let _guard = lock(dir)?;
-    check_take(dir, line, take)?;
+    let (_, file) = check_take(dir, line, take)?;
+    let path = dir.join(&file);
+    if !path.is_file() {
+        return Err(Error::MissingFile {
+            line: line.to_owned(),
+            take,
+            path,
+        });
+    }
     let event = Event::new(line, take, EventKind::Chosen(Chosen { by: by.to_owned() }));
     ledger::append_locked(dir, &event)
 }
@@ -272,7 +280,7 @@ pub struct Judgment {
 /// Appends a `judged` event for a recorded take of a current line.
 pub fn judge_take(dir: &Path, line: &str, take: u32, judgment: Judgment) -> Result<()> {
     let _guard = lock(dir)?;
-    let snapshot = check_take(dir, line, take)?;
+    let (snapshot, _) = check_take(dir, line, take)?;
     let event = Event::new(
         line,
         take,
@@ -288,19 +296,20 @@ pub fn judge_take(dir: &Path, line: &str, take: u32, judgment: Judgment) -> Resu
 }
 
 /// Checks that `line` is in the script and `take` was recorded for it, and
-/// returns the line's current snapshot.
-fn check_take(dir: &Path, line: &str, take: u32) -> Result<Snapshot> {
+/// returns the line's current snapshot and the take's file.
+fn check_take(dir: &Path, line: &str, take: u32) -> Result<(Snapshot, String)> {
     let project = Project::open(dir)?;
     let snapshot = project
         .snapshot(line)
         .ok_or_else(|| Error::UnknownLine(line.to_owned()))?;
-    if ledger::read(dir)?.recorded(line, take).is_none() {
-        return Err(Error::UnknownTake {
+    let file = ledger::read(dir)?
+        .recorded(line, take)
+        .map(|rec| rec.file.clone())
+        .ok_or_else(|| Error::UnknownTake {
             line: line.to_owned(),
             take,
-        });
-    }
-    Ok(snapshot)
+        })?;
+    Ok((snapshot, file))
 }
 
 /// A numbered take file, `NNN.wav` or `NNN.json`.
@@ -722,6 +731,29 @@ mod tests {
             judged.snapshot,
             Project::open(dir).unwrap().snapshot("hook").unwrap()
         );
+    }
+
+    #[test]
+    fn choose_refuses_a_take_whose_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let info = crate::project::FilmInfo {
+            duration_s: 51.5,
+            size: 1,
+            modified: "2026-11-22T20:05:11Z".to_owned(),
+        };
+        Project::init(dir, Path::new("film.mp4"), info).unwrap();
+        fs::write(
+            dir.join("script.toml"),
+            "[[line]]\nid = \"hook\"\nstart = 10.0\ntext = \"Hello.\"\n",
+        )
+        .unwrap();
+        record(dir, "hook", 10);
+        fs::remove_file(dir.join("takes/hook/001.wav")).unwrap();
+        let err = choose_take(dir, "hook", 1, "narrator").unwrap_err();
+        assert!(matches!(err, Error::MissingFile { take: 1, .. }), "{err:?}");
+        assert_eq!(err.code(), "missing-file");
+        assert_eq!(read(dir).unwrap().events.len(), 1, "nothing appended");
     }
 
     #[test]

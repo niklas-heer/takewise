@@ -187,7 +187,7 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | `takewise script set <dir> <line> --text … / --start … / --end …` | Edit one field of one line safely. |
 | `takewise check <dir> [--line ID] [--take N]` | Run checks; appends `checked` events. |
 | `takewise judge <dir> <line> <take> --verdict … --reason … --by … [--score …]` | Add an outside judgment. |
-| `takewise choose <dir> <line> <take> [--by …]` | Choose a take. |
+| `takewise choose <dir> <line> <take> [--by …]` | Choose a take; refuses one whose file is missing (exit 1, `missing-file`). |
 | `takewise export <dir> [--use-proposed]` | Write `export/narration.wav` and `export/manifest.json`. |
 | `takewise doctor [<dir>]` | Check whisper-cli, the model, microphone access, input devices and their sample rates, the output device. |
 

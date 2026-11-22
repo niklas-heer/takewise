@@ -251,7 +251,13 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             ))
         }
         Command::Choose { dir, line, take, by } => {
-            tw::choose_take(&dir, &line, take, &by)?;
+            match tw::choose_take(&dir, &line, take, &by) {
+                Err(err @ tw::Error::MissingFile { .. }) => {
+                    return Ok(Outcome::new(json!({ "line": line, "take": take }), "")
+                        .with_finding("missing-file", err.to_string()));
+                }
+                result => result?,
+            }
             Ok(Outcome::new(
                 json!({ "line": line, "take": take, "by": by }),
                 format!("Chose {line} take {take} ({by})"),

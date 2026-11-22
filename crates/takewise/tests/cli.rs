@@ -470,3 +470,33 @@ fn status_version_matches_the_script_it_shows() {
         "status issued a version for a different script than it showed: {mismatches:?}"
     );
 }
+
+#[test]
+fn missing_take_file_fails_choose_and_strict_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    record_take(&dir, "hook");
+    takewise()
+        .arg("choose")
+        .arg(&dir)
+        .args(["hook", "1"])
+        .assert()
+        .success();
+    fs::rename(dir.join("takes/hook/001.wav"), tmp.path().join("lost.wav")).unwrap();
+
+    let (code, value) = json(takewise().arg("choose").arg(&dir).args(["hook", "1"]));
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(value["error"]["code"], "missing-file");
+
+    let (code, value) = json(takewise().arg("status").arg(&dir).arg("--strict"));
+    assert_eq!(code, 1, "{value}");
+    let problems = value["data"]["problems"].as_array().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p["code"] == "missing-file" && p["line"] == "hook"),
+        "{problems:?}"
+    );
+    assert_eq!(value["data"]["lines"][0]["takes"][0]["missing"], true);
+}

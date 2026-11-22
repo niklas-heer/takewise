@@ -53,6 +53,8 @@ pub struct TakeState {
     pub stale_check: bool,
     /// Speech start and end in seconds from the take's first sample.
     pub speech: Option<(f64, f64)>,
+    /// The take's WAV is not on disk.
+    pub missing: bool,
 }
 
 // serde's `serialize_with` hands the field over by reference.
@@ -114,6 +116,7 @@ impl Rank {
 }
 
 fn fold_take(
+    project: &Project,
     ledger: &Ledger,
     line: &str,
     take: u32,
@@ -160,6 +163,7 @@ fn fold_take(
         verdict_source,
         stale_check,
         speech: latest_checked.and_then(|c| c.speech),
+        missing: !project.dir.join(&rec.file).is_file(),
     };
     let rank = Rank {
         take,
@@ -194,7 +198,8 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         for event in ledger.events.iter().filter(|e| e.line == line.id) {
             match &event.kind {
                 EventKind::Recorded(rec) if seen.insert(event.take) => {
-                    let (take, rank) = fold_take(ledger, &line.id, event.take, rec, &current);
+                    let (take, rank) =
+                        fold_take(project, ledger, &line.id, event.take, rec, &current);
                     takes.push(take);
                     ranks.push(rank);
                 }
@@ -204,6 +209,17 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         }
         takes.sort_by_key(|t| t.take);
         let proposed = ranks.iter().min_by(|a, b| a.cmp(b)).map(|r| r.take);
+        if let Some(take) = chosen
+            .as_ref()
+            .and_then(|(no, _)| takes.iter().find(|t| t.take == *no))
+            .filter(|t| t.missing)
+        {
+            problems.push(Problem::new(
+                Some(&line.id),
+                "missing-file",
+                format!("the chosen take {} ({}) is missing", take.take, take.file),
+            ));
+        }
         lines.push(LineState {
             id: line.id.clone(),
             text: current.text.clone(),

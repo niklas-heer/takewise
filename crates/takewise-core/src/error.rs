@@ -25,6 +25,12 @@ pub enum Error {
     UnknownLine(String),
     #[error("line {line:?} has no take {take}")]
     UnknownTake { line: String, take: u32 },
+    #[error("{line} take {take}: its file {} is missing", path.display())]
+    MissingFile {
+        line: String,
+        take: u32,
+        path: PathBuf,
+    },
     #[error("no Takewise project at {} (missing project.toml)", .0.display())]
     NotAProject(PathBuf),
 }
@@ -41,6 +47,7 @@ impl Error {
             Error::Invalid(_) => "invalid-script",
             Error::UnknownLine(_) => "unknown-line",
             Error::UnknownTake { .. } => "unknown-take",
+            Error::MissingFile { .. } => "missing-file",
         }
     }
 }
