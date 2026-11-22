@@ -16,6 +16,7 @@ pub mod takes;
 #[cfg(test)]
 mod testutil;
 pub mod timing;
+pub mod words;
 
 pub use edit::{
     Field, ScriptVersion, script_version, set_film_info, set_latency_offset, set_line_field,
