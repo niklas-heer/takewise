@@ -382,15 +382,14 @@ impl RecordingWindow {
         self.show(update);
     }
 
-    fn took(&mut self, committed: Option<TakeRef>) {
-        let Some(taken) = committed else {
-            return;
-        };
+    /// Selects a committed take; returns the message saying so.
+    fn took(&mut self, committed: Option<TakeRef>) -> Option<String> {
+        let taken = committed?;
         self.reload();
         if self.line_id() == Some(taken.line.as_str()) {
             self.take = Some(taken.take);
         }
-        self.message = Some(format!("Recorded {} take {}.", taken.line, taken.take));
+        Some(format!("Recorded {} take {}.", taken.line, taken.take))
     }
 
     /// Once per frame: reload on outside changes, keep the device check and
@@ -423,12 +422,14 @@ impl RecordingWindow {
         self.show(update);
     }
 
-    /// Shows what the recorder reports and selects a committed take.
+    /// Shows what the recorder reports and selects a committed take. An
+    /// interruption or error is shown together with the success, never
+    /// replaced by it.
     fn show(&mut self, update: recorder::Update) {
-        if let Some(message) = update.message {
+        let success = self.took(update.committed);
+        if let Some(message) = recorder::join(success, update.message) {
             self.message = Some(message);
         }
-        self.took(update.committed);
     }
 
     fn record(&mut self, _: &Record, _: &mut Window, cx: &mut Context<Self>) {

@@ -695,3 +695,35 @@ fn a_dropout_is_filled_and_counted(cx: &mut TestAppContext) {
     assert_eq!(&samples[4800..7200], &vec![0; 2400][..]);
     assert_eq!(samples[7200], 100_000);
 }
+
+#[gpui_kit::test]
+fn an_interruption_is_shown_with_the_saved_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.2, 4800);
+    settle(cx, &f);
+    f.media.0.borrow_mut().capture_error = Some("the device was unplugged".to_owned());
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(recorded(&f.dir).len(), 1);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("the device was unplugged"), "{shown}");
+    assert!(shown.contains("Recorded a take 1"), "{shown}");
+}
+
+#[gpui_kit::test]
+fn a_dropout_is_shown_after_the_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: pre-roll from film 6.0
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.2, 4800); // film 6.0 .. 6.1
+    f.media.send(101.25, 4800); // 0.95 s lost: at film 6.1
+    f.media.set_now(101.5);
+    press(cx, f.window, &["space"]);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("Recorded d take 1"), "{shown}");
+    assert!(shown.contains("Audio dropout at 0:06"), "{shown}");
+}
