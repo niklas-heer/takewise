@@ -1,0 +1,19 @@
+[package]
+name = "takewise-core"
+version = "0.0.0"
+description = "Takewise's UI-free model: the project folder format, ledger, script edits, checks, ranking and export."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror = "2.0.21"
+toml = { version = "1.2.2", default-features = false, features = ["std", "serde", "parse", "display"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

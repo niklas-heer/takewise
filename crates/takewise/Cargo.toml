@@ -1,0 +1,14 @@
+[package]
+name = "takewise"
+version = "0.1.0"
+description = "Record voiceover narration over a finished film, line by line, with checks and an agent-friendly CLI."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+takewise-core.workspace = true
+
+[lints]
+workspace = true
