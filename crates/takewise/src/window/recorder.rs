@@ -337,12 +337,19 @@ impl Recorder {
             sample_film_time(&history, host, 0, RECORD_RATE, latency_s, offset_ms)
         });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
+        // The take keeps its film position: placed against the line as it is
+        // now, which M or an agent may have moved during the take.
+        let snapshot = Project::open(dir)
+            .ok()
+            .and_then(|project| project.snapshot(&line))
+            .unwrap_or(snapshot);
+        let first_film_s = first_film_s.unwrap_or(line_start);
         #[allow(clippy::cast_possible_truncation)]
         let input = RecordedInput {
             sample_rate: RECORD_RATE,
             device,
             channel,
-            line_offset_s: line_offset_s(first_film_s.unwrap_or(line_start), line_start),
+            line_offset_s: line_offset_s(first_film_s, snapshot.start),
             snapshot,
             dropouts: Some(written.dropouts.len().min(u32::MAX as usize) as u32),
         };

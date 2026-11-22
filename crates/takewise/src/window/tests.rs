@@ -727,3 +727,30 @@ fn a_dropout_is_shown_after_the_take(cx: &mut TestAppContext) {
     assert!(shown.contains("Recorded d take 1"), "{shown}");
     assert!(shown.contains("Audio dropout at 0:06"), "{shown}");
 }
+
+#[gpui_kit::test]
+fn mark_during_a_take_keeps_its_film_position(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.2, 4800); // first sample at film 6.0
+    settle(cx, &f);
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    // Film 6.0 is at host 100.15, so the playhead is at 9.0 at host 103.15.
+    f.media.set_now(103.15);
+    press(cx, f.window, &["m"]);
+    assert_eq!(start_of(&f.dir, "d"), 9.0);
+    f.media.set_now(103.5);
+    press(cx, f.window, &["space"]);
+
+    let takes = recorded(&f.dir);
+    let event = &takes[0].2;
+    assert_eq!(event.snapshot.start, 9.0, "the line as it is at commit");
+    assert!(
+        (event.line_offset_s - -3.0).abs() < 1e-9,
+        "the take still starts at film 6.0: {}",
+        event.line_offset_s
+    );
+}
