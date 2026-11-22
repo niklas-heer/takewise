@@ -6,9 +6,11 @@
 //! once the first buffer arrived, at least [`START_LEAD_S`] ahead, so a slow
 //! input device never eats into the pre-roll. Until the scheduled start the
 //! scheduled mapping holds (the count-in runs backwards from it); from then
-//! on the player's own timebase is read back, and every departure from the
-//! mapping in effect (a late start, a stall, a rate change) is recorded in
-//! the history that places the captured samples.
+//! on the player's own timebase is read back. The first read replaces the
+//! scheduled mapping, count-in included, so a late start moves the whole
+//! take; every later departure (a stall, a rate change) is recorded from
+//! the moment it is seen. This history places the captured samples, for a
+//! take and for the calibration alike.
 
 use takewise_core::{Timebase, TimebaseHistory};
 
@@ -30,6 +32,8 @@ pub struct FilmClock {
     history: TimebaseHistory,
     /// Host time of the current start, while the film plays.
     start_host_s: Option<f64>,
+    /// Host time from which the current start's scheduled mapping holds.
+    scheduled_from_s: f64,
     /// Whether the player's timebase was read since the current start.
     read_back: bool,
 }
@@ -64,6 +68,7 @@ impl FilmClock {
             now
         };
         self.history.record(from, tb);
+        self.scheduled_from_s = from;
         self.start_host_s = Some(tb.host_anchor_s);
         self.read_back = false;
         Ok(tb)
@@ -71,7 +76,9 @@ impl FilmClock {
 
     /// Reads the player's timebase once the film plays and records it when
     /// it departs from the mapping in effect. The first read after a start
-    /// takes effect from the start; later ones (stalls, rate changes) from
+    /// replaces the scheduled mapping wherever it held (for the first start
+    /// also the count-in before it: contiguous audio follows the film as it
+    /// really started); later ones (stalls, rate changes) take effect from
     /// now. Call once per frame.
     pub fn track(&mut self, media: &dyn Media) {
         let Some(start) = self.start_host_s else {
@@ -87,7 +94,11 @@ impl FilmClock {
                 || (actual.rate - expected.rate).abs() > RATE_TOLERANCE
         });
         if changed {
-            let from = if self.read_back { now } else { start };
+            let from = if self.read_back {
+                now
+            } else {
+                self.scheduled_from_s
+            };
             self.history.record(from, actual);
         }
         self.read_back = true;

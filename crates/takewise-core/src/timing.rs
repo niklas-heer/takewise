@@ -78,6 +78,32 @@ pub fn sample_film_time(
         .map(|film| film + offset_ms / 1000.0)
 }
 
+/// How far contiguous audio drifts from the film: the largest distance, in
+/// film seconds, between where `history` places host times in
+/// `from_host_s..=to_host_s` and where audio placed at `from_host_s` and
+/// running at rate 1 places them. Zero when the film played steadily (or
+/// before any timebase).
+pub fn film_shift_s(history: &TimebaseHistory, from_host_s: f64, to_host_s: f64) -> f64 {
+    let Some(start) = history.film_at(from_host_s) else {
+        return 0.0;
+    };
+    let shift = |film: f64, host: f64| (film - (start + (host - from_host_s))).abs();
+    let mut max = history
+        .film_at(to_host_s)
+        .map_or(0.0, |film| shift(film, to_host_s));
+    for (idx, (at, tb)) in history.entries.iter().enumerate() {
+        if *at <= from_host_s || *at > to_host_s {
+            continue;
+        }
+        // Both sides of the change: the new mapping, and the one it ends.
+        max = max.max(shift(tb.film_at(*at), *at));
+        if let Some((_, before)) = idx.checked_sub(1).and_then(|i| history.entries.get(i)) {
+            max = max.max(shift(before.film_at(*at), *at));
+        }
+    }
+    max
+}
+
 /// How far a buffer may start from where the previous one ended before the
 /// difference counts as a gap.
 pub const GAP_TOLERANCE_S: f64 = 0.001;
@@ -227,6 +253,45 @@ mod tests {
         film_anchor_s: 0.0,
         host_anchor_s: 0.0,
     };
+
+    #[test]
+    fn film_shift_measures_a_stall_and_a_jump() {
+        let mut history = TimebaseHistory::new();
+        history.record(f64::NEG_INFINITY, PLAYING_FROM_ZERO);
+        // Steady playback: no shift.
+        assert!(close(film_shift_s(&history, 1.0, 5.0), 0.0));
+        // Stalled at film 3.0 from host 3.0 to 3.1, then playing on.
+        history.record(
+            3.0,
+            Timebase {
+                rate: 0.0,
+                film_anchor_s: 3.0,
+                host_anchor_s: 3.0,
+            },
+        );
+        history.record(
+            3.1,
+            Timebase {
+                rate: 1.0,
+                film_anchor_s: 3.0,
+                host_anchor_s: 3.1,
+            },
+        );
+        assert!(close(film_shift_s(&history, 1.0, 5.0), 0.1));
+        assert!(close(film_shift_s(&history, 1.0, 3.05), 0.05), "mid-stall");
+        assert!(close(film_shift_s(&history, 1.0, 2.0), 0.0), "before it");
+        // A jump forward by 0.3 at host 4.0.
+        history.record(
+            4.0,
+            Timebase {
+                rate: 1.0,
+                film_anchor_s: 4.2,
+                host_anchor_s: 4.0,
+            },
+        );
+        assert!(close(film_shift_s(&history, 1.0, 5.0), 0.2));
+        assert!(close(film_shift_s(&TimebaseHistory::new(), 1.0, 5.0), 0.0));
+    }
 
     #[test]
     fn maps_with_timebase_valid_at_capture() {

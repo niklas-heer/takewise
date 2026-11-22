@@ -493,6 +493,7 @@ mod tests {
             line_offset_s: -2.0,
             snapshot: project.snapshot(line).unwrap(),
             dropouts: None,
+            film_shift_ms: None,
         };
         let partial = begin_take(dir, line, &input).unwrap();
         let mut audio = noise(5.0);

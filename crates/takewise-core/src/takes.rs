@@ -31,6 +31,10 @@ pub struct RecordedInput {
     /// Gaps in the captured audio, once counted (when the take is stopped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropouts: Option<u32>,
+    /// How far the film departed from the take's placement after it
+    /// started (a stall or rate change), when more than 5 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub film_shift_ms: Option<f64>,
 }
 
 /// A take's `NNN.json`: the recording input plus the name of the partial
@@ -193,6 +197,7 @@ fn recorded_event(
             snapshot: input.snapshot,
             recovered,
             dropouts: input.dropouts,
+            film_shift_ms: input.film_shift_ms,
         }),
     )
 }
@@ -748,6 +753,7 @@ mod tests {
                 end: 15.0,
             },
             dropouts: None,
+            film_shift_ms: None,
         }
     }
 

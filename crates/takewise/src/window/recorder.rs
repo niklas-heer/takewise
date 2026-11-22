@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
 use takewise_core::takes::FULL_SCALE;
+use takewise_core::timing::film_shift_s;
 use takewise_core::{
     Dropout, PartialTake, Project, RECORD_RATE, RecordPlan, RecordedInput, Snapshot, TakeRef,
     TakeState, Timebase, WavLock, begin_take, commit_take, line_offset_s, plan_take,
@@ -33,6 +34,8 @@ const METER_RETRY_S: f64 = 2.0;
 const SAVE_RETRY_S: f64 = 2.0;
 /// A film halted this close to its end has reached it.
 const END_TOLERANCE_S: f64 = 0.25;
+/// A film shift larger than this after the take started is recorded.
+const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
 
 /// What a tick or a stop produced, for the window to show.
 #[derive(Debug, Default)]
@@ -97,8 +100,6 @@ struct Take {
     writer: TakeWriter,
     /// The take on disk: begun once the first buffer places the take.
     partial: Option<PartialTake>,
-    /// Film time of the first sample, once known.
-    first_film_s: Option<f64>,
     /// Why the take could not be begun on disk (it is kept in memory).
     begin_error: Option<String>,
     /// Whether the writer's error was shown.
@@ -300,7 +301,6 @@ impl Recorder {
             clock: FilmClock::new(),
             writer: TakeWriter::spawn(rx),
             partial: None,
-            first_film_s: None,
             begin_error: None,
             write_error_shown: false,
             line_start_host_s: None,
@@ -330,7 +330,7 @@ impl Recorder {
             clock,
             writer,
             partial,
-            first_film_s,
+            film_ended_host_s,
             ..
         } = *take;
         let written = writer.finish();
@@ -346,11 +346,22 @@ impl Recorder {
                 message: Some("Stopped before the film started; nothing was recorded.".to_owned()),
             };
         }
-        let first_film_s = first_film_s.or_else(|| {
-            let host = written.first_host_s?;
+        // Placed with the film's timebase as read back (a late start moves
+        // the take), by the same mapping the calibration measures.
+        let first_film_s = written.first_host_s.and_then(|host| {
             sample_film_time(clock.history(), host, 0, RECORD_RATE, latency_s, offset_ms)
         });
+        let film_shift_ms = written.first_host_s.and_then(|host| {
+            let from = host - latency_s;
+            let to = (from + written.samples.len() as f64 / f64::from(RECORD_RATE))
+                .min(film_ended_host_s.unwrap_or(f64::INFINITY));
+            let shift_ms = film_shift_s(clock.history(), from, to) * 1000.0;
+            (shift_ms > FILM_SHIFT_TOLERANCE_MS).then_some(shift_ms)
+        });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
+        let shift_note = film_shift_ms.map(|ms| {
+            format!("The film stalled during the take; placement may be off by {ms:.0} ms.")
+        });
         // The take keeps its film position: placed against the line as it is
         // now, which M or an agent may have moved during the take.
         let snapshot = Project::open(dir)
@@ -366,6 +377,7 @@ impl Recorder {
             line_offset_s: line_offset_s(first_film_s, snapshot.start),
             snapshot,
             dropouts: Some(written.dropouts.len().min(u32::MAX as usize) as u32),
+            film_shift_ms,
         };
         let Written {
             samples,
@@ -382,7 +394,7 @@ impl Recorder {
             complete,
         };
         let mut update = self.save(dir, unsaved);
-        update.message = join(update.message, dropouts);
+        update.message = join(join(update.message, dropouts), shift_note);
         update
     }
 
@@ -682,8 +694,9 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
     if take.partial.is_some() || take.begin_error.is_some() || !take.clock.started() {
         return None;
     }
+    // Placed by the schedule for now; rewritten with the film's timebase as
+    // read back when the take is committed.
     let first = first_sample_film_s(take, progress.first_host_s?).unwrap_or(take.line_start);
-    take.first_film_s = Some(first);
     let input = RecordedInput {
         sample_rate: RECORD_RATE,
         device: take.device.clone(),
@@ -691,6 +704,7 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
         line_offset_s: line_offset_s(first, take.line_start),
         snapshot: take.snapshot.clone(),
         dropouts: None,
+        film_shift_ms: None,
     };
     match begin_take(dir, &take.line, &input) {
         Ok(partial) => {

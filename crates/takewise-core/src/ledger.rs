@@ -82,6 +82,12 @@ pub struct Recorded {
     /// Gaps in the captured audio (filled with silence), when counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropouts: Option<u32>,
+    /// The largest distance in milliseconds between where the film really
+    /// was during the take and where the take's contiguous audio places it,
+    /// when the film stalled or changed rate after it started by more than
+    /// 5 ms. Absent otherwise, and on takes recorded before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub film_shift_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,6 +291,7 @@ mod tests {
                 snapshot: snapshot(),
                 recovered: false,
                 dropouts: None,
+                film_shift_ms: None,
             }),
         )
     }

@@ -588,6 +588,7 @@ fn recorded_input_round_trips(cx: &mut TestAppContext) {
         line_offset_s: -2.0,
         snapshot,
         dropouts: None,
+        film_shift_ms: None,
     };
     let partial = tw::begin_take(&f.dir, "a", &input).expect("begin");
     tw::write_take_wav(&partial.wav, &[0; 480], 48_000).expect("wav");
@@ -689,6 +690,7 @@ fn opening_the_window_adopts_a_crashed_take(cx: &mut TestAppContext) {
             line_offset_s: -2.0,
             snapshot,
             dropouts: None,
+            film_shift_ms: None,
         };
         let partial = tw::begin_take(dir, "a", &input).expect("begin");
         let mut wav = tw::PartialWav::create(&partial.wav, 48_000).expect("wav");
@@ -853,8 +855,8 @@ fn the_film_clock_follows_the_players_timebase() {
         "from the start on"
     );
     assert!(
-        close(clock.film_at(100.2).expect("mapped"), 5.9),
-        "count-in unchanged"
+        close(clock.film_at(100.2).expect("mapped"), 5.88),
+        "the count-in follows the read-back start"
     );
 
     // A stall at film 7.0, then playback goes on.
@@ -990,4 +992,69 @@ fn a_take_of_the_last_line_stops_after_the_films_end(cx: &mut TestAppContext) {
     frame(cx, f.window);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
     assert_eq!(recorded(&f.dir).len(), 1);
+}
+
+#[gpui_kit::test]
+fn a_late_start_moves_the_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    begin(cx, &f, 100.0); // scheduled: film 6.0 at host 100.4
+    // The player really starts 40 ms late.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.44,
+    });
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    f.media.set_now(100.6);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    let event = &takes[0].2;
+    // The first sample (host 100.0, before the start) is placed with the
+    // read-back timebase: film 5.56, not the scheduled 5.6.
+    assert!(
+        (event.line_offset_s - -2.44).abs() < 1e-6,
+        "{}",
+        event.line_offset_s
+    );
+    assert_eq!(event.film_shift_ms, None, "nothing changed after the start");
+}
+
+#[gpui_kit::test]
+fn a_stall_during_the_take_is_recorded(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d
+    begin(cx, &f, 100.0); // first sample at film 5.6; film 6.0 at host 100.4
+    f.media.send(100.1, 91_200); // audio up to host 102.0
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    // The film stalls at 7.0 for 100 ms.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 7.0,
+        host_anchor_s: 101.4,
+    });
+    f.media.set_now(101.4);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 7.0,
+        host_anchor_s: 101.5,
+    });
+    f.media.set_now(101.5);
+    frame(cx, f.window);
+    settle(cx, &f);
+    f.media.set_now(102.0);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    let event = &takes[0].2;
+    assert!(close(event.line_offset_s, -2.4), "{}", event.line_offset_s);
+    let shift = event.film_shift_ms.expect("a shift is recorded");
+    assert!((shift - 100.0).abs() < 1e-6, "{shift}");
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("film stalled during the take; placement may be off by 100 ms."),
+        "{shown}"
+    );
 }
