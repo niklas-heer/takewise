@@ -51,3 +51,11 @@ pub fn samples(seconds: f64) -> usize {
 fn round(x: f64) -> i32 {
     x.round() as i32
 }
+
+/// A temporary directory with a placeholder `project.toml`, enough for the
+/// project lock, for tests of the ledger and take files.
+pub fn project_tempdir() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(crate::project::PROJECT_FILE), "").unwrap();
+    tmp
+}

@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn wav_roundtrip_is_24_bit_mono() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let path = tmp.path().join("a.wav");
         let samples = vec![0, 1, -1, 8_388_607, -8_388_608, 123_456];
         write_take_wav(&path, &samples, 48_000).unwrap();
@@ -526,13 +526,13 @@ mod tests {
 
     #[test]
     fn begin_take_refuses_unsafe_line_ids() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         assert!(begin_take(tmp.path(), "../escape", &input()).is_err());
     }
 
     #[test]
     fn commit_take_numbers_sequentially() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         let takes: Vec<u32> = (0..3).map(|_| record(dir, "hook", 4800).take).collect();
         assert_eq!(takes, vec![1, 2, 3]);
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn commit_skips_numbers_with_leftover_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         fs::create_dir_all(dir.join("takes/hook")).unwrap();
         fs::write(dir.join("takes/hook/004.json"), "{}").unwrap();
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn repair_adopts_unlogged_wav() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         record(dir, "hook", 10);
         // A crash between the renames and the ledger append leaves 002 unlogged.
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn repair_completes_commit_interrupted_between_renames() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         record(dir, "hook", 10);
         let partial = crash_after_metadata_rename(dir, 2);
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn repair_reports_metadata_without_audio() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         let partial = crash_after_metadata_rename(dir, 1);
         fs::rename(&partial.wav, dir.join("takes/hook/elsewhere.wav")).unwrap();
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn repair_reports_wav_without_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         let line_dir = dir.join("takes/hook");
         fs::create_dir_all(&line_dir).unwrap();
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn repair_keeps_partials() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let dir = tmp.path();
         let partial = begin_take(dir, "hook", &input()).unwrap();
         write_take_wav(&partial.wav, &[1; 10], 48_000).unwrap();

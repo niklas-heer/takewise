@@ -17,7 +17,13 @@ pub struct ProjectLock {
 
 /// Takes the exclusive advisory lock on `<dir>/.lock`, waiting for other
 /// writers. Hold it only for short writes, never while recording.
+///
+/// Fails with `NotAProject` when `dir` has no `project.toml`, so a mistyped
+/// path never gains a stray `.lock` file.
 pub fn lock(dir: &Path) -> Result<ProjectLock> {
+    if !dir.join(crate::project::PROJECT_FILE).is_file() {
+        return Err(crate::error::Error::NotAProject(dir.to_path_buf()));
+    }
     let path = dir.join(LOCK_FILE);
     let file = OpenOptions::new()
         .read(true)
@@ -106,9 +112,26 @@ mod tests {
     }
 
     #[test]
+    fn lock_refuses_a_directory_without_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = lock(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::NotAProject(_)),
+            "{err:?}"
+        );
+        assert!(!tmp.path().join(LOCK_FILE).exists(), "no stray lock file");
+        let missing = tmp.path().join("missing");
+        assert!(matches!(
+            lock(&missing).unwrap_err(),
+            crate::error::Error::NotAProject(_)
+        ));
+    }
+
+    #[test]
     fn lock_is_exclusive() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
+        std::fs::write(dir.join(crate::project::PROJECT_FILE), "").unwrap();
         let first = lock(&dir).unwrap();
 
         let (tx, rx) = mpsc::channel();

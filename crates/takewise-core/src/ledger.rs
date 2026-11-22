@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn read_missing_ledger_is_empty() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let ledger = read(tmp.path()).unwrap();
         assert_eq!(ledger.events, []);
         assert!(!ledger.torn_tail);
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn append_then_read() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         append(tmp.path(), &recorded(1)).unwrap();
         append(tmp.path(), &recorded(2)).unwrap();
         let ledger = read(tmp.path()).unwrap();
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn append_after_torn_tail_starts_new_line() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let path = tmp.path().join(LEDGER_FILE);
         let first = serde_json::to_string(&recorded(1)).unwrap();
         let torn = r#"{"v":1,"at":"2026-11-22T20:00:00Z","kind":"reco"#;
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn read_skips_bad_middle_line() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::project_tempdir();
         let path = tmp.path().join(LEDGER_FILE);
         let one = serde_json::to_string(&recorded(1)).unwrap();
         let two = serde_json::to_string(&recorded(2)).unwrap();
