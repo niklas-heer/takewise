@@ -230,8 +230,14 @@ fn export_locked(project: &Project, state: &State, use_proposed: bool) -> Result
             return Err(err);
         }
     };
-    // The WAV first, the manifest last: a crash in between leaves a manifest
-    // whose hash does not match the WAV.
+    // The old manifest goes first, then the WAV, the manifest last: an
+    // interruption anywhere leaves no manifest, or one whose hash does not
+    // match the WAV, but never an old manifest vouching for a changed export.
+    if let Err(err) = remove_if_present(&manifest_path) {
+        let _ = fs::remove_file(&wav_temp);
+        let _ = fs::remove_file(&manifest_temp);
+        return Err(err);
+    }
     if let Err(err) = rename_temp(&wav_temp, &wav_path) {
         let _ = fs::remove_file(&manifest_temp);
         return Err(err);
@@ -760,6 +766,28 @@ mod tests {
             "no stale manifest stays behind to vouch for the old WAV"
         );
         assert!(dir.join("takes/hook/001.wav").exists(), "takes are kept");
+    }
+
+    #[test]
+    fn interrupted_export_leaves_no_old_manifest() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        assert_eq!(run(&dir, false).refused, []);
+        assert!(dir.join("export/manifest.json").exists());
+
+        // Renaming the new WAV into place fails: a non-empty directory sits
+        // where the WAV goes.
+        let wav = dir.join("export/narration.wav");
+        fs::remove_file(&wav).unwrap();
+        fs::create_dir(&wav).unwrap();
+        fs::write(wav.join("keep"), b"x").unwrap();
+        let result = export(&dir, &ExportOptions::default());
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            !dir.join("export/manifest.json").exists(),
+            "the old manifest is gone before the new WAV is moved into place"
+        );
     }
 
     #[test]
