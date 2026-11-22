@@ -8,9 +8,10 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use takewise_core::{
-    self as tw, CheckConfig, ExportOptions, Field, FilmInfo, Judgment, LineState, Problem, Project,
-    RepairReport, ScriptVersion, State, Verdict,
+    self as tw, AvailableInput, CheckConfig, ExportOptions, Field, FilmInfo, Judgment, LineState,
+    Problem, Project, RepairReport, ScriptVersion, State, Verdict, check_input,
 };
+use takewise_media::{DeviceInfo, Transport};
 
 use crate::film;
 use crate::output::Outcome;
@@ -539,6 +540,103 @@ fn tool_check(name: &'static str, install: &str) -> Check {
     }
 }
 
+/// What `doctor` found out about the audio devices.
+struct AudioReport {
+    checks: Vec<Check>,
+    warnings: Vec<String>,
+    inputs: Vec<serde_json::Value>,
+    output: Option<serde_json::Value>,
+    text: String,
+}
+
+fn device_json(device: &DeviceInfo) -> serde_json::Value {
+    json!({
+        "name": device.name,
+        "sample_rate": device.sample_rate,
+        "channels": device.channels,
+        "transport": device.transport.as_str(),
+    })
+}
+
+/// Lists the input devices and the default output, checks the project's
+/// input device, and warns about Bluetooth output.
+fn audio_devices(project: Option<&Project>) -> AudioReport {
+    let mut report = AudioReport {
+        checks: Vec::new(),
+        warnings: Vec::new(),
+        inputs: Vec::new(),
+        output: None,
+        text: String::new(),
+    };
+    match takewise_media::input_devices() {
+        Ok(inputs) => {
+            report.text.push_str("Input devices:\n");
+            for input in &inputs {
+                let _ = writeln!(
+                    report.text,
+                    "  {:<32} {:>6} Hz  {} ch  {}",
+                    input.name,
+                    input.sample_rate,
+                    input.channels,
+                    input.transport.as_str()
+                );
+            }
+            report.inputs = inputs.iter().map(device_json).collect();
+            if let Some(project) = project {
+                let available: Vec<AvailableInput> = inputs
+                    .iter()
+                    .map(|input| AvailableInput {
+                        name: input.name.clone(),
+                        sample_rate: input.sample_rate,
+                    })
+                    .collect();
+                let configured = project.config.input.device.as_deref();
+                let (ok, detail) = match check_input(configured, &available) {
+                    Ok(()) => (
+                        true,
+                        format!(
+                            "{} channel {}",
+                            configured.unwrap_or_default(),
+                            project.config.input.channel
+                        ),
+                    ),
+                    Err(message) => (false, message),
+                };
+                report.checks.push(Check {
+                    name: "input",
+                    ok,
+                    detail,
+                });
+            }
+        }
+        Err(err) => report.checks.push(Check {
+            name: "input-devices",
+            ok: false,
+            detail: err.to_string(),
+        }),
+    }
+    match takewise_media::default_output() {
+        Ok(output) => {
+            if output.transport == Transport::Bluetooth {
+                report.warnings.push(format!(
+                    "output {} is Bluetooth; its latency is long and varies, so record with wired or built-in headphones",
+                    output.name
+                ));
+            }
+            let _ = writeln!(
+                report.text,
+                "Output: {} ({} Hz, {})",
+                output.name,
+                output.sample_rate,
+                output.transport.as_str()
+            );
+            report.output = Some(device_json(&output));
+        }
+        Err(err) => report.warnings.push(format!("no default output: {err}")),
+    }
+    report
+}
+
 /// `$TAKEWISE_MODELS`, else `~/.local/share/takewise/models`.
 fn models_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("TAKEWISE_MODELS") {
@@ -571,7 +669,7 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         },
     });
     checks.push(tool_check("ffprobe", "brew install ffmpeg"));
-    match project {
+    match &project {
         None => {}
         Some(Err(err)) => checks.push(Check {
             name: "project",
@@ -599,14 +697,28 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         }
     }
 
+    let devices = audio_devices(project.as_ref().and_then(|p| p.as_ref().ok()));
+    checks.extend(devices.checks);
+
     let mut text = String::new();
     for check in &checks {
         let mark = if check.ok { "ok  " } else { "FAIL" };
         let _ = writeln!(text, "{mark} {:<14} {}", check.name, check.detail);
     }
-    text.push_str("Input devices are checked from milestone 2.\n");
+    for warning in &devices.warnings {
+        let _ = writeln!(text, "warn {warning}");
+    }
+    text.push_str(&devices.text);
     let failed: Vec<&str> = checks.iter().filter(|c| !c.ok).map(|c| c.name).collect();
-    let outcome = Outcome::new(json!({ "checks": checks }), text);
+    let outcome = Outcome::new(
+        json!({
+            "checks": checks,
+            "warnings": devices.warnings,
+            "inputs": devices.inputs,
+            "output": devices.output,
+        }),
+        text,
+    );
     if failed.is_empty() {
         outcome
     } else {

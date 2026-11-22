@@ -469,6 +469,18 @@ fn doctor_reports_checks() {
     );
     let film = checks.iter().find(|c| c["name"] == "film").unwrap();
     assert_eq!(film["ok"], true, "{film}");
+    // A new project has no input device chosen, so it cannot record yet.
+    let input = checks.iter().find(|c| c["name"] == "input").unwrap();
+    assert_eq!(input["ok"], false, "{input}");
+    assert!(
+        input["detail"]
+            .as_str()
+            .unwrap()
+            .contains("No input device chosen"),
+        "{input}"
+    );
+    assert!(value["data"]["inputs"].is_array(), "{value}");
+    assert!(value["data"]["warnings"].is_array(), "{value}");
 }
 
 #[test]

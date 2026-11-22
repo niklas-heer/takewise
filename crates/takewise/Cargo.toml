@@ -13,6 +13,7 @@ jiff = { version = "1.0.2", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 takewise-core.workspace = true
+takewise-media.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

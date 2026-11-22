@@ -1,0 +1,31 @@
+[package]
+name = "takewise-media"
+version = "0.0.0"
+description = "Takewise's macOS media bridges: film and take playback with AVPlayer, video frames for GPUI, capture with cpal and CoreAudio latencies."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cpal = "0.18.2"
+objc2.workspace = true
+objc2-av-foundation.workspace = true
+objc2-core-audio.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-foundation.workspace = true
+takewise-core.workspace = true
+thiserror = "2.0.21"
+
+[dev-dependencies]
+objc2-core-video.workspace = true
+
+[[test]]
+name = "smoke"
+# AVPlayer needs the main thread, which libtest does not give its tests.
+harness = false
+
+[lints]
+workspace = true
