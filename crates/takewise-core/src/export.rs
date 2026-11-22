@@ -65,7 +65,8 @@ pub struct ManifestLine {
     pub source_samples: [u64; 2],
     /// Half-open sample range in `narration.wav`.
     pub dest_samples: [u64; 2],
-    /// Detected speech start and end in film seconds (before cropping).
+    /// Detected speech start and end in film seconds, clamped to the film;
+    /// a `speech-cropped` warning gives the unclamped values.
     pub speech_film_s: [f64; 2],
 }
 
@@ -105,6 +106,9 @@ struct Placed {
     dest: (usize, usize),
     /// The take was recorded against different text than the line has now.
     old_text: bool,
+    /// The unclamped speech in film seconds, when part of it lies outside
+    /// the film.
+    cropped_speech: Option<(f64, f64)>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -206,7 +210,7 @@ fn export_locked(project: &Project, state: &State, use_proposed: bool) -> Result
         }
     };
 
-    let warnings = warnings(&placed);
+    let warnings = warnings(&placed, project.film_duration());
     let lines: Vec<ManifestLine> = placed.into_iter().map(|p| p.line).collect();
     let info = &project.config.film_info;
     let manifest = Manifest {
@@ -295,7 +299,8 @@ fn place(
     let mut src1 = (seconds_to_samples(speech_end, rate) + margin).min(len);
     let take_start_film = line.start + take.line_offset_s;
     let speech_film = (take_start_film + speech_start, take_start_film + speech_end);
-    if speech_film.1 <= 0.0 || speech_film.0 >= project.film_duration() {
+    let duration = project.film_duration();
+    if speech_film.1 <= 0.0 || speech_film.0 >= duration {
         return Err((
             "speech-outside-film",
             "chosen takes whose speech lies entirely outside the film",
@@ -317,6 +322,8 @@ fn place(
             "chosen takes whose speech lies outside the film",
         ));
     }
+    let clamped = (speech_film.0.max(0.0), speech_film.1.min(duration));
+    let cropped_speech = (clamped != speech_film).then_some(speech_film);
     let (src0, src1, dest0, dest1) = (
         to_usize(src0),
         to_usize(src1),
@@ -331,28 +338,41 @@ fn place(
             chosen_by: by,
             source_samples: [to_u64(src0), to_u64(src1)],
             dest_samples: [to_u64(dest0), to_u64(dest1)],
-            speech_film_s: [speech_film.0, speech_film.1],
+            speech_film_s: [clamped.0, clamped.1],
         },
         samples,
         src: src0,
         dest: (dest0, dest1),
         old_text: take.recorded_against_old_text,
+        cropped_speech,
     })
 }
 
-fn warnings(placed: &[Placed]) -> Vec<ExportWarning> {
-    placed
-        .iter()
-        .filter(|p| p.old_text)
-        .map(|p| ExportWarning {
-            code: "recorded-against-old-text",
-            line: p.line.id.clone(),
-            message: format!(
-                "{} was recorded against different text than the line has now",
-                p.line.take_file
-            ),
-        })
-        .collect()
+fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
+    let mut warnings = Vec::new();
+    for p in placed {
+        if p.old_text {
+            warnings.push(ExportWarning {
+                code: "recorded-against-old-text",
+                line: p.line.id.clone(),
+                message: format!(
+                    "{} was recorded against different text than the line has now",
+                    p.line.take_file
+                ),
+            });
+        }
+        if let Some((start, end)) = p.cropped_speech {
+            warnings.push(ExportWarning {
+                code: "speech-cropped",
+                line: p.line.id.clone(),
+                message: format!(
+                    "the speech of {} runs from {start:.3} s to {end:.3} s, partly outside the film (0 s to {film_duration:.3} s); the part outside is cropped",
+                    p.line.take_file
+                ),
+            });
+        }
+    }
+    warnings
 }
 
 fn overlaps(placed: &[Placed]) -> Vec<Refusal> {
@@ -576,10 +596,44 @@ mod tests {
         assert_eq!(line.dest_samples[0], 0);
         assert_eq!(line.source_samples[0], 96_000);
         assert_eq!(line.dest_samples[1], 48_000 + 7_200);
-        assert!((line.speech_film_s[0] + 0.5).abs() < 0.02, "{line:?}");
+        assert_eq!(line.speech_film_s[0], 0.0, "clamped to the film: {line:?}");
+        assert!((line.speech_film_s[1] - 1.0).abs() < 0.02, "{line:?}");
         let audio = narration(&dir);
         assert_eq!(audio.len(), FILM_SAMPLES);
         assert!(onset(&audio) < 960, "speech is placed right from film zero");
+
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        let warning = &report.warnings[0];
+        assert_eq!(
+            (warning.code, warning.line.as_str()),
+            ("speech-cropped", "hook")
+        );
+        assert!(warning.message.contains("-0.500"), "{}", warning.message);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["warnings"][0]["code"], "speech-cropped");
+        assert_eq!(manifest["lines"][0]["speech_film_s"][0], 0.0);
+    }
+
+    #[test]
+    fn export_crops_past_film_end_with_a_warning() {
+        let script = "[[line]]\nid = \"hook\"\nstart = 50.0\ntext = \"Bye.\"\n";
+        let (_tmp, dir) = setup(script);
+        // Speech runs from 50.0 s to 52.5 s film time; the film ends at 51.5 s.
+        let t = take(&dir, "hook", Some((2.0, 4.5)));
+        choose(&dir, &t);
+        let report = run(&dir, false);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        let line = &report.lines[0];
+        assert_eq!(line.dest_samples[1], FILM_SAMPLES as u64);
+        assert_eq!(line.speech_film_s[1], 51.5, "{line:?}");
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert_eq!(report.warnings[0].code, "speech-cropped");
+        assert!(
+            report.warnings[0].message.contains("52.500"),
+            "{}",
+            report.warnings[0].message
+        );
     }
 
     #[test]
