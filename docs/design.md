@@ -188,12 +188,13 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | `takewise check <dir> [--line ID] [--take N]` | Run checks; appends `checked` events. |
 | `takewise judge <dir> <line> <take> --verdict … --reason … --by … [--score …]` | Add an outside judgment. |
 | `takewise choose <dir> <line> <take> [--by …]` | Choose a take; refuses one whose file is missing (exit 1, `missing-file`). |
-| `takewise export <dir> [--use-proposed]` | Write `export/narration.wav` and `export/manifest.json`. |
-| `takewise doctor [<dir>]` | Check whisper-cli, the model, microphone access, input devices and their sample rates, the output device. |
+| `takewise export <dir> [--use-proposed] [--format …] [--bit-depth …] [--sample-rate …] [--processing raw\|clean]` | Write `export/narration.wav` or `.flac` and `export/manifest.json`. |
+| `takewise calibrate <dir> [--write] [--output <device>]` | Run the loopback latency test; `--write` stores the offset and the device pair. |
+| `takewise doctor [<dir>]` | Check whisper-cli, the model, `ffmpeg`, microphone access, input devices and their sample rates, the output device. |
 
 ## Export and Resolve handoff
 
-`narration.wav` is mono PCM, starting at film time zero and exactly as long as the film; 48 kHz 24-bit WAV with `raw` processing, otherwise as set in `[export]` (see "Setup and sound").
+The narration file (`narration.wav` or `narration.flac`) is mono, starting at film time zero and exactly as long as the film. `[export]` sets its format, sample rate and bit depth for both processing profiles; a project without `[export]` gets 48 kHz 24-bit WAV with `raw` processing. Export removes a narration file of the other format, so only one narration file sits beside the manifest.
 
 For each line, the chosen take is used; a line without one makes `export` fail with the line ids, unless `--use-proposed` uses the proposed take (the manifest records `by: "proposed"`), which it refuses with `no-acceptable-take` when that take's effective verdict is `retake`; a line with no takes at all always fails. A used take in which no speech is detected also fails export, naming the line. A used take recorded against different text than the line has now is exported, with a `recorded-against-old-text` warning in the manifest (and a notice in `status`). From the take, the source range is its speech, extended by 150 ms on either side and clipped to the take. A source sample `i` lands at destination sample `round((line.start + line_offset_s) × 48000) + i`; trimming never shifts the speech. Ranges are cropped to `[0, film length)`; a take whose speech (without the margin) lies entirely outside that range fails export with `speech-outside-film`, and one whose speech lies partly outside is exported with a `speech-cropped` warning in the manifest that gives the unclamped speech times (the line's `speech_film_s` is clamped to the film). When two lines' destination ranges overlap, export fails and names both lines, so the narrator can choose another take or move a start. Each placed range gets 10 ms fades.
 
@@ -201,7 +202,7 @@ Export holds the project lock while it reads and folds the project and writes bo
 
 `manifest.json` lists the film (path, duration, size, modified), the WAV it describes (`narration`: file, size, SHA-256) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and, once milestone 3 adds transcription, word times in film seconds.
 
-For Resolve, an agent imports `narration.wav` onto a new audio track at the timeline start, or places the individual takes (always the raw originals) at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the WAV against the loopback beeps and imports it into Resolve once.
+For Resolve, an agent imports the narration file onto a new audio track at the timeline start, or places the individual takes (always the raw originals) at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the narration file against the loopback beeps and imports it into Resolve once.
 
 ## Architecture
 
@@ -259,13 +260,15 @@ room_floor_dbfs = -68.0
 speech_to_noise_db = 46.0
 ```
 
-When the input or output differs from `[calibration]`, `status` and the window warn that the latency calibration is stale. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`. Device and route changes take effect between takes, never during one.
+`[calibration]` also records the capture buffer size; when the input, the output or the buffer size differs from it, or a project has an offset but no `[calibration]` (measured before this section), `status` and the window warn that the latency calibration is stale. `status` likewise warns when the devices differ from `[setup]` or no setup check has run. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`. Device and route changes take effect between takes, never during one.
 
 ### Recording screen additions (milestone 4a)
 
 **Audio panel** (toggled with **A**, usable while the film plays): input device, input channel and output device as pickers. Every channel of the selected input shows its own live meter, so the channel that carries the mic is obvious. A missing device is explained in plain words ("RODECaster Duo is not connected. Connect it or pick another input."). An input not at 48 kHz offers a "Switch to 48 kHz" button (sets the device's nominal rate through CoreAudio). Film volume and monitor volume are sliders and also keys that match the typed character, so they work on QWERTY and QWERTZ alike: `-` and `+` for the film, `,` and `.` for the monitor. They can change during a take.
 
-**Monitoring** (**H**, also a visible toggle in the panel). Off by default. When on, the existing capture callback also writes into a ring buffer that an output stream plays at `monitor.volume_db`; monitoring never opens a second capture and never changes the buffer size of the capture stream, which is fixed per session (128 frames) so calibration stays valid. In v1 monitoring requires the input and output to be the same device (a shared clock, such as the RØDECaster's mic and headphone outputs); with different devices the toggle explains why it is unavailable. The panel shows the estimated mic-to-ear delay (input latency + buffer + output latency, labeled as an estimate) and warns above 15 ms, which rules out the built-in mic (about 50 ms). Monitoring is refused while the output is the built-in speakers (feedback). Because CoreAudio cannot tell whether an interface monitors in hardware, the panel always shows a hint: "If your interface has direct monitoring, use it instead and leave this off, or you will hear yourself twice." A monitoring failure mutes only the monitor; recording continues.
+**Monitoring** (**H**, also a visible toggle in the panel). Off by default. **H** works between takes only, since starting an output stream mid-take risks a dropout. A saved `enabled = true` resumes monitoring on open only when the devices are the ones it was enabled on, with the toggle visibly on; otherwise it starts off. When on, the existing capture callback also writes into a ring buffer that an output stream plays at `monitor.volume_db`; monitoring never opens a second capture and never changes the buffer size of the capture stream, which is fixed per session (128 frames, for every take whether monitored or not) so calibration stays valid. In v1 monitoring requires the input and output to be the same device (a shared clock, such as the RØDECaster's mic and headphone outputs); with different devices the toggle explains why it is unavailable. The panel shows the estimated mic-to-ear delay (input latency + buffer + output latency, labeled as an estimate) and warns above 15 ms, which rules out the built-in mic (about 50 ms). Monitoring is refused while the output is the built-in speakers (feedback). Because CoreAudio cannot tell whether an interface monitors in hardware, the panel always shows a hint: "If your interface has direct monitoring, use it instead and leave this off, or you will hear yourself twice." A monitoring failure mutes only the monitor; recording continues.
+
+**Monitoring spike, the gate for 4a.** On the RØDECaster with wired headphones, with AVPlayer running: zero dropouts over five minutes of capture at 128 frames; loopback placement within ±20 ms and unchanged (within 2 ms) between the device's default buffer and 128 frames, and between monitoring off and on; the measured mic-to-ear delay. If the device refuses 128 frames or any criterion fails, capture keeps the device's default buffer and 4a ships the panel, meters and scrolling with only the direct-monitoring hint, without software monitoring.
 
 **Meters.** The input meter shows peak with a 1.5 s hold and a shaded target band from −18 to −6 dBFS. A "near clipping" light turns red at −1 dBFS and stays red until **K** or the next take; a take whose samples reached −0.1 dBFS is marked "clipped" in its row (the verdict rule's threshold).
 
@@ -276,13 +279,13 @@ When the input or output differs from `[calibration]`, `status` and the window w
 **C**, offered when a project is first opened and when the input or output device changes. Steps:
 
 1. *Devices:* input, channel and output, as in the panel. Bluetooth output and the built-in speakers are flagged ("film sound from speakers will leak into your takes; use wired headphones").
-2. *Voice:* the narrator reads a test sentence shown on screen. Reports peak and average speech level and any clipping, and suggests a gain change in dB on the interface so peaks land near −10 dBFS. Hints, not verdicts: plosives (bursts of energy below 80 Hz, "turn the mic slightly off-axis or add a pop filter") and boom (much more energy below 200 Hz than in 200 Hz–4 kHz, "if you sound boomy, move a little further from the mic"; tuned on Niklas's voice at known distances).
+2. *Voice:* the narrator reads a test sentence shown on screen. Reports peak and average speech level and any clipping, and suggests a gain change in dB on the interface so peaks land near −10 dBFS; after the narrator changes the gain, the sentence is read again until the level fits, so step 3 compares against the final gain. Hints, not verdicts: plosives (bursts of energy below 80 Hz, "turn the mic slightly off-axis or add a pop filter") and boom (much more energy below 200 Hz than in 200 Hz–4 kHz, "if you sound boomy, move a little further from the mic"; tuned on Niklas's voice at known distances).
 3. *Room:* five seconds of silence. Reports the room's noise floor and the speech-to-noise ratio against step 2's speech level: 40 dB or more is good, 30–40 dB acceptable, below 30 dB noisy, with tips. Mains hum is flagged when narrow peaks at 50 or 60 Hz *and* at least two harmonics stand clearly above neighbouring frequencies for the whole recording. The recording is kept as the session's room tone (`takes/.room.wav`) for noise reduction.
 4. *Latency (optional):* the loopback calibration, offered when `[calibration]` does not match the current device pair.
 
 Results are saved in `[setup]`.
 
-**Noise per take.** A new verdict rule after rule 6: a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
+**Noise per take.** `checked` gains `speech_level_dbfs` (RMS over the energy speech range). A new verdict rule after rule 6: a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
 
 **Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed.
 
@@ -294,8 +297,9 @@ Takes are always recorded as 48 kHz, 24-bit WAV, the lossless original, and are 
 
 1. Each used take, whole, through a high-pass at 80 Hz and gentle noise reduction (`afftdn`, fixed reduction of 10 dB, noise floor from the session's room tone). Noise reduction is skipped when there is no room tone or the room tone is digital silence (a gated interface). A click fixture proves the filters add no delay, or the delay is measured and compensated, so `clean` places speech exactly where `raw` does.
 2. Placement, fades and cropping in Rust, as for `raw`.
-3. Loudness: measure integrated loudness and true peak of the assembled narration (`ebur128`), then apply one static gain: the smaller of the gain to reach −16 LUFS and the gain that keeps true peak at −1 dBTP. No dynamic normalization. The achieved loudness and true peak are recorded in the manifest, measured on the final encoded file.
+3. Loudness: measure integrated loudness and true peak of the assembled narration (`ebur128`), then apply one static gain: the smaller of the gain to reach −16 LUFS and the gain that keeps true peak at −1 dBTP. No dynamic normalization.
 4. Resampling to 44.1 kHz (once, for the whole narration) and dither when writing 16-bit.
+5. Verification: integrated loudness and true peak are measured again on the final encoded file and recorded in the manifest. If resampling or dither pushed the true peak above −1 dBTP, the gain is lowered by the excess and steps 3–5 run once more; the manifest records the final values.
 
 `raw` skips steps 1 and 3 and needs no `ffmpeg` unless resampling or FLAC is requested; `doctor` checks `ffmpeg`. The manifest states `sample_rate` of the export file and `source_sample_rate` (48000) of the takes: source ranges stay in take samples at 48 kHz, destination ranges are in export samples (`round(n × rate / 48000)`), and film seconds are authoritative.
 

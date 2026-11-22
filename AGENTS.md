@@ -20,7 +20,7 @@ Takewise is a macOS app for recording voiceover narration over a finished film: 
   - `takewise-media`: macOS bridges (AVFoundation, CoreAudio) through `objc2`. The only crate allowed `unsafe`, with a `SAFETY` comment on every block.
   - `takewise`: the binary: CLI subcommands and the GPUI recording window (through `gpui-kit`, pinned exactly).
 - Commands: `mise run build`, `mise run run -- <args>`, `mise run test`, `mise run check` (fmt, Clippy with `-D warnings`, tests), `mise run clean`.
-- Runtime tools: `whisper-cli` (Homebrew `whisper-cpp`) for transcription and `ffmpeg` for media fixtures.
+- Runtime tools: `whisper-cli` (Homebrew `whisper-cpp`) for transcription; `ffmpeg` for film info, audio for the checks, the `clean` export, resampling and FLAC (`raw` WAV export at 48 kHz works without it).
 - Debug builds are large; run `mise run clean` when done.
 
 ## Conventions
