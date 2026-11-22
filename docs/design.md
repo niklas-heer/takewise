@@ -1,6 +1,6 @@
 # Takewise v1 design
 
-Status: revised after council round 1 (Claude Fable 5.2: 6/10, GPT Sol 6.2: 7/10), 2026-11-22.
+Status: revised after council rounds 1 (Claude Fable 5.2: 6/10, GPT Sol 6.2: 7/10) and 2 (8.5/10, 8/10), 2026-11-22.
 
 ## Why
 
@@ -56,6 +56,7 @@ kindred-promo.takewise/
   project.toml        # film, audio settings, check settings
   script.toml         # the lines, edited by agents and by the app
   takes/<line-id>/001.wav
+  takes/<line-id>/001.json  # the take's recording metadata, written before the WAV is published
   takes.jsonl         # append-only ledger
   .lock               # advisory lock held while writing
   export/narration.wav
@@ -69,7 +70,7 @@ format = 1
 film = "../renders/kindred-promo-v2.mp4"   # relative to the project dir, or absolute
 sample_rate = 48000
 
-[film_info]                                 # written by init, refreshed by `takewise status --refresh-film`
+[film_info]                                 # written by init (ffprobe), refreshed by `takewise status --refresh-film`
 duration_s = 51.5
 size = 12345678
 modified = "2026-11-22T20:05:11Z"
@@ -107,10 +108,10 @@ Validation (`status` reports, the app refuses to record until fixed): ids unique
 The app, the CLI and agents editing by hand may all touch the folder.
 
 - **One lock.** Every Takewise writer takes an exclusive advisory lock on `.lock` (`flock`) for the duration of a write: a script edit, a take allocation, a ledger append. Writes are short; the lock is never held while recording.
-- **`script.toml` edits** are format-preserving (`toml_edit`): re-read the file under the lock, change one field of one line by id, write a temp file, rename over. The app watches the file and reloads; an edit made in the app against a version that changed on disk is rejected with a message instead of overwriting it. Agents may edit the file directly at any time; they should use `takewise script set` (below) while the app is open.
-- **Takes.** Recording writes to `takes/<line>/.NNN.wav.partial`. On stop, the WAV is finalized and fsynced, then under the lock the next free number is allocated, the file renamed to `NNN.wav`, and the `recorded` event appended. Take numbers are allocated only under the lock.
-- **Ledger appends** are one `write` of one complete line with `O_APPEND`. Readers ignore a torn last line without a newline and `status` reports it.
-- **Recovery.** A `NNN.wav` without a `recorded` event (crash between rename and append) is adopted with a `recorded` event marked `recovered: true` the next time the app or `takewise status --repair` runs. A leftover `.partial` is reported and kept, never deleted.
+- **`script.toml` edits** are format-preserving (`toml_edit`): re-read the file under the lock, change one field of one line by id, write a temp file, rename over. The app watches the file and reloads; an edit made in the app against a version that changed on disk is rejected with a message instead of overwriting it. Agents may edit the file directly while the app is closed. Only `takewise script set` (below) is protected against concurrent edits; a direct edit while the app is open can be overwritten.
+- **Takes.** Recording writes to `takes/<line>/.<uuid>.wav.partial`, with its metadata (everything the `recorded` event needs) already in `takes/<line>/.<uuid>.json.partial` when capture starts. On stop, the WAV is finalized and fsynced, then under the lock the next free number is allocated, the metadata renamed to `NNN.json`, the WAV to `NNN.wav`, and the `recorded` event appended. Take numbers are allocated only under the lock.
+- **Ledger appends** are one `write` of one complete line with `O_APPEND`, under the lock; when the file does not end in a newline (a torn last line from a crash), the writer first appends one, so the new event starts on its own line. Readers skip any line that does not parse and `status` reports it.
+- **Recovery.** A `NNN.wav` without a `recorded` event (crash between rename and append) is adopted from its `NNN.json` with a `recorded` event marked `recovered: true` the next time the app or `takewise status --repair` runs; without its `NNN.json` it is only reported. A leftover `.partial` is reported and kept, never deleted.
 
 ### The ledger
 
@@ -118,10 +119,10 @@ The app, the CLI and agents editing by hand may all touch the folder.
 
 - `recorded`: `file`, `sample_rate`, `samples`, `device`, `channel`, `line_offset_s` (film time of the take's first sample minus the line's start, at record time; negative because capture begins with pre-roll), and a `snapshot` of the line at record time (`text`, `start`, `end`).
 - `checked`: `snapshot` checked against (text and slot), transcript with word times, word differences, `speech` (start and end in source seconds, from the energy detector), `overrun_s`, `peak_dbfs`, `clipped_samples`, `noise_floor_dbfs`, `verdict` (`keep`, `retake`, `listen`), `reasons` (list of `{code, message}`), `checker` (whisper model and Takewise version).
-- `judged`: an outside judgment: `by` (free text, for example `claude-opus-5-5`), `verdict`, optional `score` 0–1, `reason`.
+- `judged`: an outside judgment: `snapshot` judged against, `by` (free text, for example `claude-opus-5-5`), `verdict`, optional `score` 0–1, `reason`.
 - `chosen`: `by` (`narrator` or the agent's name).
 
-Folding: a take's effective verdict is its latest `judged` event if any, otherwise its latest `checked` event whose snapshot matches the current line; a check against old text or an old slot is shown as stale and re-run. A line's choice is its latest `chosen` event. No other event kinds in v1.
+Snapshots store the resolved slot end, so moving a neighbour also changes them. Folding: a take's effective verdict is its latest `judged` event whose snapshot matches the current line, otherwise its latest matching `checked` event, otherwise none (`unchecked`). A judgment or check against old text or an old slot is shown as stale; checks are re-run, judgments are not. A line's choice is its latest `chosen` event. No other event kinds in v1.
 
 ## Timing model
 
@@ -153,14 +154,14 @@ The clock mapping is the spike's job to prove. The model: capture buffers carry 
 - **Record (Space):** the film starts `preroll_s` before the line's start; a 3-2-1 count-in shows on screen; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is never monitored.
 - **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…". The top-ranked take gets a hollow star (proposed); a chosen take gets a filled one.
 - **Enter** chooses the selected take, **R** records another, **P** plays the line in context (pre-roll, take, tail) with the selected take locked to the film, **↑/↓** move between lines and **←/→** between takes.
-- **M** sets the current line's start to the playhead while the film plays, clamped between the neighbouring lines' starts. **E** edits the line's text in place. Both write `script.toml` as described above.
+- **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place. Both write `script.toml` as described above.
 - When the input device is missing or not running at 48 kHz, the screen says so, names the available devices, and does not record.
 
 ## Checks
 
 All local, run after each take and by `takewise check`. Recording and choosing work without them; a failed check never blocks the narrator.
 
-- **Speech and timing (primary):** an energy detector on the take finds speech start and end relative to the noise floor measured in the pre-roll. Overrun is speech end past the slot end; early start is speech start before the line's start.
+- **Speech and timing (primary, milestone 1 because export needs it):** an energy detector on the take finds speech start and end relative to the noise floor measured in the pre-roll. Overrun is speech end past the slot end; early start is speech start before the line's start.
 - **Words:** transcribe with whisper.cpp (`whisper-cli`, Homebrew `whisper-cpp`) *without* the script as a prompt, so the model does not hear what it expects. Normalize case, punctuation and simple numbers, align the words with the line text and report missing, extra and substituted words with times. The exact output format of the installed `whisper-cli` is verified before relying on it.
 - **Sound:** peak dBFS, clipped samples (at or above −0.1 dBFS), noise floor.
 - **Verdict, first matching rule wins:**
@@ -172,7 +173,7 @@ All local, run after each take and by `takewise check`. Recording and choosing w
   6. Only substitutions (likely mishearings of names or numbers) → `listen`, naming them.
   7. Otherwise → `keep`.
   Thresholds are tuned on real takes (the Kindred narration recorded on 2026-11-22), not only on synthetic `say` fixtures.
-- **Ranking** among a line's takes, using effective verdicts: `keep` before `listen` before `retake`; then fewer word differences; then smaller overrun; then outside `score`; then newest. The top take is proposed, never chosen automatically.
+- **Ranking** among a line's takes, using effective verdicts: `keep` before `listen` and `unchecked` (equal) before `retake`; then fewer word differences; then smaller overrun; then outside `score`; then newest. The top take is proposed, never chosen automatically.
 
 ## CLI
 
@@ -182,7 +183,7 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | --- | --- |
 | `takewise init <dir> --film <path>` | Create a project with an empty script and the film's info. |
 | `takewise record <dir>` | Open the recording window. |
-| `takewise status <dir> [--strict] [--repair]` | Lines, takes, effective verdicts, proposed and chosen takes, validation problems, stale checks, orphans, film changes. |
+| `takewise status <dir> [--strict] [--repair] [--refresh-film]` | Lines, takes, effective verdicts, proposed and chosen takes, validation problems, stale checks, orphans, film changes. |
 | `takewise script set <dir> <line> --text … / --start … / --end …` | Edit one field of one line safely. |
 | `takewise check <dir> [--line ID] [--take N]` | Run checks; appends `checked` events. |
 | `takewise judge <dir> <line> <take> --verdict … --reason … --by … [--score …]` | Add an outside judgment. |
@@ -194,9 +195,9 @@ One binary, `takewise`. Every command takes the project directory and supports `
 
 `narration.wav` is 48 kHz mono 24-bit PCM, starting at film time zero and exactly as long as the film.
 
-For each line, the chosen take is used; a line without one makes `export` fail with the line ids, unless `--use-proposed` uses the proposed take (recorded in the manifest). From the take, the source range is its speech, extended by 150 ms on either side and clipped to the take. A source sample `i` lands at destination sample `round((line.start + line_offset_s) × 48000) + i`; trimming never shifts the speech. Ranges are cropped to `[0, film length)`. When two lines' destination ranges overlap, export fails and names both lines, so the narrator can choose another take or move a start. Each placed range gets 10 ms fades.
+For each line, the chosen take is used; a line without one makes `export` fail with the line ids, unless `--use-proposed` uses the proposed take (the manifest records `by: "proposed"`); a line with no takes at all always fails. A used take in which no speech is detected also fails export, naming the line. From the take, the source range is its speech, extended by 150 ms on either side and clipped to the take. A source sample `i` lands at destination sample `round((line.start + line_offset_s) × 48000) + i`; trimming never shifts the speech. Ranges are cropped to `[0, film length)`. When two lines' destination ranges overlap, export fails and names both lines, so the narrator can choose another take or move a start. Each placed range gets 10 ms fades.
 
-`manifest.json` lists the film (path, duration, size, modified) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and word times in film seconds.
+`manifest.json` lists the film (path, duration, size, modified) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and, once milestone 3 adds transcription, word times in film seconds.
 
 For Resolve, an agent imports `narration.wav` onto a new audio track at the timeline start, or places the individual takes at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the WAV against the loopback beeps and imports it into Resolve once.
 
@@ -217,9 +218,9 @@ A Cargo workspace:
 ## Milestones
 
 0. **Media spike (throwaway):** a GPUI window plays the film with a text overlay; capture records from a chosen device and channel with host timestamps; a take plays back locked to the film; the loopback test places beeps within ±20 ms at film zero and after seeks; microphone permission for a bare binary versus a bundle is settled. Decides surface versus layer, the capture API and how latency is accounted for.
-1. **Core and CLI:** format, validation, lock and write protocol, ledger and folding, `init`, `status`, `script set`, `choose`, `judge`, `export`, `doctor` without whisper; tests with fixtures.
+1. **Core and CLI:** format, validation, lock and write protocol, ledger and folding, the energy speech detector, `init` (film info through `ffprobe`), `status`, `script set`, `choose`, `judge`, `export`, and `doctor` limited to tools, model and film (devices arrive with milestone 2); tests with fixtures.
 2. **Recording window:** the screen above on the spike's media path: record, play in context, choose, mark start, edit text, level meter. After this milestone Niklas can narrate a film; agents can judge takes from the folder.
-3. **Checks:** energy detector, whisper-cli integration, alignment, verdict rules, ranking, `check`; thresholds tuned on real takes; verdicts in the window.
+3. **Checks:** whisper-cli integration, alignment, verdict rules, ranking, `check`; thresholds tuned on real takes; verdicts in the window.
 4. **Ship:** app bundle, README with the Resolve recipe, agent instructions.
 
 ## Constraints
