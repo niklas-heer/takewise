@@ -474,9 +474,7 @@ fn script_set(
 }
 
 fn export(dir: &Path, use_proposed: bool) -> Result<Outcome, CliError> {
-    let project = Project::open(dir)?;
-    let state = tw::fold(&project, &tw::read(dir)?);
-    let report = tw::export(&project, &state, &ExportOptions { use_proposed })?;
+    let report = tw::export(dir, &ExportOptions { use_proposed })?;
     if report.refused.is_empty() {
         let narration = dir.join("export/narration.wav");
         let mut text = format!(

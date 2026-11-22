@@ -11,11 +11,11 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, rename_temp, write_temp};
-use crate::ledger::Verdict;
+use crate::ledger::{Verdict, read};
 use crate::project::Project;
 use crate::script::{Line, validate};
 use crate::speech::analyze;
-use crate::state::State;
+use crate::state::{State, fold};
 use crate::takes::{encode_wav, read_take_wav};
 
 pub const EXPORT_DIR: &str = "export";
@@ -135,11 +135,19 @@ impl Refusals {
 }
 
 /// Writes `export/narration.wav` (film length, mono 24-bit) and
-/// `export/manifest.json` from each line's chosen take, under the project
-/// lock. On refusal it writes nothing and removes an earlier manifest, so no
-/// stale pair looks valid; the export is regenerable and takes are untouched.
-pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<ExportReport> {
-    let _guard = lock(&project.dir)?;
+/// `export/manifest.json` from each line's chosen take. The project, script
+/// and ledger are read and folded under the project lock, so the pair
+/// reflects the state at write time. On refusal it writes nothing and removes
+/// an earlier manifest, so no stale pair looks valid; the export is
+/// regenerable and takes are untouched.
+pub fn export(dir: &Path, opts: &ExportOptions) -> Result<ExportReport> {
+    let _guard = lock(dir)?;
+    let project = Project::open(dir)?;
+    let state = fold(&project, &read(dir)?);
+    export_locked(&project, &state, opts.use_proposed)
+}
+
+fn export_locked(project: &Project, state: &State, use_proposed: bool) -> Result<ExportReport> {
     let dir = project.dir.join(EXPORT_DIR);
     let mut refused = Vec::new();
     let problems = validate(&project.script, project.film_duration());
@@ -156,7 +164,7 @@ pub fn export(project: &Project, state: &State, opts: &ExportOptions) -> Result<
     let mut refusals = Refusals::default();
     let mut placed: Vec<Placed> = Vec::new();
     for line in &project.script.lines {
-        match place(project, state, opts.use_proposed, line) {
+        match place(project, state, use_proposed, line) {
             Ok(p) => placed.push(p),
             Err((code, message)) => refusals.add(code, &line.id, message),
         }
@@ -479,9 +487,7 @@ mod tests {
     }
 
     fn run(dir: &Path, use_proposed: bool) -> ExportReport {
-        let project = Project::open(dir).unwrap();
-        let state = fold(&project, &ledger::read(dir).unwrap());
-        export(&project, &state, &ExportOptions { use_proposed }).unwrap()
+        export(dir, &ExportOptions { use_proposed }).unwrap()
     }
 
     fn narration(dir: &Path) -> Vec<i32> {
@@ -778,6 +784,43 @@ mod tests {
         let report = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(report.refused, []);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn export_reads_state_under_the_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_tmp, dir) = setup(ONE_LINE);
+        let first = take(&dir, "hook", Some((2.0, 3.0)));
+        let second = take(&dir, "hook", Some((2.5, 3.0)));
+        choose(&dir, &first);
+        // An outside fold sees take 1 chosen.
+        let project = Project::open(&dir).unwrap();
+        let before = fold(&project, &ledger::read(&dir).unwrap());
+        assert_eq!(before.lines[0].chosen, Some((1, "narrator".to_owned())));
+
+        // Another writer holds the lock while export starts, and chooses
+        // take 2 before releasing it.
+        let guard = crate::fsutil::lock(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let other = dir.clone();
+        let handle = std::thread::spawn(move || tx.send(run(&other, false)).unwrap());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        let event = Event::new(
+            "hook",
+            second.take,
+            EventKind::Chosen(Chosen {
+                by: "claude".to_owned(),
+            }),
+        );
+        ledger::append_locked(&dir, &event).unwrap();
+        drop(guard);
+
+        let report = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(report.refused, []);
+        assert_eq!(report.lines[0].take_file, "takes/hook/002.wav");
+        assert_eq!(report.lines[0].chosen_by, "claude");
     }
 
     #[test]
