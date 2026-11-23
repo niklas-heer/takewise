@@ -2147,6 +2147,74 @@ fn a_window_pausing_its_checks_leaves_another_windows_running(cx: &mut TestAppCo
     );
 }
 
+/// Sets `[check]` in `project.toml`, as an edit by hand would.
+fn set_check(dir: &Path, model: &str, language: &str) {
+    let path = dir.join("project.toml");
+    let text = fs::read_to_string(&path).expect("project.toml");
+    let kept = match text.find("[check]") {
+        Some(start) => {
+            let rest = &text[start + 1..];
+            let end = rest.find("\n[").map_or(text.len(), |i| start + 1 + i + 1);
+            format!("{}{}", &text[..start], &text[end..])
+        }
+        None => text,
+    };
+    let section = format!("[check]\nwhisper_model = {model:?}\nlanguage = {language:?}\n");
+    fs::write(&path, format!("{}\n{section}", kept.trim_end())).expect("write project.toml");
+}
+
+#[gpui_kit::test]
+fn changed_check_settings_start_a_new_worker(cx: &mut TestAppContext) {
+    let f = open_checked(cx, &[(DEVICE, 48_000)], |_| {}, no_transcriber());
+    let made: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let log = Arc::clone(&made);
+    f.view.update(cx, |view, _| {
+        view.make_checker = Box::new(move |project: &Project| {
+            let config = &project.config.check;
+            log.lock()
+                .expect("made")
+                .push((config.whisper_model.clone(), config.language.clone()));
+            Checker {
+                transcriber: Arc::new(tw::Unavailable {
+                    reason: "a new worker".to_owned(),
+                    model: config.whisper_model.clone(),
+                }),
+                tools: Vec::new(),
+                tag: worker_tag(),
+            }
+        });
+        view.reload();
+    });
+    let made_now = || made.lock().expect("made").clone();
+    assert_eq!(made_now(), [], "unchanged settings keep the worker");
+
+    let model = config(&f.dir).check.whisper_model;
+    set_check(&f.dir, &model, "de");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(made_now(), [(model.clone(), "de".to_owned())]);
+
+    set_check(&f.dir, "models/ggml-other.bin", "de");
+    f.view.update(cx, |view, _| view.reload());
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(made_now().len(), 2, "one new worker per change");
+
+    record_take(cx, &f);
+    wait_until(cx, &f, || checked_events(&f.dir) >= 1);
+    let checker = tw::read(&f.dir)
+        .expect("ledger")
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::Checked(checked) => Some(checked.checker.clone()),
+            _ => None,
+        })
+        .expect("a check");
+    assert!(
+        checker.contains(" whisper models/ggml-other.bin "),
+        "checked by the new worker: {checker}"
+    );
+}
+
 #[gpui_kit::test]
 fn quitting_mid_check_kills_its_child_and_temporary_files(cx: &mut TestAppContext) {
     // Reads its held-open standard input first.

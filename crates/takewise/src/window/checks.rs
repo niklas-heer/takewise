@@ -332,9 +332,13 @@ pub struct Checks {
     done: Receiver<Done>,
     /// Queued or running, each take once.
     pending: Vec<TakeRef>,
-    /// Every take checked this session with the line as its check took it,
-    /// so a take that cannot be checked is not queued again and again.
-    tried: Vec<(TakeRef, Snapshot)>,
+    /// Every take checked this session with the line as its check took it
+    /// and the `checker` that checked it, so a take that cannot be checked
+    /// is not queued again and again, while one checked by other settings
+    /// is.
+    tried: Vec<(TakeRef, Snapshot, String)>,
+    /// The `checker` this worker's checks record.
+    checker: String,
 }
 
 impl Checks {
@@ -346,6 +350,7 @@ impl Checks {
             tools,
             tag,
         } = checker;
+        let checker = tw::checker(env!("CARGO_PKG_VERSION"), &transcriber.model());
         let (jobs_tx, jobs_rx) = channel::<TakeRef>();
         let (done_tx, done_rx) = channel();
         let control = Arc::new(Control::default());
@@ -392,6 +397,7 @@ impl Checks {
             done: done_rx,
             pending: Vec::new(),
             tried: Vec::new(),
+            checker,
         }
     }
 
@@ -426,13 +432,13 @@ impl Checks {
     /// Queues a check of `take`, whose line `snapshot` has now, unless it
     /// is queued or running (its check takes the line as it is when it
     /// begins; one that turns out stale is queued again once done) or was
-    /// checked against that line before.
+    /// checked against that line by this worker's checker before.
     pub fn queue(&mut self, take: &TakeRef, snapshot: &Snapshot) {
         if self.pending.contains(take)
             || self
                 .tried
                 .iter()
-                .any(|(t, s)| t == take && s.matches(snapshot))
+                .any(|(t, s, by)| t == take && s.matches(snapshot) && *by == self.checker)
         {
             return;
         }
@@ -464,7 +470,8 @@ impl Checks {
         for d in &done {
             self.pending.retain(|t| *t != d.take);
             if let Some(snapshot) = &d.snapshot {
-                self.tried.push((d.take.clone(), snapshot.clone()));
+                self.tried
+                    .push((d.take.clone(), snapshot.clone(), self.checker.clone()));
             }
         }
         done

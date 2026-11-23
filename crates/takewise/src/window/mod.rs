@@ -168,6 +168,26 @@ fn load(dir: &Path) -> Result<Loaded, tw::Error> {
     })
 }
 
+/// What a check worker's checks depend on: the `checker` it records (the
+/// model's file name and the preprocessing) and the language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckKey {
+    checker: String,
+    language: String,
+}
+
+fn check_key(project: &Project) -> CheckKey {
+    let config = &project.config.check;
+    let model = Path::new(&config.whisper_model).file_name().map_or_else(
+        || config.whisper_model.clone(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    CheckKey {
+        checker: tw::checker(env!("CARGO_PKG_VERSION"), &model),
+        language: config.language.clone(),
+    }
+}
+
 /// whisper-cli with the project's model and the tools it runs, or, when it
 /// cannot be set up, a stand-in that leaves every take's words unchecked
 /// with the reason. Kills the tools an earlier Takewise left behind.
@@ -347,6 +367,11 @@ pub struct RecordingWindow {
     editing: Option<Draft>,
     watcher: Option<Watcher>,
     checks: Checks,
+    /// The `[check]` settings and preprocessing the check worker was made
+    /// for ([`check_key`]); when they change, a new worker replaces it.
+    checks_for: CheckKey,
+    /// Makes the check worker's checker for the project as it is now.
+    make_checker: Box<dyn Fn(&Project) -> Checker>,
     focus: FocusHandle,
     subscriptions: Vec<Subscription>,
     /// The connected inputs as last checked.
@@ -408,6 +433,7 @@ impl RecordingWindow {
             async {}
         });
         let checks = Checks::new(dir.clone(), checker);
+        let checks_for = check_key(&loaded.project);
         let loaded_unchecked = loaded.unchecked;
         let film_gain_db = loaded.project.config.record.film_gain_db;
         let monitor_db = loaded.project.config.monitor.volume_db;
@@ -445,6 +471,8 @@ impl RecordingWindow {
             editing: None,
             watcher,
             checks,
+            checks_for,
+            make_checker: Box::new(self::checker),
             focus,
             subscriptions,
             inputs: Vec::new(),
@@ -591,12 +619,32 @@ impl RecordingWindow {
                 self.project = loaded.project;
                 self.version = loaded.version;
                 self.state = loaded.state;
+                self.refresh_checks();
                 self.sync_volumes();
                 self.after_reload(current.as_deref());
                 self.queue_checks(&loaded.unchecked);
             }
             Err(err) => self.message = Some(format!("Could not reload the project: {err}")),
         }
+    }
+
+    /// Replaces the check worker when `[check]` (the model or the language)
+    /// or the preprocessing changed since it was made, so no check runs
+    /// with stale settings; dropping the old one cancels its check. The
+    /// takes its checks no longer match are queued again by the reload.
+    fn refresh_checks(&mut self) {
+        let key = check_key(&self.project);
+        if key == self.checks_for {
+            return;
+        }
+        self.replace_checks((self.make_checker)(&self.project));
+    }
+
+    /// Starts a new check worker with `checker` in place of the old one.
+    fn replace_checks(&mut self, checker: Checker) {
+        self.checks = Checks::new(self.dir.clone(), checker);
+        self.checks_for = check_key(&self.project);
+        self.pause_checks_while_recording();
     }
 
     /// Queues a check of each take without a current one (a new take, or a
@@ -626,7 +674,7 @@ impl RecordingWindow {
             return;
         };
         // The old worker checks without words; dropping it cancels it.
-        self.checks = Checks::new(self.dir.clone(), prompt.installer().checker(&self.project));
+        self.replace_checks(prompt.installer().checker(&self.project));
         self.reload();
         let again = match tw::read(&self.dir) {
             Ok(ledger) => tw::words_not_checked_takes(&self.project, &ledger),
