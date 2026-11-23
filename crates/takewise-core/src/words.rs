@@ -9,7 +9,8 @@
 //! ("eighteen sixty seven", "nineteen oh five") is its value; "1990s" and
 //! "nineteen nineties" are `1990s`, "21st" and "twenty-first" `21st`, "3.5"
 //! and "three point five zero" `3.5` (a decimal is its value), "$5" and
-//! "five dollars" `5 dollars`; a sign is kept, so "-5", "minus five" and
+//! "five dollars" `5 dollars`, "$3.50" and "three dollars (and) fifty
+//! (cents)" `3.5 dollars`; a sign is kept, so "-5", "minus five" and
 //! "negative five" are `-5`, never `5`. A lone whole one stays the word `one`, since
 //! it is often not a number ("every one"), and "first" and "second" are
 //! ordinals only when attached ("twenty-first"), never in "a sixty second
@@ -18,8 +19,10 @@
 //! but never across punctuation: "pick twenty, one at a time" is `20 one`.
 //! [`align`] still matches a number split in two on one side against the
 //! joined form on the other (`60 second` and `62nd`, `20 first` and `21st`),
-//! and a script clock time such as `11:30` against "eleven thirty" or `11
-//! 30`; without a colon in the script, two numbers are never a time.
+//! a clock time with a colon such as `11:30` on either side against "eleven
+//! thirty", `11 30` or `11.30` (as whisper writes it) on the other, and
+//! "alright" against "all right"; without a colon on one side, two numbers
+//! are never a time.
 //!
 //! An `'s` or a trailing apostrophe is kept as a mark on its [`Token`], since
 //! it changes what the token may be heard as. [`align`] accepts a heard
@@ -148,6 +151,9 @@ fn same(expected: &Token, heard: &Token) -> bool {
     {
         return true;
     }
+    if is_time_as_decimal(expected, heard) || is_time_as_decimal(heard, expected) {
+        return true;
+    }
     if let (Some(a), Some(b)) = (whole_number(expected), whole_number(heard))
         && a == b
     {
@@ -165,6 +171,23 @@ fn same(expected: &Token, heard: &Token) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `decimal` is the clock time `time` written with a point, as
+/// whisper and British English write "nine thirty": `9.30` (`9.3` once
+/// normalized) for `9:30`, `9.05` for `9:05`.
+fn is_time_as_decimal(time: &Token, decimal: &Token) -> bool {
+    let Some((hours, minutes)) = clock(&time.text) else {
+        return false;
+    };
+    let Some((int, frac)) = decimal.text.split_once('.') else {
+        return false;
+    };
+    decimal.apostrophe == Apostrophe::None
+        && int.parse() == Ok(hours)
+        && (1..=2).contains(&frac.len())
+        && frac.chars().all(|c| c.is_ascii_digit())
+        && format!("{frac:0<2}").parse() == Ok(minutes)
 }
 
 /// A clock time with a colon, such as `11:30`: its hours and minutes.
@@ -216,20 +239,27 @@ fn whole_number(token: &Token) -> Option<(u64, Form)> {
 enum Join {
     /// The same words, written differently: a contracted "is" (`link is`
     /// and `link's`), a number in two parts (`sixty second` and `62nd`, `20
-    /// first` and `21st`), or a script clock time (`11:30` heard as `11 30`
-    /// or "nine thirty" for `9:30`).
+    /// first` and `21st`), a clock time (`11:30` and `11 30`, or "nine
+    /// thirty" and `9:30`), a hyphenated word (`voice-over` and
+    /// `voiceover`) or "all right" and "alright".
     Same,
     /// Two separate words heard or written as one (`every day` and
     /// `everyday`): a possible mishearing.
     Compound,
 }
 
-/// Whether `first` and `second` are `one` on the other side; `one_is_script`
-/// says that `one` is the script's token, which a clock time must be.
-fn pair_is_one(first: &Token, second: &Token, one: &Token, one_is_script: bool) -> Option<Join> {
+/// One word that whisper may write as two, and the two: "alright" and "all
+/// right".
+const SPLIT_SPELLINGS: [(&str, &str, &str); 1] = [("alright", "all", "right")];
+
+/// Whether `first` and `second` are `one` on the other side.
+fn pair_is_one(first: &Token, second: &Token, one: &Token) -> Option<Join> {
     let contracted =
         one.apostrophe == Apostrophe::S && first.is_plain(&one.text) && second.is_plain("is");
-    if contracted {
+    let spelled = SPLIT_SPELLINGS
+        .iter()
+        .any(|&(joined, a, b)| one.is_plain(joined) && first.is_plain(a) && second.is_plain(b));
+    if contracted || spelled {
         return Some(Join::Same);
     }
     let joined = one.text.len() == first.text.len() + second.text.len()
@@ -250,8 +280,7 @@ fn pair_is_one(first: &Token, second: &Token, one: &Token, one_is_script: bool) 
     let (Some((a, a_form)), Some((b, b_form))) = (whole_number(first), whole_number(second)) else {
         return None;
     };
-    if one_is_script
-        && let Some((hours, minutes)) = clock(&one.text)
+    if let Some((hours, minutes)) = clock(&one.text)
         && a_form == Form::Cardinal
         && b_form == Form::Cardinal
         && (a, b) == (hours, minutes)
@@ -706,14 +735,23 @@ fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(V
         Item::Word(_) => {
             let (int, form, mut next) = cardinal(words, k)?;
             let mut value = Value::whole(int);
+            let mut currency = None;
             if form == Form::Cardinal && word_at(words, next) == Some("point") {
                 let digits: String = (next + 1..).map_while(|i| digit_at(words, i)).collect();
                 if !digits.is_empty() {
                     next += 1 + digits.len();
                     value.frac = digits;
                 }
+            } else if form == Form::Cardinal
+                && let Some(unit) = word_at(words, next).and_then(currency_word)
+                && let Some((cents, after)) = cents_at(words, next + 1)
+            {
+                // "three dollars fifty" is `3.5 dollars`, as "$3.50" is.
+                value.frac = format!("{cents:02}");
+                currency = Some(unit);
+                next = after;
             }
-            (value, form, next, None)
+            (value, form, next, currency)
         }
         Item::Other(_) => return None,
     };
@@ -740,6 +778,35 @@ fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(V
         tokens.push(Token::plain(text));
     }
     Some((tokens, next))
+}
+
+/// The singular and plural of a currency named in words: `dollars` is
+/// (`dollar`, `dollars`).
+fn currency_word(word: &str) -> Option<(&'static str, &'static str)> {
+    [
+        ("dollar", "dollars"),
+        ("euro", "euros"),
+        ("pound", "pounds"),
+    ]
+    .into_iter()
+    .find(|(one, many)| word == *one || word == *many)
+}
+
+/// The cents said after a currency word, from 1 to 99, and the index after
+/// them: "fifty", "fifty cents", "and fifty cents"; an "and" needs the cents
+/// named, so "three dollars and two apples" has none.
+fn cents_at(words: &[Option<&str>], i: usize) -> Option<(u64, usize)> {
+    let and = word_at(words, i) == Some("and");
+    let at = if and { i + 1 } else { i };
+    let (cents, form, after) = small(words, at)?;
+    if form != Form::Cardinal || !(1..=99).contains(&cents) {
+        return None;
+    }
+    let named = matches!(word_at(words, after), Some("cent" | "cents" | "pence"));
+    if and && !named {
+        return None;
+    }
+    Some((cents, if named { after + 1 } else { after }))
 }
 
 /// A cardinal token with a minus sign: `5` is `-5`, `one` `-1`; `None` for
@@ -1108,7 +1175,7 @@ impl Alignment<'_> {
             return None;
         };
         let e = self.expected;
-        pair_is_one(&e[i], &e[i + 1], &self.heard[j].token, false)
+        pair_is_one(&e[i], &e[i + 1], &self.heard[j].token)
     }
 
     /// One expected token heard as two, ending at expected[i - 1] and
@@ -1118,7 +1185,7 @@ impl Alignment<'_> {
             return None;
         };
         let h = self.heard;
-        pair_is_one(&h[j].token, &h[j + 1].token, &self.expected[i], true)
+        pair_is_one(&h[j].token, &h[j + 1].token, &self.expected[i])
     }
 
     fn matches(&self, i: usize, j: usize) -> bool {
@@ -1522,6 +1589,57 @@ mod tests {
             );
         }
         assert_ne!(align(&normalize("3.5"), &heard("three point five one")), []);
+    }
+
+    #[test]
+    fn align_accepts_whisper_spellings() {
+        for (script, said) in [
+            ("at 9:30", "at 9.30"),
+            ("at 9:30", "at 9:30"),
+            ("at 9:30", "at nine thirty"),
+            ("at 9:05", "at 9.05"),
+            ("at nine thirty", "at 9:30"),
+            ("Alright, let's go", "All right, let's go"),
+            ("All right, let's go", "Alright, let's go"),
+            ("It costs $3.50", "It costs three dollars fifty"),
+            ("It costs $3.50", "It costs three dollars and fifty cents"),
+            ("It costs $3.05", "It costs three dollars five"),
+            ("It costs $1.50", "It costs one dollar fifty"),
+            ("It costs €3.50", "It costs three euros fifty"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        // Another time or amount is a difference.
+        assert_ne!(align(&normalize("at 9:30"), &heard("at 9.35")), []);
+        assert_ne!(align(&normalize("at 9:30"), &heard("at 10.30")), []);
+        assert_ne!(
+            align(
+                &normalize("It costs $3.50"),
+                &heard("It costs three dollars sixty")
+            ),
+            []
+        );
+        // "and" joins cents only when they are named.
+        assert_eq!(
+            shown("three dollars and two apples"),
+            tokens("3 dollars and 2 apples")
+        );
+        // "three fifty" may be 350: a possible mishearing to listen to.
+        let diffs = align(&normalize("It costs $3.50"), &heard("It costs three fifty"));
+        assert_ne!(diffs, []);
+        assert!(
+            diffs.iter().all(|d| d.kind == WordDiffKind::Substituted),
+            "{diffs:?}"
+        );
     }
 
     #[test]
