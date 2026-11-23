@@ -128,7 +128,9 @@ pub struct ExportSettings {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExportWarning {
     pub code: &'static str,
-    pub line: String,
+    /// The line it is about; absent for the whole narration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
     pub message: String,
 }
 
@@ -225,6 +227,8 @@ struct Placed {
     /// The unclamped speech in film seconds, when part of it lies outside
     /// the film.
     cropped_speech: Option<(f64, f64)>,
+    /// `clean` only: why noise reduction was skipped for this take.
+    nr_skipped: Option<String>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -254,38 +258,205 @@ impl Refusals {
     }
 }
 
-/// Writes `export/narration.wav` (film length, mono 24-bit) and
-/// `export/manifest.json` from each line's chosen take. The project, script
-/// and ledger are read and folded under the project lock, so the pair
-/// reflects the state at write time. On refusal it writes nothing and removes
-/// an earlier manifest, so no stale pair looks valid; the export is
-/// regenerable and takes are untouched.
-pub fn export(dir: &Path, opts: &ExportOptions) -> Result<ExportReport> {
-    let _guard = lock(dir)?;
-    let project = Project::open(dir)?;
-    let ledger = read(dir)?;
-    let state = fold(&project, &ledger);
-    export_locked(&project, &ledger, &state, opts)
+/// The film on disk as the caller found it just before export, to compare
+/// with the `[film_info]` the timings were made against.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilmOnDisk {
+    Missing,
+    Found {
+        size: u64,
+        /// RFC 3339, whole seconds, as `[film_info] modified`.
+        modified: String,
+        /// `None` when it could not be measured (no `ffprobe`): the size
+        /// and modification time decide alone.
+        duration_s: Option<f64>,
+    },
 }
 
-fn export_locked(
+/// Durations closer than this are the same film.
+const FILM_DURATION_TOLERANCE_S: f64 = 1e-3;
+
+/// Why the film no longer matches what the project measured, if it does
+/// not: `film-missing` or `film-changed`.
+fn film_refusal(project: &Project, film: &FilmOnDisk) -> Option<Refusal> {
+    let info = &project.config.film_info;
+    let refresh = "check the timings, then run `takewise status --refresh-film`";
+    match film {
+        FilmOnDisk::Missing => Some(Refusal {
+            code: "film-missing",
+            lines: Vec::new(),
+            message: format!("the film {} is missing", project.film_path().display()),
+        }),
+        FilmOnDisk::Found {
+            size,
+            modified,
+            duration_s,
+        } => {
+            let same = *size == info.size
+                && *modified == info.modified
+                && duration_s
+                    .is_none_or(|d| (d - info.duration_s).abs() <= FILM_DURATION_TOLERANCE_S);
+            (!same).then(|| Refusal {
+                code: "film-changed",
+                lines: Vec::new(),
+                message: format!("the film changed since it was measured; {refresh}"),
+            })
+        }
+    }
+}
+
+/// What an export read: a hash of `project.toml`, `script.toml` and
+/// `takes.jsonl`. The export publishes only when it is unchanged after
+/// rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateVersion([u8; 32]);
+
+fn state_version(dir: &Path) -> Result<StateVersion> {
+    let mut hash = Sha256::new();
+    for file in [
+        crate::project::PROJECT_FILE,
+        crate::project::SCRIPT_FILE,
+        crate::ledger::LEDGER_FILE,
+    ] {
+        let path = dir.join(file);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(io(&path)(err)),
+        };
+        hash.update(to_u64(bytes.len()).to_le_bytes());
+        hash.update(&bytes);
+    }
+    Ok(StateVersion(hash.finalize().into()))
+}
+
+/// Writes `export/narration.wav` (film length, mono 24-bit) and
+/// `export/manifest.json` from each line's chosen take, after comparing
+/// `film` with the film the project measured.
+///
+/// The project, script and ledger are read and folded under the project
+/// lock, which is then released while the takes are cleaned and the
+/// narration rendered (`ffmpeg` can take a while). The lock is taken again
+/// to publish: only when the project, script and ledger are unchanged, so
+/// the pair reflects the state at write time. When they changed, the export
+/// renders once more from the new state, then refuses with `state-changed`.
+///
+/// On refusal it writes nothing and removes an earlier manifest, so no stale
+/// pair looks valid; the export is regenerable and takes are untouched.
+pub fn export(dir: &Path, opts: &ExportOptions, film: &FilmOnDisk) -> Result<ExportReport> {
+    export_observed(dir, opts, film, &mut || {})
+}
+
+/// How many times export renders before refusing with `state-changed`.
+const RENDER_ATTEMPTS: usize = 2;
+
+/// [`export`], calling `rendered` after each render, outside the lock.
+fn export_observed(
+    dir: &Path,
+    opts: &ExportOptions,
+    film: &FilmOnDisk,
+    rendered: &mut dyn FnMut(),
+) -> Result<ExportReport> {
+    let export_dir = dir.join(EXPORT_DIR);
+    for _ in 0..RENDER_ATTEMPTS {
+        let (project, ledger, version, settings, plan) = {
+            let _guard = lock(dir)?;
+            let version = state_version(dir)?;
+            let project = Project::open(dir)?;
+            let ledger = read(dir)?;
+            let state = fold(&project, &ledger);
+            let settings = opts.settings(project.config.export.as_ref())?;
+            let plan = match plan(&project, &ledger, &state, opts, film) {
+                Ok(plan) => plan,
+                Err(refused) => return refuse(&export_dir, refused),
+            };
+            (project, ledger, version, settings, plan)
+        };
+        let render = render_export(&project, &ledger, settings, plan)?;
+        rendered();
+        let _guard = lock(dir)?;
+        let unchanged = match state_version(dir) {
+            Ok(now) => now == version,
+            Err(err) => {
+                let _ = fs::remove_file(&render.narration_temp);
+                return Err(err);
+            }
+        };
+        if unchanged {
+            return publish_export(&project, &export_dir, render);
+        }
+        let _ = fs::remove_file(&render.narration_temp);
+    }
+    let _guard = lock(dir)?;
+    refuse(
+        &export_dir,
+        vec![Refusal {
+            code: "state-changed",
+            lines: Vec::new(),
+            message: format!(
+                "the project changed while the export rendered, {RENDER_ATTEMPTS} times; export again when it is quiet"
+            ),
+        }],
+    )
+}
+
+/// Removes an earlier manifest and reports `refused`.
+fn refuse(export_dir: &Path, refused: Vec<Refusal>) -> Result<ExportReport> {
+    remove_if_present(&export_dir.join(MANIFEST_FILE))?;
+    Ok(ExportReport {
+        refused,
+        ..ExportReport::default()
+    })
+}
+
+/// The takes placed in the film, ready to render.
+struct Plan {
+    placed: Vec<Placed>,
+    tight: Vec<ExportWarning>,
+}
+
+/// Checks the film and places each line's take, or says why export
+/// refuses.
+fn plan(
     project: &Project,
     ledger: &Ledger,
     state: &State,
     opts: &ExportOptions,
-) -> Result<ExportReport> {
-    let settings = opts.settings(project.config.export.as_ref())?;
-    let use_proposed = opts.use_proposed;
-    let dir = project.dir.join(EXPORT_DIR);
-    let (mut placed, tight, refused) = gather(project, ledger, state, use_proposed);
-    if !refused.is_empty() {
-        remove_if_present(&dir.join(MANIFEST_FILE))?;
-        return Ok(ExportReport {
-            refused,
-            ..ExportReport::default()
-        });
+    film: &FilmOnDisk,
+) -> std::result::Result<Plan, Vec<Refusal>> {
+    let (placed, tight, mut refused) = gather(project, ledger, state, opts.use_proposed);
+    if let Some(film) = film_refusal(project, film) {
+        refused.insert(0, film);
     }
+    if refused.is_empty() {
+        Ok(Plan { placed, tight })
+    } else {
+        Err(refused)
+    }
+}
 
+/// A rendered narration in its temp file, with what the manifest says.
+struct Rendered {
+    narration_temp: PathBuf,
+    narration_path: PathBuf,
+    file: String,
+    narration: ManifestNarration,
+    settings: ExportConfig,
+    report: ExportSettings,
+    lines: Vec<ManifestLine>,
+    warnings: Vec<ExportWarning>,
+}
+
+/// Cleans the takes (`clean`), mixes and renders the narration into a temp
+/// file in the export directory. Runs without the lock.
+fn render_export(
+    project: &Project,
+    ledger: &Ledger,
+    settings: ExportConfig,
+    plan: Plan,
+) -> Result<Rendered> {
+    let Plan { mut placed, tight } = plan;
+    let dir = project.dir.join(EXPORT_DIR);
     let ffmpeg = ffmpeg_for(settings)?;
     if settings.processing == Processing::Clean {
         let ffmpeg = ffmpeg.as_ref().ok_or_else(|| missing_ffmpeg(settings))?;
@@ -316,6 +487,7 @@ fn export_locked(
 
     let mut warnings = warnings(&placed, project.film_duration());
     warnings.extend(tight);
+    warnings.extend(loudness_warning(&report));
     let lines: Vec<ManifestLine> = placed
         .into_iter()
         .map(|p| {
@@ -326,6 +498,20 @@ fn export_locked(
             line
         })
         .collect();
+    Ok(Rendered {
+        narration_temp,
+        narration_path,
+        file,
+        narration,
+        settings,
+        report,
+        lines,
+        warnings,
+    })
+}
+
+/// Writes the manifest and puts the rendered pair in place. Under the lock.
+fn publish_export(project: &Project, dir: &Path, render: Rendered) -> Result<ExportReport> {
     let info = &project.config.film_info;
     let manifest = Manifest {
         v: 1,
@@ -335,24 +521,42 @@ fn export_locked(
             size: info.size,
             modified: &info.modified,
         },
-        narration,
-        settings: report,
-        lines: &lines,
-        warnings: &warnings,
+        narration: render.narration,
+        settings: render.report,
+        lines: &render.lines,
+        warnings: &render.warnings,
     };
     publish(
-        &dir,
+        dir,
         &manifest,
-        &narration_temp,
-        &narration_path,
-        settings.format,
+        &render.narration_temp,
+        &render.narration_path,
+        render.settings.format,
     )?;
     Ok(ExportReport {
-        narration: file,
-        settings: Some(report),
-        lines,
+        narration: render.file,
+        settings: Some(render.report),
+        lines: render.lines,
         refused: Vec::new(),
-        warnings,
+        warnings: render.warnings,
+    })
+}
+
+/// A `loudness-target-missed` warning when `clean` could not bring the
+/// narration to its loudness target.
+fn loudness_warning(report: &ExportSettings) -> Option<ExportWarning> {
+    if report.loudness_target_reached != Some(false) {
+        return None;
+    }
+    let measured = report
+        .loudness_lufs
+        .map_or_else(String::new, |lufs| format!(" measures {lufs:.1} LUFS and"));
+    Some(ExportWarning {
+        code: "loudness-target-missed",
+        line: None,
+        message: format!(
+            "the narration{measured} misses {TARGET_LUFS:.0} LUFS by more than {LOUDNESS_TOLERANCE_LU} LU: the peak limiter stops at 6 dB, so very dynamic speech stays quieter; raise it in the edit or record the loud parts softer"
+        ),
     })
 }
 
@@ -500,13 +704,18 @@ fn clean_takes(
         let len = p.samples.len();
         p.samples = cleaned.into_iter().map(|v| v * UNIT).collect();
         p.samples.resize(len, 0.0);
-        p.line.noise_reduction = Some(match (&room, info.noise_floor_db) {
-            (Ok(tone), Some(floor)) => format!(
+        p.nr_skipped = match (&room, info.noise_floor_db) {
+            (Ok(_), Some(_)) => None,
+            (Err(why), _) => Some(why.clone()),
+            (Ok(_), None) => Some("no noise floor to reduce to".to_owned()),
+        };
+        p.line.noise_reduction = Some(match (&room, info.noise_floor_db, &p.nr_skipped) {
+            (Ok(tone), Some(floor), _) => format!(
                 "afftdn {NOISE_REDUCTION_DB:.0} dB at a noise floor of {floor:.1} dB from {}",
                 tone.file
             ),
-            (Err(why), _) => format!("skipped: {why}"),
-            (Ok(_), None) => "skipped".to_owned(),
+            (_, _, Some(why)) => format!("skipped: {why}"),
+            _ => "skipped".to_owned(),
         });
     }
     Ok(())
@@ -689,6 +898,7 @@ fn place(
         fade_room: (usize::MAX, usize::MAX),
         old_text: take.recorded_against_old_text,
         cropped_speech,
+        nr_skipped: None,
     })
 }
 
@@ -732,7 +942,7 @@ fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
         if p.old_text {
             warnings.push(ExportWarning {
                 code: "recorded-against-old-text",
-                line: p.line.id.clone(),
+                line: Some(p.line.id.clone()),
                 message: format!(
                     "{} was recorded against different text than the line has now",
                     p.line.take_file
@@ -742,11 +952,18 @@ fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
         if let Some((start, end)) = p.cropped_speech {
             warnings.push(ExportWarning {
                 code: "speech-cropped",
-                line: p.line.id.clone(),
+                line: Some(p.line.id.clone()),
                 message: format!(
                     "the speech of {} runs from {start:.3} s to {end:.3} s, partly outside the film (0 s to {film_duration:.3} s); the part outside is cropped",
                     p.line.take_file
                 ),
+            });
+        }
+        if let Some(why) = &p.nr_skipped {
+            warnings.push(ExportWarning {
+                code: "noise-reduction-skipped",
+                line: Some(p.line.id.clone()),
+                message: format!("{}: noise reduction skipped: {why}", p.line.take_file),
             });
         }
     }
@@ -770,7 +987,7 @@ fn split_margins(placed: &mut [Placed], rate: u32) -> Vec<ExportWarning> {
             let ms = (b_start - a_end) as f64 * 1000.0 / f64::from(rate);
             warnings.push(ExportWarning {
                 code: "tight-gap",
-                line: placed[a].line.id.clone(),
+                line: Some(placed[a].line.id.clone()),
                 message: format!(
                     "the speech of {} and {} is only {ms:.0} ms apart; the cut between them has shortened fades",
                     placed[a].line.id, placed[b].line.id
@@ -966,6 +1183,16 @@ mod tests {
         ledger::append(dir, &event).unwrap();
     }
 
+    /// The film as the project measured it.
+    fn unchanged_film(dir: &Path) -> FilmOnDisk {
+        let info = Project::open(dir).unwrap().config.film_info;
+        FilmOnDisk::Found {
+            size: info.size,
+            modified: info.modified,
+            duration_s: Some(info.duration_s),
+        }
+    }
+
     fn run(dir: &Path, use_proposed: bool) -> ExportReport {
         export(
             dir,
@@ -973,6 +1200,7 @@ mod tests {
                 use_proposed,
                 ..ExportOptions::default()
             },
+            &unchanged_film(dir),
         )
         .unwrap()
     }
@@ -1121,7 +1349,7 @@ mod tests {
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
         let warning = &report.warnings[0];
         assert_eq!(
-            (warning.code, warning.line.as_str()),
+            (warning.code, warning.line.as_deref().unwrap_or_default()),
             ("speech-cropped", "hook")
         );
         assert!(warning.message.contains("-0.500"), "{}", warning.message);
@@ -1253,7 +1481,7 @@ mod tests {
             .filter(|w| w.code == "tight-gap")
             .collect();
         assert_eq!(tight.len(), 1, "{:?}", report.warnings);
-        assert_eq!(tight[0].line, "one");
+        assert_eq!(tight[0].line.as_deref(), Some("one"));
         assert!(tight[0].message.contains("two"), "{tight:?}");
 
         // Within each take's speech the narration is the take, unfaded.
@@ -1376,7 +1604,7 @@ mod tests {
         assert!(report.refused.is_empty(), "{:?}", report.refused);
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
         assert_eq!(report.warnings[0].code, "recorded-against-old-text");
-        assert_eq!(report.warnings[0].line, "hook");
+        assert_eq!(report.warnings[0].line.as_deref(), Some("hook"));
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["warnings"][0]["code"], "recorded-against-old-text");
@@ -1475,7 +1703,7 @@ mod tests {
         fs::remove_file(&wav).unwrap();
         fs::create_dir(&wav).unwrap();
         fs::write(wav.join("keep"), b"x").unwrap();
-        let result = export(&dir, &ExportOptions::default());
+        let result = export(&dir, &ExportOptions::default(), &unchanged_film(&dir));
         assert!(result.is_err(), "{result:?}");
         assert!(
             !dir.join("export/manifest.json").exists(),
@@ -1542,6 +1770,119 @@ mod tests {
         assert_eq!(report.refused, []);
         assert_eq!(report.lines[0].take_file, "takes/hook/002.wav");
         assert_eq!(report.lines[0].chosen_by, "claude");
+    }
+
+    #[test]
+    fn export_refuses_a_missing_or_changed_film() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let opts = ExportOptions::default();
+        let refused = |film: FilmOnDisk| {
+            let report = export(&dir, &opts, &film).unwrap();
+            assert!(!dir.join("export/narration.wav").exists());
+            refused_codes(&report)
+        };
+        assert_eq!(refused(FilmOnDisk::Missing), vec!["film-missing"]);
+        let FilmOnDisk::Found {
+            size,
+            modified,
+            duration_s,
+        } = unchanged_film(&dir)
+        else {
+            unreachable!()
+        };
+        let found = |size: u64, modified: &str, duration_s: Option<f64>| FilmOnDisk::Found {
+            size,
+            modified: modified.to_owned(),
+            duration_s,
+        };
+        assert_eq!(
+            refused(found(size + 1, &modified, duration_s)),
+            vec!["film-changed"]
+        );
+        assert_eq!(
+            refused(found(size, "2026-11-23T08:00:00Z", duration_s)),
+            vec!["film-changed"]
+        );
+        assert_eq!(
+            refused(found(size, &modified, Some(52.0))),
+            vec!["film-changed"]
+        );
+        // Without ffprobe the duration is unknown: size and time decide.
+        let report = export(&dir, &opts, &found(size, &modified, None)).unwrap();
+        assert_eq!(report.refused, []);
+        // And a refusal afterwards removes the manifest.
+        assert_eq!(
+            refused_codes(&export(&dir, &opts, &FilmOnDisk::Missing).unwrap()),
+            vec!["film-missing"]
+        );
+        assert!(!dir.join("export/manifest.json").exists());
+    }
+
+    fn choose_by(dir: &Path, take: u32, by: &str) {
+        let event = Event::new(
+            "hook",
+            take,
+            EventKind::Chosen(Chosen { by: by.to_owned() }),
+        );
+        ledger::append(dir, &event).unwrap();
+    }
+
+    #[test]
+    fn a_change_while_rendering_renders_again() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let first = take(&dir, "hook", Some((2.0, 3.0)));
+        let second = take(&dir, "hook", Some((2.5, 3.0)));
+        choose(&dir, &first);
+        let mut renders = 0;
+        // The lock is free while rendering: `append` takes it.
+        let report = export_observed(
+            &dir,
+            &ExportOptions::default(),
+            &unchanged_film(&dir),
+            &mut || {
+                renders += 1;
+                if renders == 1 {
+                    choose_by(&dir, second.take, "claude");
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(renders, 2);
+        assert_eq!(report.refused, []);
+        assert_eq!(report.lines[0].take_file, "takes/hook/002.wav");
+        let m: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
+        assert_eq!(m["lines"][0]["chosen_by"], "claude");
+    }
+
+    #[test]
+    fn a_state_that_keeps_changing_refuses_export() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        assert_eq!(run(&dir, false).refused, []);
+        let mut renders = 0;
+        let report = export_observed(
+            &dir,
+            &ExportOptions::default(),
+            &unchanged_film(&dir),
+            &mut || {
+                renders += 1;
+                choose_by(&dir, t.take, &format!("agent-{renders}"));
+            },
+        )
+        .unwrap();
+        assert_eq!(renders, 2, "one render, then one more");
+        assert_eq!(refused_codes(&report), vec!["state-changed"]);
+        assert!(!dir.join("export/manifest.json").exists());
+        let leftovers: Vec<_> = fs::read_dir(dir.join("export"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert_eq!(leftovers, Vec::<std::ffi::OsString>::new());
     }
 
     #[test]
@@ -1833,9 +2174,19 @@ mod tests {
         let m = manifest(&dir);
         assert_eq!(m["processing"], "clean");
         assert_eq!(m["loudness_lufs"], measured.integrated_lufs);
-        // No room tone was recorded: noise reduction was skipped, and why.
+        // No room tone was recorded: noise reduction was skipped, and why,
+        // also as a warning.
         let note = m["lines"][0]["noise_reduction"].as_str().unwrap();
         assert!(note.starts_with("skipped: no room tone"), "{note}");
+        let skipped: Vec<&ExportWarning> = report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "noise-reduction-skipped")
+            .collect();
+        assert_eq!(skipped.len(), 1, "{:?}", report.warnings);
+        assert_eq!(skipped[0].line.as_deref(), Some("hook"));
+        assert!(skipped[0].message.contains("no room tone"), "{skipped:?}");
+        assert_eq!(m["warnings"][0]["code"], "noise-reduction-skipped");
     }
 
     #[test]
@@ -1874,6 +2225,22 @@ mod tests {
             let reduction = settings.limiter_max_reduction_db.unwrap();
             assert!(reduction > 5.0 && reduction <= 6.0, "{reduction}");
             assert_eq!(manifest(&dir)["loudness_target_reached"], false);
+            let missed = report
+                .warnings
+                .iter()
+                .find(|w| w.code == "loudness-target-missed")
+                .expect("a loudness warning");
+            assert_eq!(missed.line, None);
+            assert!(missed.message.contains("LUFS"), "{missed:?}");
+            let listed = manifest(&dir)["warnings"].clone();
+            assert!(
+                listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w["code"] == "loudness-target-missed" && w.get("line").is_none()),
+                "{listed}"
+            );
         }
     }
 
@@ -1899,7 +2266,7 @@ mod tests {
         };
         crate::room::save_room_tone(&dir, &noise(5.0), RATE, jiff::Timestamp::now(), &tone)
             .unwrap();
-        export_with(
+        let report = export_with(
             &dir,
             ExportConfig {
                 processing: Processing::Clean,
@@ -1908,6 +2275,14 @@ mod tests {
         );
         let note = manifest(&dir)["lines"][0]["noise_reduction"].clone();
         assert!(note.as_str().unwrap().starts_with("afftdn 10 dB"), "{note}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| w.code != "noise-reduction-skipped"),
+            "{:?}",
+            report.warnings
+        );
         let (clean, _) = decode(&ffmpeg, &dir.join("export/narration.wav"));
         assert!(
             peak_at(&clean).abs_diff(504_000) <= 1,

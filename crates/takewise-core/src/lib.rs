@@ -36,8 +36,8 @@ pub use edit::{
 };
 pub use error::{Error, Result};
 pub use export::{
-    ExportOptions, ExportReport, ExportSettings, ExportWarning, ManifestLine, ManifestWord,
-    Refusal, export, narration_file,
+    ExportOptions, ExportReport, ExportSettings, ExportWarning, FilmOnDisk, ManifestLine,
+    ManifestWord, Refusal, export, narration_file,
 };
 pub use fsutil::{ProjectLock, lock, write_atomic};
 pub use ledger::{

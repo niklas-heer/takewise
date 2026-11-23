@@ -268,6 +268,60 @@ fn choose_then_export_writes_wav_and_manifest() {
 }
 
 #[test]
+fn export_refuses_a_changed_or_missing_film() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    let take = record_take(&dir, "hook");
+    takewise()
+        .arg("choose")
+        .arg(&dir)
+        .args(["hook", &take.take.to_string()])
+        .assert()
+        .success();
+    let raw = ["--processing", "raw"];
+    let export = |dir: &Path| json(takewise().arg("export").arg(dir).args(raw));
+
+    // A film one second longer: the timings may no longer fit.
+    let film = tmp.path().join("film.wav");
+    write_take_wav(&film, &vec![0; 8_000 * 105 / 2], 8_000).unwrap();
+    let (code, value) = export(&dir);
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(
+        value["data"]["refused"][0]["code"], "film-changed",
+        "{value}"
+    );
+    assert!(!dir.join("export/narration.wav").exists());
+    takewise()
+        .arg("export")
+        .arg(&dir)
+        .args(raw)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("film-changed"))
+        .stderr(predicate::str::contains("--refresh-film"));
+
+    // After --refresh-film it exports.
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .arg("--refresh-film")
+        .assert()
+        .success();
+    let (code, value) = export(&dir);
+    assert_eq!(code, 0, "{value}");
+
+    fs::remove_file(&film).unwrap();
+    let (code, value) = export(&dir);
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(
+        value["data"]["refused"][0]["code"], "film-missing",
+        "{value}"
+    );
+    assert!(!dir.join("export/manifest.json").exists());
+}
+
+#[test]
 fn export_flags_override_config() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = init(tmp.path());
@@ -305,6 +359,21 @@ fn export_flags_override_config() {
     // The config is not changed by the flags.
     let config = fs::read_to_string(dir.join("project.toml")).unwrap();
     assert!(config.contains("processing = \"clean\""), "{config}");
+    // The configured clean export skips noise reduction for this silent
+    // pre-roll, and says so in the text and the manifest's warnings.
+    if takewise_core::ffmpeg::Ffmpeg::find().is_some() {
+        takewise()
+            .arg("export")
+            .arg(&dir)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "warning: hook: takes/hook/001.wav: noise reduction skipped: the take's pre-roll is digital silence (a gated input) (noise-reduction-skipped)",
+            ));
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["warnings"][0]["code"], "noise-reduction-skipped");
+    }
     // Values outside the supported set are usage errors.
     let (code, _) = json(
         takewise()

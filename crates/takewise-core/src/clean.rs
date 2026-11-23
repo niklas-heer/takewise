@@ -47,10 +47,7 @@ pub fn choose_room_tone(
     tz: &jiff::tz::TimeZone,
 ) -> Result<RoomTone, String> {
     if is_gated(take_floor_dbfs) {
-        return Err(
-            "the take's pre-roll is digital silence (a gated input); noise reduction skipped"
-                .to_owned(),
-        );
+        return Err("the take's pre-roll is digital silence (a gated input)".to_owned());
     }
     let day = |t: jiff::Timestamp| tz.to_datetime(t).date();
     let same_input: Vec<&RoomTone> = tones
@@ -68,9 +65,7 @@ pub fn choose_room_tone(
     }
     let usable: Vec<&&RoomTone> = same_input.iter().filter(|t| !t.gated).collect();
     if usable.is_empty() {
-        return Err(
-            "the room tone is digital silence (a gated input); noise reduction skipped".to_owned(),
-        );
+        return Err("the room tone is digital silence (a gated input)".to_owned());
     }
     usable
         .iter()

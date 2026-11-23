@@ -761,9 +761,25 @@ impl ExportArgs {
     }
 }
 
+/// The film on disk now, measured like `init` measured it: its size and
+/// modification time, and its duration when `ffprobe` can read it.
+fn film_on_disk(dir: &Path) -> Result<tw::FilmOnDisk, CliError> {
+    let path = Project::open(dir)?.film_path();
+    if !path.exists() {
+        return Ok(tw::FilmOnDisk::Missing);
+    }
+    let (size, modified) = film::stamp(&path)?;
+    let duration_s = film::probe(&path).ok().map(|info| info.duration_s);
+    Ok(tw::FilmOnDisk::Found {
+        size,
+        modified,
+        duration_s,
+    })
+}
+
 fn export(args: &ExportArgs) -> Result<Outcome, CliError> {
     let dir = args.dir.as_path();
-    let report = tw::export(dir, &args.options())?;
+    let report = tw::export(dir, &args.options(), &film_on_disk(dir)?)?;
     if report.refused.is_empty() {
         let narration = dir.join("export").join(&report.narration);
         let mut text = format!(
@@ -786,7 +802,11 @@ fn export(args: &ExportArgs) -> Result<Outcome, CliError> {
         }
         text.push('\n');
         for w in &report.warnings {
-            let _ = writeln!(text, "warning: {}: {} ({})", w.line, w.message, w.code);
+            match &w.line {
+                Some(line) => writeln!(text, "warning: {line}: {} ({})", w.message, w.code),
+                None => writeln!(text, "warning: {} ({})", w.message, w.code),
+            }
+            .ok();
         }
         return Ok(Outcome::new(
             json!({
