@@ -480,11 +480,19 @@ impl RecordingWindow {
         {
             self.message = Some(err);
         }
+        self.pause_checks_while_recording();
     }
 
     fn finish_take(&mut self) {
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
+        self.pause_checks_while_recording();
+    }
+
+    /// Holds the checks back while a take records; they resume once it is
+    /// committed.
+    fn pause_checks_while_recording(&self) {
+        self.checks.set_paused(self.recorder.is_recording());
     }
 
     /// Selects a committed take; returns the message saying so. When its
@@ -534,6 +542,7 @@ impl RecordingWindow {
         );
         let update = self.recorder.tick(&mut *self.media, &self.dir);
         self.show(update);
+        self.pause_checks_while_recording();
     }
 
     /// Shows what the recorder reports and selects a committed take. An

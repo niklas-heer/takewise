@@ -1536,6 +1536,70 @@ fn verdict_appears_after_commit(cx: &mut TestAppContext) {
     );
 }
 
+/// Renders frames until `done` holds for the transcriber's calls.
+fn wait_heard(cx: &mut TestAppContext, f: &Fixture, gated: &Gated, done: impl Fn(usize) -> bool) {
+    for _ in 0..2000 {
+        frame(cx, f.window);
+        if done(gated.heard.lock().expect("heard").len()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("timed out waiting for the checks");
+}
+
+#[gpui_kit::test]
+fn checks_wait_while_a_take_records(cx: &mut TestAppContext) {
+    let (release, gate) = channel();
+    let gated = Arc::new(Gated {
+        gate: Mutex::new(gate),
+        heard: Mutex::new(Vec::new()),
+    });
+    let f = open_checked(cx, &[(DEVICE, 48_000)], |_| {}, gated.clone());
+    record_take(cx, &f); // a take 1: its check starts and waits
+    begin(cx, &f, 200.0);
+    f.media.set_now(200.5);
+    press(cx, f.window, &["space"]); // a take 2: queued
+    wait_heard(cx, &f, &gated, |n| n == 1);
+
+    // A take starts while take 1 is checked: that check finishes, the
+    // next one waits for the take to end.
+    press(cx, f.window, &["down"]);
+    begin(cx, &f, 300.0);
+    release.send(()).expect("the check waits");
+    let first = tw::TakeRef {
+        line: "a".to_owned(),
+        take: 1,
+    };
+    for _ in 0..2000 {
+        f.media.set_now(300.2);
+        frame(cx, f.window);
+        if f.view
+            .read_with(cx, |view, _| !view.checks.is_pending(&first))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !f.view
+            .read_with(cx, |view, _| view.checks.is_pending(&first)),
+        "the running check finished"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(gated.heard.lock().expect("heard").len(), 1, "take 2 waits");
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+
+    f.media.set_now(300.5);
+    press(cx, f.window, &["space"]); // b take 1 committed: checks resume
+    wait_heard(cx, &f, &gated, |n| n >= 2);
+    assert_eq!(
+        gated.heard.lock().expect("heard")[1],
+        f.dir.join("takes/a/002.wav")
+    );
+    drop(release);
+}
+
 #[gpui_kit::test]
 fn a_reload_queues_a_take_whose_check_went_stale(cx: &mut TestAppContext) {
     let f = open_with(cx, &[(DEVICE, 48_000)], |_| {});
