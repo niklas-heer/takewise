@@ -1,7 +1,7 @@
 //! Take files: recording into partial files, committing numbered takes, and
 //! recovering after a crash.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -765,6 +765,11 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
     let ledger = ledger::read(dir)?;
     let mut adopted = BTreeSet::new();
     let mut metadata_without_audio = Vec::new();
+    // Audio renamed below stays locked until it is adopted: releasing and
+    // retaking the lock could find it still held by a process another
+    // thread is spawning (a child briefly shares this process's open
+    // files), and skip the take as if a recording held it.
+    let mut renamed: BTreeMap<PathBuf, Hold> = BTreeMap::new();
     for meta in scan(dir)?.unlogged_metadata(&ledger) {
         match interrupted_commit(dir, meta) {
             Some(partial_wav) => {
@@ -772,9 +777,10 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
                 if matches!(held, Hold::Recorder) {
                     continue;
                 }
-                let wav = dir.join(meta.path.with_extension("wav"));
+                let rel = meta.path.with_extension("wav");
+                let wav = dir.join(&rel);
                 fs::rename(&partial_wav, &wav).map_err(io(&wav))?;
-                drop(held);
+                renamed.insert(rel, held);
             }
             None => metadata_without_audio.push(meta.path.clone()),
         }
@@ -794,7 +800,9 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
         ..RepairReport::default()
     };
     for wav in files.unlogged_wavs(&ledger) {
-        let held = hold(&dir.join(&wav.path));
+        let held = renamed
+            .remove(&wav.path)
+            .unwrap_or_else(|| hold(&dir.join(&wav.path)));
         if matches!(held, Hold::Recorder) {
             continue;
         }
@@ -1128,6 +1136,40 @@ mod tests {
         let again = repair(dir).unwrap();
         assert!(again.adopted.is_empty(), "repair is idempotent");
         assert_eq!(read(dir).unwrap().events.len(), 3);
+    }
+
+    /// A process spawned on another thread briefly shares this process's
+    /// open files, and with them their locks. `repair` must not release
+    /// and retake the lock on the audio it renamed: a lock that lingers in
+    /// such a child would look like a recording window's, and the take
+    /// would be skipped.
+    #[test]
+    fn repair_completes_interrupted_commits_while_processes_spawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/usr/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        let skipped = (0..100)
+            .filter(|_| {
+                let tmp = crate::testutil::project_tempdir();
+                let dir = tmp.path();
+                crash_after_metadata_rename(dir, 1);
+                repair(dir).unwrap().adopted.is_empty()
+            })
+            .count();
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(skipped, 0, "takes skipped as if a recording held them");
     }
 
     #[test]
