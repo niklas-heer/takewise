@@ -29,7 +29,9 @@
 //! "the light is below" heard as "the lights below" is a difference. Two
 //! words on one side against their concatenation on the other ("every day"
 //! and "everyday", "every one" and "everyone") are one substitution, a
-//! possible mishearing, since they often mean different things. Diffs name
+//! possible mishearing, since they often mean different things; joined by a
+//! hyphen they are one word spelled two ways ("voice-over" and "voiceover",
+//! "e-mail" and "email") and match. Diffs name
 //! the words as written in the script or said in the transcript, lowercased
 //! and without punctuation: `second` (not `2nd`), `1,867`, `eighteen
 //! sixty-eight`, `link's`.
@@ -82,6 +84,8 @@ pub struct Token {
     /// Punctuation such as a comma stands between this token and the one
     /// before it, so the two are never one number.
     after_break: bool,
+    /// A hyphen joins this token to the one before it: "voice-over".
+    after_hyphen: bool,
     /// The words as written or said, lowercased and without punctuation,
     /// which diffs name: `second`, `1,867`, `eighteen sixty-eight`, `$5`.
     written: String,
@@ -97,6 +101,7 @@ impl Token {
             text: text.into(),
             apostrophe,
             after_break: false,
+            after_hyphen: false,
             written: String::new(),
         };
         token.written = token.display();
@@ -214,8 +219,8 @@ enum Join {
     /// first` and `21st`), or a script clock time (`11:30` heard as `11 30`
     /// or "nine thirty" for `9:30`).
     Same,
-    /// Two words heard or written as one (`every day` and `everyday`): a
-    /// possible mishearing.
+    /// Two separate words heard or written as one (`every day` and
+    /// `everyday`): a possible mishearing.
     Compound,
 }
 
@@ -231,7 +236,13 @@ fn pair_is_one(first: &Token, second: &Token, one: &Token, one_is_script: bool) 
         && one.text.starts_with(&first.text)
         && one.text.ends_with(&second.text);
     if first.is_plain_word() && second.is_plain_word() && one.is_plain_word() && joined {
-        return Some(Join::Compound);
+        // A hyphenated pair is one word spelled two ways ("voice-over",
+        // "voiceover"); an open pair may mean something else ("every one").
+        return Some(if second.after_hyphen {
+            Join::Same
+        } else {
+            Join::Compound
+        });
     }
     if second.after_break {
         return None;
@@ -289,6 +300,7 @@ fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
             .find(|&i| items[i].sep == Sep::Break)
             .unwrap_or(items.len());
         let after_break = lexed.sep == Sep::Break;
+        let after_hyphen = lexed.sep == Sep::Hyphen;
         if let Some((tokens, next)) = number_phrase(&items[..end], &words[..end], k) {
             let last = items
                 .get(next.saturating_sub(1))
@@ -309,6 +321,7 @@ fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
                 };
                 let token = Token {
                     after_break,
+                    after_hyphen,
                     written,
                     ..token
                 };
@@ -320,6 +333,7 @@ fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
         if let Item::Word(token) | Item::Other(token) = &lexed.item {
             let token = Token {
                 after_break,
+                after_hyphen,
                 ..token.clone()
             };
             out.push((token, lexed.part, lexed.part));
@@ -1790,7 +1804,7 @@ mod tests {
             ("every day", "everyday", "every day", "everyday", 0.0),
             ("every one", "everyone", "every one", "everyone", 0.0),
             (
-                "Kindred is free and open-source.",
+                "Kindred is free and open source.",
                 "Kindred is free and opensource",
                 "open source",
                 "opensource",
@@ -1811,6 +1825,30 @@ mod tests {
         // Only the two words that make it up.
         let diffs = align(&normalize("every day"), &heard("everyone"));
         assert_ne!(diffs, []);
+    }
+
+    #[test]
+    fn align_joins_hyphenated_words() {
+        for (script, said) in [
+            ("a voice-over", "a voiceover"),
+            ("send an e-mail", "send an email"),
+            ("free and open-source", "free and opensource"),
+            ("a voice-over", "a voice-over"),
+            ("a voice-over", "a voice over"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        // An open compound is still a possible mishearing.
+        assert_eq!(align(&normalize("every one"), &heard("everyone")).len(), 1);
     }
 
     #[test]
