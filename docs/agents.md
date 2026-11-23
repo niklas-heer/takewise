@@ -1,0 +1,229 @@
+# Takewise for agents
+
+Takewise splits narration work between a person and an agent. The narrator reads the lines in the recording window; you, the agent, write the script, read the checks of every take, judge and choose takes, export the narration and place it in the film's edit. Everything goes through the `takewise` command and plain files, so you never need the window.
+
+This guide walks one project through the whole loop. Every command in it is run by a test (`crates/takewise/tests/agents_doc.rs`) against a scratch project, and every JSON example below is checked against the real output, so they stay true.
+
+## Rules
+
+- Add `--json` to any command: it prints one JSON object, `{"ok":true,"data":…}` or `{"ok":false,"error":{"code":…,"message":…},"data":…}`.
+- Exit codes: 0 success, 1 a finding (`data` says what: an export that refuses, `status --strict` with open lines, a failed `doctor` check), 2 a usage or setup error (`error.code` says which, such as `missing-model` or `script-changed`).
+- Never edit `takes.jsonl` or anything under `takes/`. Takes are only ever added; choices and judgments are new events written by `choose` and `judge`.
+- Write `script.toml` freely before recording. Once takes exist, change one field at a time with `takewise script set … --expect <script_version>`, so an edit made against a script the narrator changed meanwhile is refused instead of lost.
+- Flag, don't decide: checks and judgments rank takes; only `choose` (yours or the narrator's) picks one.
+
+## 1. Check the setup
+
+```sh
+takewise models install --json
+takewise doctor --json
+```
+
+`models install` downloads the speech model (1.5 GB) once, resuming an interrupted download, and verifies it; it reports `already-installed` when it is there. `doctor` checks `whisper-cli`, the model, `ffmpeg`, the microphone permission and the audio devices; each failed check in `data.checks` says how to fix it.
+
+## 2. Create the project and write the script
+
+```sh
+takewise init promo.takewise --film renders/promo.mp4 --json
+```
+
+`init` measures the film with `ffprobe` and writes `project.toml` and an empty `script.toml`. Write the lines: an `id` (lowercase letters, digits and `-`, unique), the `start` in seconds of film time, an optional `end` (otherwise the slot runs to the next line's start or the film's end), the `text` and an optional `note` for the narrator.
+
+<!-- file: promo.takewise/script.toml -->
+```toml
+[[line]]
+id = "hook"
+start = 2.0
+text = "Hello there."
+note = "warm, unhurried"
+
+[[line]]
+id = "close"
+start = 6.0
+end = 9.5
+text = "See you at the reunion."
+```
+
+```sh
+takewise status promo.takewise --json
+```
+
+`status` validates the script (starts in order, slots inside the film) and lists `problems`; fix them before the narrator records. Keep `script_version` for later edits.
+
+<!-- output of: takewise status promo.takewise --json -->
+```json
+{
+  "ok": true,
+  "data": {
+    "script_version": "4f1c…",
+    "film": { "path": "/…/renders/promo.mp4", "missing": false, "changed": false },
+    "lines": [
+      { "id": "hook", "text": "Hello there.", "start": 2.0, "end": 6.0, "takes": [], "chosen": null, "proposed": null }
+    ],
+    "problems": [],
+    "notices": []
+  }
+}
+```
+
+## 3. The narrator records
+
+```sh
+takewise record promo.takewise
+```
+
+This opens the recording window in `Takewise.app`; the narrator records one or more takes per line and may choose some. Wait for them. The window checks each take as it is recorded; you can follow along with `status`, which reloads from the files every time.
+
+## 4. Read the checks
+
+```sh
+takewise check promo.takewise --json
+```
+
+`check` checks every take without a current check (the window usually has already) and prints what it found. A take gets a verdict, `keep`, `listen` or `retake`, with reasons: no speech, clipping, missing, extra or misheard words (named, with times), an overrun of the line's slot, an early start, background noise. The words come from `whisper-cli` without the script as a prompt, so it does not hear what it expects. A `retake` verdict is a finding about the take, not an error: the command still exits 0. Times here (`transcript`, `word_diffs`, `speech`) are seconds from the take's first sample; `overrun_s` is how far the speech ends past the line's slot (negative: before it).
+
+<!-- output of: takewise check promo.takewise --json -->
+```json
+{
+  "ok": true,
+  "data": {
+    "checks": [
+      {
+        "line": "hook",
+        "take": 1,
+        "verdict": "keep",
+        "reasons": [],
+        "transcript": [{ "text": "Hello", "start": 2.1, "end": 2.4 }, { "text": "there.", "start": 2.5, "end": 2.8 }],
+        "word_diffs": [],
+        "speech": [2.0, 3.0],
+        "overrun_s": -3.0,
+        "peak_dbfs": -6.4,
+        "checker": "takewise 0.1.0 whisper ggml-large-v3-turbo.bin pre=hp60+norm"
+      },
+      {
+        "line": "close",
+        "take": 1,
+        "verdict": "retake",
+        "reasons": [
+          { "code": "missing-words", "message": "missing “see”, “you”, “at”" },
+          { "code": "possible-mishearing", "message": "heard “hello” for “the”, “there” for “reunion”" }
+        ],
+        "word_diffs": [{ "kind": "missing", "expected": "see", "heard": null, "at": 2.1 }]
+      }
+    ]
+  }
+}
+```
+
+```sh
+takewise status promo.takewise --json
+```
+
+In `status`, each take has its `effective` verdict (the check's, or the latest judgment's), the `reason` behind it, its `speech` (start and end in seconds of the take), and whether it was recorded against text the line no longer has. Each line has the `proposed` take (the best ranked: `keep` before `listen` and unchecked before `retake`, then fewer word differences, then less overrun, then your `score`, then newest) and the `chosen` one.
+
+<!-- output of: takewise status promo.takewise --json -->
+```json
+{
+  "ok": true,
+  "data": {
+    "lines": [
+      {
+        "id": "hook",
+        "takes": [
+          {
+            "take": 1,
+            "file": "takes/hook/001.wav",
+            "effective": "keep",
+            "verdict_source": "check",
+            "reason": null,
+            "speech": [2.0, 3.0],
+            "stale_check": false,
+            "recorded_against_old_text": false
+          }
+        ],
+        "chosen": null,
+        "proposed": 1
+      }
+    ]
+  }
+}
+```
+
+## 5. Judge and choose
+
+Listen to the takes yourself if you can (the WAVs are in `takes/<line>/`), and add a judgment when you disagree with a check or want to rank takes. A judgment overrides the check's verdict for ranking; the `score` (0 to 1) breaks ties between takes with the same verdict.
+
+```sh
+takewise judge promo.takewise close 1 --verdict listen --reason "words differ: check the ending" --by claude-opus-5-5 --score 0.4 --json
+takewise choose promo.takewise hook 1 --by claude-opus-5-5 --json
+takewise choose promo.takewise close 1 --by claude-opus-5-5 --json
+takewise status promo.takewise --strict --json
+```
+
+`choose` refuses a take whose file is missing. `status --strict` exits 0 once every line has a chosen take and no problem is left; otherwise 1.
+
+## 6. Export
+
+```sh
+takewise export promo.takewise --json
+```
+
+`export` writes `export/narration.wav` (or `.flac`): one mono file exactly as long as the film, starting at its first frame, with each line's chosen take placed where it was recorded against the picture. The project's `[export]` settings choose the format and processing; new projects export `clean` (high-pass, noise reduction from the setup check's room tone, −16 LUFS). It refuses (exit 1) with the line ids when a line has no chosen take, a take has no speech, or two lines' speech overlaps; `--use-proposed` fills unchosen lines with their proposed take. The command reports the files, the settings and loudness it used, the lines and any warnings:
+
+<!-- output of: takewise export promo.takewise --json -->
+```json
+{
+  "ok": true,
+  "data": {
+    "narration": "promo.takewise/export/narration.wav",
+    "manifest": "promo.takewise/export/manifest.json",
+    "settings": { "processing": "clean", "format": "wav", "sample_rate": 48000, "bit_depth": 24, "loudness_lufs": -16.0 },
+    "lines": [{ "id": "hook", "take_file": "takes/hook/001.wav", "speech_film_s": [2.0, 3.0] }],
+    "warnings": []
+  }
+}
+```
+
+`export/manifest.json` describes the narration file for whatever places it:
+
+```sh
+cat promo.takewise/export/manifest.json
+```
+
+<!-- output of: cat promo.takewise/export/manifest.json -->
+```json
+{
+  "film": { "path": "/…/renders/promo.mp4", "duration_s": 51.5 },
+  "narration": { "file": "narration.wav", "size": 7416068, "sha256": "4aa9…" },
+  "processing": "clean",
+  "sample_rate": 48000,
+  "source_sample_rate": 48000,
+  "bit_depth": 24,
+  "loudness_lufs": -16.0,
+  "true_peak_dbtp": -10.2,
+  "lines": [
+    {
+      "id": "hook",
+      "text": "Hello there.",
+      "take_file": "takes/hook/001.wav",
+      "chosen_by": "claude-opus-5-5",
+      "source_samples": [88800, 151200],
+      "dest_samples": [88800, 151200],
+      "speech_film_s": [2.0, 3.0],
+      "words_film_s": [{ "text": "Hello", "start": 2.1, "end": 2.4 }]
+    }
+  ]
+}
+```
+
+## 7. Place it in DaVinci Resolve
+
+Takewise has no Resolve code; place the export with your Resolve tools:
+
+1. Import the file named by the manifest's `narration.file` (in `export/`) into the media pool.
+2. Add a mono audio track to the film's timeline and place the narration at the timeline's start, so its sample 0 lines up with the film's first frame.
+3. For each entry in `lines`, add a timeline marker at `speech_film_s[0]` seconds, named after the line's `id`, with its `text` as the note.
+
+To place takes one by one instead, put each line's `take_file` (the raw original at `source_sample_rate`) at `dest_samples[0] / sample_rate` seconds and trim it to `source_samples`. The positions are exact sample offsets.
+
+When the narrator re-records a line later, run the loop from step 4 again: `check`, read `status`, `choose`, `export`.

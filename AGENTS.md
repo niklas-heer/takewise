@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Project
 
-Takewise is a macOS app for recording voiceover narration over a finished film: a teleprompter timed to the picture, takes per line, automatic checks of every take, and a folder format plus CLI that agents use to write the script, read verdicts and export the result. Read [README.md](README.md) for the goal and [docs/design.md](docs/design.md) for scope, the folder format, the CLI and milestones. Implementation plans live in `docs/plans/`.
+Takewise is a macOS app for recording voiceover narration over a finished film: a teleprompter timed to the picture, takes per line, automatic checks of every take, and a folder format plus CLI that agents use to write the script, read verdicts and export the result. Read [README.md](README.md) for the goal and [docs/design.md](docs/design.md) for scope, the folder format, the CLI and milestones. Implementation plans live in `docs/plans/`. An agent that uses Takewise for narration, rather than developing it, follows [docs/agents.md](docs/agents.md); releases follow [RELEASE.md](RELEASE.md).
 
 ## Invariants
 
