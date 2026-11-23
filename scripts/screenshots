@@ -9,7 +9,10 @@
 # checks them with whisper-cli, and renders the recording window's states
 # offscreen with fake media: nothing plays, no microphone opens, no window
 # appears. It also records two takes in a window and puts the renders
-# together as the short loop docs/images/loop.webp with img2webp. The PNGs
+# together as the short loop docs/images/loop.webp with img2webp, runs the
+# README's agent example on a copy of the project (its transcript lands in
+# build/screenshots/cli/transcript.txt) and draws that export as
+# docs/images/export.png. The PNGs
 # are then compressed with pngquant and oxipng. Needs ffmpeg, whisper-cli,
 # the speech model (`takewise models install`), and
 # `brew install webp pngquant oxipng`.

@@ -14,12 +14,15 @@
 //! of such renders of two takes recorded and checked in a window, with
 //! close-ups of their verdicts, put together with `img2webp`; the
 //! repository's social preview `<out>/social-preview.png` sets a render
-//! beside the app's icon and name. Nothing plays, no microphone opens, no window
+//! beside the app's icon and name. Last, the README's agent example runs
+//! for real on a copy of the project (`<work>/cli/transcript.txt`), and its
+//! export is drawn as `<out>/export.png`. Nothing plays, no microphone opens, no window
 //! appears and no key or mouse event is sent. `scripts/screenshots`
 //! compresses the PNGs afterwards.
 
 use std::cell::RefCell;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
@@ -113,6 +116,17 @@ const TAKES: &[(&str, &str)] = &[
     (
         "storm",
         "From up here, a storm is something you look down on.",
+    ),
+    // Read a little faster than the others, to fit its slot with room.
+    (
+        "ocean",
+        "[[rate 190]] Below, the open ocean, and rows of cloud that run for hundreds of miles. \
+         The wind lines them up like waves on a beach, one behind the other, \
+         all the way to the edge of the sky.",
+    ),
+    (
+        "desert",
+        "Then the desert, dry and red, and the next sunrise only minutes away.",
     ),
 ];
 
@@ -270,6 +284,10 @@ fn prepare(work: &Path) -> Result<Demo, String> {
         check_all(project)?;
         tw::choose_take(project, "orbit", 1, "narrator").map_err(fail)?;
         tw::choose_take(project, "coast", 1, "narrator").map_err(fail)?;
+    }
+    // The loop's project was copied before these lines had takes.
+    for line in ["ocean", "desert"] {
+        tw::choose_take(&dir, line, 1, "narrator").map_err(fail)?;
     }
     Ok(Demo {
         dir,
@@ -815,41 +833,17 @@ fn scale_of(image: &RgbaImage, window_width: f32) -> f32 {
     image.width() as f32 / window_width
 }
 
-/// How [`compose`] lays images out.
-#[derive(Clone, Copy)]
-enum Axis {
-    /// Side by side, top-aligned.
-    Row,
-    /// One below the other, left-aligned.
-    Column,
-}
-
-/// `images` laid out along `axis`, `gap` pixels apart, on `fill`.
-fn compose(images: &[RgbaImage], axis: Axis, gap: u32, fill: image::Rgba<u8>) -> RgbaImage {
+/// `images` one below the other, left-aligned, `gap` pixels apart, on
+/// `fill`.
+fn stack(images: &[RgbaImage], gap: u32, fill: image::Rgba<u8>) -> RgbaImage {
     let gaps = gap * u32::try_from(images.len().saturating_sub(1)).unwrap_or(0);
-    let (width, height) = match axis {
-        Axis::Row => (
-            images.iter().map(RgbaImage::width).sum::<u32>() + gaps,
-            images.iter().map(RgbaImage::height).max().unwrap_or(0),
-        ),
-        Axis::Column => (
-            images.iter().map(RgbaImage::width).max().unwrap_or(0),
-            images.iter().map(RgbaImage::height).sum::<u32>() + gaps,
-        ),
-    };
+    let width = images.iter().map(RgbaImage::width).max().unwrap_or(0);
+    let height = images.iter().map(RgbaImage::height).sum::<u32>() + gaps;
     let mut out = RgbaImage::from_pixel(width, height, fill);
-    let mut at = 0;
+    let mut y = 0;
     for image in images {
-        match axis {
-            Axis::Row => {
-                image::imageops::replace(&mut out, image, i64::from(at), 0);
-                at += image.width() + gap;
-            }
-            Axis::Column => {
-                image::imageops::replace(&mut out, image, 0, i64::from(at));
-                at += image.height() + gap;
-            }
-        }
+        image::imageops::replace(&mut out, image, 0, i64::from(y));
+        y += image.height() + gap;
     }
     out
 }
@@ -958,7 +952,9 @@ async fn shoot(demo: &Demo, work: &Path, out: &Path, cx: &mut AsyncApp) -> Resul
     recording(demo, work, out, cx).await?;
     social_preview(demo, work, out, cx).await?;
     take_loop(demo, work, out, cx).await?;
-    take_list(demo, out, cx).await
+    take_list(demo, out, cx).await?;
+    let cli = agent_session(demo, work)?;
+    export_strip(&cli, out, cx).await
 }
 
 /// The setup check's voice and room steps with their results: the panel
@@ -992,18 +988,17 @@ async fn setup_check(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     shot.update(cx, RecordingWindow::setup_next);
     shot.close(cx);
 
-    // The setup panel sits between the film and the side column.
+    // The setup panel sits between the film and the side column; each
+    // step is an image of its own, so a narrow page stacks them.
     let x = WINDOW.0 - 300.0 - 380.0;
     let scale = scale_of(&voice, WINDOW.0);
-    let steps = [
-        framed(&crop(&voice, WINDOW.0, (x, 0.0, 380.0, 236.0)), scale),
-        framed(&crop(&room, WINDOW.0, (x, 0.0, 380.0, 168.0)), scale),
-    ];
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let gap = (24.0 * scale) as u32;
     write_png(
-        &out.join("setup-check.png"),
-        &compose(&steps, Axis::Row, gap, TRANSPARENT),
+        &out.join("setup-voice.png"),
+        &framed(&crop(&voice, WINDOW.0, (x, 0.0, 380.0, 236.0)), scale),
+    )?;
+    write_png(
+        &out.join("setup-room.png"),
+        &framed(&crop(&room, WINDOW.0, (x, 0.0, 380.0, 168.0)), scale),
     )
 }
 
@@ -1030,7 +1025,8 @@ async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     let image = shot.render(cx).await?;
     shot.close(cx);
     // The panel (between the film and the side column) down to the film
-    // volume, and the meter row under the film.
+    // volume, and the meter row under the film: two cards, left-aligned,
+    // each as wide as what it holds.
     let scale = scale_of(&image, WINDOW.0);
     let panel = crop(
         &image,
@@ -1038,13 +1034,14 @@ async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
         (WINDOW.0 - 300.0 - 320.0, 0.0, 319.0, 362.0),
     );
     let meter = crop(&image, WINDOW.0, (266.0, 500.0, 374.0, 44.0));
-    let both = compose(
-        &[panel, meter],
-        Axis::Column,
-        0,
-        opaque(super::colors::PANEL),
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let gap = (12.0 * scale) as u32;
+    let both = stack(
+        &[framed(&panel, scale), framed(&meter, scale)],
+        gap,
+        TRANSPARENT,
     );
-    write_png(&out.join("audio-panel.png"), &framed(&both, scale))
+    write_png(&out.join("audio-panel.png"), &both)
 }
 
 /// A take of the long ocean line being recorded, the pace guide on its
@@ -1136,17 +1133,35 @@ async fn social_preview(
         icon: render_image(&icon),
         window: render_image(&window),
     };
+    let image = render_view(card, CARD, cx).await?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let small = image::imageops::resize(
+        &image,
+        CARD.0 as u32,
+        CARD.1 as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    write_png(&out.join("social-preview.png"), &small)
+}
+
+/// Renders `view` offscreen in a hidden window of `width`×`height`
+/// logical pixels, at the screen's scale.
+async fn render_view<V: gpui_kit::Render + 'static>(
+    view: V,
+    (width, height): (f32, f32),
+    cx: &mut AsyncApp,
+) -> Result<RgbaImage, String> {
     let (handle, _) = cx.update(|cx| {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(0.), px(0.)),
-                size: size(px(CARD.0), px(CARD.1)),
+                size: size(px(width), px(height)),
             })),
             focus: false,
             show: false,
             ..WindowOptions::default()
         };
-        gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| card))
+        gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| view))
             .map_err(|err| format!("cannot open the window: {err}"))
     })?;
     let draw = |cx: &mut AsyncApp| {
@@ -1169,14 +1184,7 @@ async fn social_preview(
     cx.update(|cx| {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
     });
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let small = image::imageops::resize(
-        &image,
-        CARD.0 as u32,
-        CARD.1 as u32,
-        image::imageops::FilterType::Lanczos3,
-    );
-    write_png(&out.join("social-preview.png"), &small)
+    Ok(image)
 }
 
 /// An RGBA image as GPUI draws it (BGRA).
@@ -1432,4 +1440,250 @@ async fn take_list(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), Str
             scale,
         ),
     )
+}
+
+/// The agent's part of the README's CLI example, run for real with this
+/// binary on a copy of the demo project named like it
+/// (`<work>/cli/earth.takewise`): `status`, then it judges and chooses the
+/// storm line's take and exports. The transcript goes to
+/// `<work>/cli/transcript.txt`, for the README. Returns the copy.
+fn agent_session(demo: &Demo, work: &Path) -> Result<PathBuf, String> {
+    const STEPS: &[&[&str]] = &[
+        &["status", "earth.takewise"],
+        &[
+            "judge",
+            "earth.takewise",
+            "storm",
+            "1",
+            "--verdict",
+            "keep",
+            "--reason",
+            "clear, unhurried",
+            "--by",
+            "claude-opus-5-5",
+            "--score",
+            "0.8",
+        ],
+        &[
+            "choose",
+            "earth.takewise",
+            "storm",
+            "1",
+            "--by",
+            "claude-opus-5-5",
+        ],
+        &["export", "earth.takewise"],
+    ];
+    let cli = work.join("cli");
+    let project = cli.join("earth.takewise");
+    copy_dir(&demo.dir, &project)?;
+    let exe = std::env::current_exe().map_err(|err| format!("this binary: {err}"))?;
+    let mut transcript = String::new();
+    for args in STEPS {
+        let output = Command::new(&exe)
+            .args(*args)
+            .current_dir(&cli)
+            .output()
+            .map_err(|err| format!("cannot run takewise {}: {err}", args[0]))?;
+        let shown: Vec<String> = args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') {
+                    format!("\"{a}\"")
+                } else {
+                    (*a).to_owned()
+                }
+            })
+            .collect();
+        let _ = writeln!(transcript, "$ takewise {}", shown.join(" "));
+        transcript.push_str(&String::from_utf8_lossy(&output.stdout));
+        transcript.push_str(&String::from_utf8_lossy(&output.stderr));
+        if !output.status.success() && args[0] != "status" {
+            return Err(format!("takewise {} failed:\n{transcript}", args[0]));
+        }
+    }
+    let path = cli.join("transcript.txt");
+    std::fs::write(&path, &transcript).map_err(|err| format!("{}: {err}", path.display()))?;
+    eprintln!("wrote {}", path.display());
+    Ok(project)
+}
+
+/// The narration the agent exported, drawn as one strip as long as the
+/// film, each line's id where the manifest places its take.
+async fn export_strip(project: &Path, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
+    const SIZE: (f32, f32) = (830.0, 206.0);
+    const PAD: f32 = 20.0;
+    const WAVE_H: f32 = 84.0;
+    /// Drawn at this many pixels per logical pixel; GPUI scales it.
+    const WAVE_SCALE: f32 = 2.0;
+    let export = project.join("export");
+    let manifest_path = export.join("manifest.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|err| format!("{}: {err}", manifest_path.display()))?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| format!("{}: {err}", manifest_path.display()))?;
+    let file = manifest["narration"]["file"]
+        .as_str()
+        .ok_or("the manifest names no narration file")?;
+    let (samples, rate) = tw::read_take_wav(&export.join(file)).map_err(|err| err.to_string())?;
+    #[allow(clippy::cast_precision_loss)]
+    let total = samples.len().max(1) as f64;
+    let lines: Vec<(String, f64, f64)> = manifest["lines"]
+        .as_array()
+        .ok_or("the manifest has no lines")?
+        .iter()
+        .filter_map(|line| {
+            let id = line["id"].as_str()?.to_owned();
+            let dest = line["dest_samples"].as_array()?;
+            #[allow(clippy::cast_precision_loss)]
+            let at = |n: usize| dest.get(n)?.as_u64().map(|v| v as f64 / total);
+            Some((id, at(0)?, at(1)?))
+        })
+        .collect();
+
+    let inner = SIZE.0 - 2.0 * PAD;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (width, height) = ((inner * WAVE_SCALE) as u32, (WAVE_H * WAVE_SCALE) as u32);
+    let mut wave = RgbaImage::from_pixel(width, height, opaque(super::colors::PANEL));
+    let band = opaque(super::colors::SELECTED);
+    let ink = opaque(super::colors::ACCENT);
+    let rule = opaque(super::colors::FAINT);
+    let mid = height / 2;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    for x in 0..width {
+        let from = (f64::from(x) / f64::from(width) * total) as usize;
+        let to = ((f64::from(x + 1) / f64::from(width) * total) as usize).min(samples.len());
+        let at = f64::from(x) / f64::from(width);
+        if lines.iter().any(|(_, a, b)| at >= *a && at < *b) {
+            for y in 0..height {
+                wave.put_pixel(x, y, band);
+            }
+        }
+        let peak = samples[from.min(to)..to]
+            .iter()
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        let reach = ((f64::from(peak) / FULL_SCALE).min(1.0) * f64::from(mid - 2)) as u32;
+        wave.put_pixel(x, mid, rule);
+        for y in mid.saturating_sub(reach)..=(mid + reach).min(height - 1) {
+            wave.put_pixel(x, y, ink);
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let film_s = total / f64::from(rate);
+    let level = match (
+        manifest["loudness_lufs"].as_f64(),
+        manifest["true_peak_dbtp"].as_f64(),
+    ) {
+        (Some(lufs), Some(peak)) => format!(" · {lufs:.1} LUFS · true peak {peak:.1} dBTP"),
+        _ => String::new(),
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let strip = Strip {
+        wave: render_image(&wave),
+        title: format!("export/{file}"),
+        detail: format!("{film_s:.1} s, as long as the film{level}"),
+        labels: lines
+            .iter()
+            .map(|(id, at, _)| (id.clone(), (*at * f64::from(inner)) as f32))
+            .collect(),
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        ticks: (0..=(film_s / 10.0).floor() as u32)
+            .map(|n| {
+                let s = f64::from(n * 10);
+                (
+                    format!("{}:{:02}", n * 10 / 60, n * 10 % 60),
+                    (s / film_s * f64::from(inner)) as f32,
+                )
+            })
+            .collect(),
+        inner,
+        pad: PAD,
+        wave_h: WAVE_H,
+    };
+    let image = render_view(strip, SIZE, cx).await?;
+    let scale = scale_of(&image, SIZE.0);
+    write_png(&out.join("export.png"), &framed(&image, scale))
+}
+
+/// The export image's layout: the file and its measurements, the line ids
+/// at their places, the waveform with each line's take shaded, and the
+/// film's time below.
+struct Strip {
+    wave: Arc<gpui_kit::RenderImage>,
+    title: String,
+    detail: String,
+    /// Each line's id and its x in logical pixels from the strip's left.
+    labels: Vec<(String, f32)>,
+    /// Each tick's label and x.
+    ticks: Vec<(String, f32)>,
+    inner: f32,
+    pad: f32,
+    wave_h: f32,
+}
+
+impl gpui_kit::Render for Strip {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        use gpui_kit::{ParentElement as _, Styled as _, div, img, rgb};
+        let row = |height: f32, items: &[(String, f32)], color: u32, size: f32| {
+            div()
+                .relative()
+                .w(px(self.inner))
+                .h(px(height))
+                .flex_none()
+                .children(items.iter().map(|(text, x)| {
+                    let label = div().absolute().top(px(0.)).whitespace_nowrap();
+                    // A label at the very end ends there instead.
+                    let label = if *x > self.inner - 40.0 {
+                        label.right(px(0.))
+                    } else {
+                        label.left(px(*x))
+                    };
+                    label
+                        .text_size(px(size))
+                        .text_color(rgb(color))
+                        .child(text.clone())
+                }))
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .p(px(self.pad))
+            .gap(px(6.))
+            .bg(rgb(super::colors::BACKGROUND))
+            .text_color(rgb(super::colors::TEXT))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_row()
+                    .justify_between()
+                    .pb(px(6.))
+                    .child(div().text_size(px(15.)).child(self.title.clone()))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(super::colors::DIM))
+                            .child(self.detail.clone()),
+                    ),
+            )
+            .child(row(18.0, &self.labels, super::colors::TEXT, 13.0))
+            .child(
+                img(self.wave.clone())
+                    .flex_none()
+                    .w(px(self.inner))
+                    .h(px(self.wave_h)),
+            )
+            .child(row(16.0, &self.ticks, super::colors::DIM, 11.0))
+    }
 }
