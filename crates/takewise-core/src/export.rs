@@ -25,6 +25,9 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// Audio kept on either side of the detected speech.
 const MARGIN_S: f64 = 0.150;
 const FADE_S: f64 = 0.010;
+/// Speech of two takes closer than this gets a `tight-gap` warning: there
+/// is no room for two full fades between them.
+const TIGHT_GAP_S: f64 = 0.020;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExportOptions {
@@ -122,6 +125,10 @@ struct Placed {
     dest: (usize, usize),
     /// The speech without its margins in destination samples, cropped.
     speech: (usize, usize),
+    /// The most samples the fade in and the fade out may take: a margin
+    /// shortened by a split gap leaves less room, so the fades never cut
+    /// into the speech.
+    fade_room: (usize, usize),
     /// The take was recorded against different text than the line has now.
     old_text: bool,
     /// The unclamped speech in film seconds, when part of it lies outside
@@ -205,7 +212,7 @@ fn export_locked(
             message,
         });
     }
-    split_margins(&mut placed);
+    let tight = split_margins(&mut placed, project.config.sample_rate);
     refused.extend(overlaps(&placed));
     if !refused.is_empty() {
         remove_if_present(&dir.join(MANIFEST_FILE))?;
@@ -235,7 +242,8 @@ fn export_locked(
         }
     };
 
-    let warnings = warnings(&placed, project.film_duration());
+    let mut warnings = warnings(&placed, project.film_duration());
+    warnings.extend(tight);
     let lines: Vec<ManifestLine> = placed.into_iter().map(|p| p.line).collect();
     let info = &project.config.film_info;
     let manifest = Manifest {
@@ -381,6 +389,7 @@ fn place(
         src: src0,
         dest: (dest0, dest1),
         speech: (to_usize(speech_dest.0), to_usize(speech_dest.1)),
+        fade_room: (usize::MAX, usize::MAX),
         old_text: take.recorded_against_old_text,
         cropped_speech,
     })
@@ -449,30 +458,48 @@ fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
 
 /// Where only the margins of two neighbouring takes overlap, splits the
 /// gap between their speech at its midpoint: each keeps its margin up to
-/// there. Takes whose speech overlaps are left for [`overlaps`].
-fn split_margins(placed: &mut [Placed]) {
+/// there. Takes whose speech overlaps are left for [`overlaps`]. Returns a
+/// `tight-gap` warning for each pair whose speech is less than
+/// [`TIGHT_GAP_S`] apart.
+fn split_margins(placed: &mut [Placed], rate: u32) -> Vec<ExportWarning> {
+    let tight_gap = to_usize(seconds_to_samples(TIGHT_GAP_S, rate));
+    let mut warnings = Vec::new();
     let mut order: Vec<usize> = (0..placed.len()).collect();
     order.sort_by_key(|&i| placed[i].speech);
     for pair in order.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         let (a_end, b_start) = (placed[a].speech.1, placed[b].speech.0);
+        if a_end <= b_start && b_start - a_end < tight_gap {
+            let ms = (b_start - a_end) as f64 * 1000.0 / f64::from(rate);
+            warnings.push(ExportWarning {
+                code: "tight-gap",
+                line: placed[a].line.id.clone(),
+                message: format!(
+                    "the speech of {} and {} is only {ms:.0} ms apart; the cut between them has shortened fades",
+                    placed[a].line.id, placed[b].line.id
+                ),
+            });
+        }
         if a_end > b_start || placed[a].dest.1 <= placed[b].dest.0 {
             continue;
         }
         let mid = a_end + (b_start - a_end) / 2;
         let first = &mut placed[a];
         first.dest.1 = first.dest.1.min(mid);
+        first.fade_room.1 = first.dest.1 - a_end;
         let second = &mut placed[b];
         if second.dest.0 < mid {
             second.src += mid - second.dest.0;
             second.dest.0 = mid;
         }
+        second.fade_room.0 = b_start - second.dest.0;
     }
     for p in placed {
         let len = p.dest.1 - p.dest.0;
         p.line.source_samples = [to_u64(p.src), to_u64(p.src + len)];
         p.line.dest_samples = [to_u64(p.dest.0), to_u64(p.dest.1)];
     }
+    warnings
 }
 
 /// Pairs of takes whose speech (without the margins) overlaps in the film.
@@ -496,18 +523,22 @@ fn overlaps(placed: &[Placed]) -> Vec<Refusal> {
 }
 
 /// Copies each placed range into a silent film-length buffer with linear
-/// fades at both ends.
+/// fades at both ends, each as long as its room allows (none where a split
+/// gap leaves no margin).
 fn mix(placed: &[Placed], film_len: usize, rate: u32) -> Vec<i32> {
     let mut out = vec![0i32; film_len];
     let fade = to_usize(seconds_to_samples(FADE_S, rate)).max(1);
     for p in placed {
         let len = p.dest.1 - p.dest.0;
-        let ramp = fade.min(len / 2).max(1);
+        let ramp = |room: usize| fade.min(len / 2).max(1).min(room);
+        let (fade_in, fade_out) = (ramp(p.fade_room.0), ramp(p.fade_room.1));
         let source = p.samples.iter().skip(p.src).take(len);
         for (k, (slot, &sample)) in out[p.dest.0..p.dest.1].iter_mut().zip(source).enumerate() {
-            let edge = k.min(len - 1 - k);
-            *slot = if edge < ramp {
-                scale(sample, edge as f64 / ramp as f64)
+            let to_end = len - 1 - k;
+            *slot = if k < fade_in {
+                scale(sample, k as f64 / fade_in as f64)
+            } else if to_end < fade_out {
+                scale(sample, to_end as f64 / fade_out as f64)
             } else {
                 sample
             };
@@ -902,6 +933,58 @@ mod tests {
         );
         assert_eq!(two.dest_samples[0] - 436_800, two.source_samples[0]);
         assert_eq!(two.source_samples[1], 144_000 + 7_200);
+    }
+
+    #[test]
+    fn a_tight_gap_gets_fades_that_spare_the_speech_and_a_warning() {
+        // Speech at 10..11 s and 11.01..12.01 s of film: a 10 ms gap, too
+        // short for two 10 ms fades outside the speech.
+        let script = "[[line]]\nid = \"one\"\nstart = 10.0\ntext = \"A.\"\n\n[[line]]\nid = \"two\"\nstart = 11.01\ntext = \"B.\"\n";
+        let (_tmp, dir) = setup(script);
+        let a = take(&dir, "one", Some((2.0, 3.0)));
+        let b = take(&dir, "two", Some((2.0, 3.0)));
+        choose(&dir, &a);
+        choose(&dir, &b);
+        let report = run(&dir, false);
+        assert_eq!(refused_codes(&report), Vec::<&str>::new(), "{report:?}");
+        let tight: Vec<&ExportWarning> = report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "tight-gap")
+            .collect();
+        assert_eq!(tight.len(), 1, "{:?}", report.warnings);
+        assert_eq!(tight[0].line, "one");
+        assert!(tight[0].message.contains("two"), "{tight:?}");
+
+        // Within each take's speech the narration is the take, unfaded.
+        let out = narration(&dir);
+        for (line, t) in report.lines.iter().zip([&a, &b]) {
+            let (source, _) =
+                read_take_wav(&dir.join(format!("takes/{}/{:03}.wav", t.line, t.take))).unwrap();
+            let [src0, _] = line.source_samples;
+            let [dest0, _] = line.dest_samples;
+            let from = samples_at(line.speech_film_s[0]) + 1;
+            let to = samples_at(line.speech_film_s[1]) - 1;
+            for d in from..to {
+                let i = usize::try_from(d).unwrap();
+                let s = usize::try_from(d - dest0 + src0).unwrap();
+                assert_eq!(out[i], source[s], "{} at sample {d}", line.id);
+            }
+        }
+
+        // A gap of 20 ms or more is no warning.
+        let script = script.replace("11.01", "11.02");
+        let (_tmp, dir) = setup(&script);
+        let a = take(&dir, "one", Some((2.0, 3.0)));
+        let b = take(&dir, "two", Some((2.0, 3.0)));
+        choose(&dir, &a);
+        choose(&dir, &b);
+        let report = run(&dir, false);
+        assert!(
+            report.warnings.iter().all(|w| w.code != "tight-gap"),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]
