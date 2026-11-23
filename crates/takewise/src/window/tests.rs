@@ -1357,6 +1357,46 @@ fn a_take_whose_commit_failed_after_renaming_its_audio_is_finished(cx: &mut Test
     a_partly_committed_take_is_finished_by_its_window(cx, 2);
 }
 
+/// Records a take whose commit fails after `renames` of its two renames,
+/// then removes the renamed files: the retry cannot finish that commit, so
+/// it saves the take again from memory, once.
+fn a_take_whose_renamed_files_vanished_is_saved_from_memory(cx: &mut TestAppContext, renames: u8) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    tw::takes::fail_commits_after_renames(Some(renames));
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    tw::takes::fail_commits_after_renames(None);
+    fs::remove_file(f.dir.join("takes/a/001.json")).expect("metadata");
+    if renames == 2 {
+        fs::remove_file(f.dir.join("takes/a/001.wav")).expect("audio");
+    }
+
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "saved on retry");
+    assert_eq!((takes[0].1, takes[0].2.samples), (1, 2400));
+    let (samples, _) = tw::read_take_wav(&f.dir.join("takes/a/001.wav")).expect("audio");
+    assert_eq!(samples.len(), 2400);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("saved again from memory"), "{shown}");
+    f.media.set_now(120.0);
+    frame(cx, f.window);
+    assert_eq!(recorded(&f.dir).len(), 1, "exactly one recorded event");
+}
+
+#[gpui_kit::test]
+fn a_take_whose_renamed_metadata_vanished_is_saved_from_memory(cx: &mut TestAppContext) {
+    a_take_whose_renamed_files_vanished_is_saved_from_memory(cx, 1);
+}
+
+#[gpui_kit::test]
+fn a_take_whose_renamed_files_both_vanished_is_saved_from_memory(cx: &mut TestAppContext) {
+    a_take_whose_renamed_files_vanished_is_saved_from_memory(cx, 2);
+}
+
 #[gpui_kit::test]
 fn a_take_begun_late_is_rewritten_under_its_lock(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);

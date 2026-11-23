@@ -428,9 +428,9 @@ impl Recorder {
     /// Writes and commits a stopped take, or keeps it to retry.
     fn save(&mut self, dir: &Path, mut unsaved: Unsaved) -> Update {
         match save(dir, &mut unsaved) {
-            Ok(committed) => Update {
-                committed: Some(committed),
-                message: None,
+            Ok(saved) => Update {
+                committed: Some(saved.take),
+                message: saved.note,
             },
             Err(err) => {
                 let message = format!(
@@ -464,14 +464,18 @@ impl Recorder {
         let mut left = Vec::new();
         for mut unsaved in mem::take(&mut self.unsaved) {
             match save(dir, &mut unsaved) {
-                Ok(committed) if update.committed.is_none() => {
-                    update.message = Some(format!(
-                        "Saved the earlier take of {} as take {}.",
-                        committed.line, committed.take
-                    ));
+                Ok(saved) if update.committed.is_none() => {
+                    let committed = saved.take;
+                    update.message = join(
+                        saved.note,
+                        Some(format!(
+                            "Saved the earlier take of {} as take {}.",
+                            committed.line, committed.take
+                        )),
+                    );
                     update.committed = Some(committed);
                 }
-                Ok(_) => {}
+                Ok(saved) => update.message = join(update.message.take(), saved.note),
                 Err(_) => left.push(unsaved),
             }
         }
@@ -760,9 +764,37 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
     }
 }
 
+/// A take saved: the take, and a note when saving it took a detour.
+struct Saved {
+    take: TakeRef,
+    note: Option<String>,
+}
+
 /// Writes a stopped take's metadata and, when the partial WAV is not
 /// complete, its audio from memory, then commits it.
-fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<TakeRef, String> {
+fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<Saved, String> {
+    let mut note = None;
+    // An earlier commit renamed the take's files but failed before logging
+    // it: finish that commit (the take's lock is still held). When the
+    // renamed files are gone, the take starts afresh from memory.
+    if let Some(partial) = unsaved.partial.as_ref().filter(|p| !p.meta.exists()) {
+        match finish_interrupted_commit(dir, partial) {
+            Ok(Some(take)) => return Ok(Saved { take, note }),
+            Ok(None) => {}
+            Err(takewise_core::Error::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                unsaved.partial = None;
+                unsaved.lock = None;
+                unsaved.complete = false;
+                note = Some(format!(
+                    "The files of the take of {} vanished before it was committed; it was saved again from memory.",
+                    unsaved.line
+                ));
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
     let partial = if let Some(partial) = &unsaved.partial {
         partial.clone()
     } else {
@@ -771,14 +803,6 @@ fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<TakeRef, String> {
         unsaved.partial = Some(partial.clone());
         partial
     };
-    // An earlier commit renamed the take's files but failed before logging
-    // it: finish that commit (the take's lock is still held).
-    if !partial.meta.exists()
-        && let Some(committed) =
-            finish_interrupted_commit(dir, &partial).map_err(|err| err.to_string())?
-    {
-        return Ok(committed);
-    }
     if !unsaved.complete {
         // Rewritten only while holding the file's lock (kept from the
         // recording, else taken now), so a repair never adopts it meanwhile.
@@ -794,7 +818,8 @@ fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<TakeRef, String> {
     if COMMITS_FAIL.get() {
         return Err("the commit failed (test)".to_owned());
     }
-    commit_take(dir, partial).map_err(|err| err.to_string())
+    let take = commit_take(dir, partial).map_err(|err| err.to_string())?;
+    Ok(Saved { take, note })
 }
 
 #[cfg(test)]
