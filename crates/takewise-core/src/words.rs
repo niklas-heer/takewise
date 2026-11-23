@@ -8,10 +8,11 @@
 //! five" is `105`, "two thousand and five" `2005`; a year said in two parts
 //! ("eighteen sixty seven", "nineteen oh five") is its value; "1990s" and
 //! "nineteen nineties" are `1990s`, "21st" and "twenty-first" `21st`, "3.5"
-//! and "three point five" `3.5`, "$5" and "five dollars" `5 dollars`. A lone
-//! whole one stays the word `one`, since it is often not a number ("every
-//! one"), and "first" and "second" are ordinals only when attached
-//! ("twenty-first"), never in "a sixty second timer". A number said over
+//! and "three point five zero" `3.5` (a decimal is its value), "$5" and
+//! "five dollars" `5 dollars`. A lone whole one stays the word `one`, since
+//! it is often not a number ("every one"), and "first" and "second" are
+//! ordinals only when attached ("twenty-first"), never in "a sixty second
+//! timer". A number said over
 //! several heard words is one token, timed from its first word to its last,
 //! but never across punctuation: "pick twenty, one at a time" is `20 one`.
 //! [`align`] still matches a number split in two on one side against the
@@ -659,6 +660,8 @@ fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(V
         Item::Other(_) => return None,
     };
     let mut value = value;
+    // A decimal compares by value: "3.50" is "three point five".
+    value.frac.truncate(value.frac.trim_end_matches('0').len());
     if form == Form::Cardinal
         && (matches!(items.get(k).map(|l| &l.item), Some(Item::Number(_)))
             || !value.frac.is_empty())
@@ -1284,6 +1287,30 @@ mod tests {
                 "{said} / {script}"
             );
         }
+    }
+
+    #[test]
+    fn decimals_compare_by_value() {
+        assert_eq!(shown("3.50%"), tokens("3.5 percent"));
+        assert_eq!(shown("three point five zero"), tokens("3.5"));
+        assert_eq!(shown("2.0"), tokens("2"));
+        for (script, said) in [
+            ("3.50%", "three point five percent"),
+            ("3.5", "three point five zero"),
+            ("$1.50", "one point five dollars"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        assert_ne!(align(&normalize("3.5"), &heard("three point five one")), []);
     }
 
     #[test]
