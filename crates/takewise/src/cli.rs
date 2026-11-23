@@ -45,7 +45,12 @@ enum Command {
     Record { dir: PathBuf },
     /// The recording window itself; `record` starts it inside the app bundle.
     #[command(hide = true)]
-    Window { dir: PathBuf },
+    Window {
+        dir: PathBuf,
+        /// Where to write whether the window opened, for `record`.
+        #[arg(long)]
+        result: Option<PathBuf>,
+    },
     /// Measure the input and output latency with a loopback test: hold the
     /// headphones to the microphone; beeps play and are recorded. Runs
     /// inside Takewise.app like `record`.
@@ -264,8 +269,8 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             out,
             output,
         } => calibrate_run(&dir, &film, &out, output.as_deref()),
-        Command::Window { dir } => {
-            crate::window::run(&dir).map_err(CliError::Setup)?;
+        Command::Window { dir, result } => {
+            crate::window::run(&dir, result.as_deref()).map_err(CliError::Setup)?;
             Ok(Outcome::new(json!({}), String::new()))
         }
         Command::Status {
@@ -974,10 +979,18 @@ fn tool_check(name: &'static str, install: &str) -> Check {
     }
 }
 
-/// Validates the project, then runs the recording window inside
-/// Takewise.app and waits for it to close.
+/// Validates the project and its film, then runs the recording window
+/// inside Takewise.app and waits for it to close; fails when the window
+/// could not open.
 fn record(dir: &Path) -> Result<Outcome, CliError> {
     let project = Project::open(dir)?;
+    let film = project.film_path();
+    if !film.is_file() {
+        return Err(CliError::Setup(format!(
+            "the film {} does not exist; put it back or point `film` in project.toml at it",
+            film.display()
+        )));
+    }
     let problems = tw::validate(&project.script, project.film_duration());
     if !problems.is_empty() {
         let mut text = String::new();
@@ -995,11 +1008,46 @@ fn record(dir: &Path) -> Result<Outcome, CliError> {
     }
     let dir = std::path::absolute(dir)
         .map_err(|err| CliError::Setup(format!("{}: {err}", dir.display())))?;
-    let bundle = run_in_bundle(&["window".as_ref(), dir.as_os_str()])?;
+    let work = tempfile::tempdir()
+        .map_err(|err| CliError::Setup(format!("no folder for the window's result: {err}")))?;
+    let result = work.path().join("window.json");
+    let bundle = run_in_bundle(&[
+        "window".as_ref(),
+        dir.as_os_str(),
+        "--result".as_ref(),
+        result.as_os_str(),
+    ])?;
+    window_opened(&result)?;
     Ok(Outcome::new(
         json!({ "bundle": bundle }),
         format!("Recording window closed ({}).", bundle.display()),
     ))
+}
+
+/// Whether the window opened, by the result it wrote to `result`.
+fn window_opened(result: &Path) -> Result<(), CliError> {
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        #[serde(default)]
+        ok: bool,
+        error: Option<String>,
+    }
+    let text = std::fs::read_to_string(result).map_err(|_| {
+        CliError::Setup(
+            "the recording window did not start (Takewise.app wrote no result)".to_owned(),
+        )
+    })?;
+    let reply: Reply = serde_json::from_str(&text)
+        .map_err(|err| CliError::Setup(format!("unreadable result from the window: {err}")))?;
+    match (reply.ok, reply.error) {
+        (_, Some(error)) => Err(CliError::Setup(format!(
+            "the recording window could not open: {error}"
+        ))),
+        (true, None) => Ok(()),
+        (false, None) => Err(CliError::Setup(
+            "the recording window did not say whether it opened".to_owned(),
+        )),
+    }
 }
 
 /// Runs `takewise <args>` inside Takewise.app and waits for it to quit.
@@ -1535,5 +1583,24 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         outcome
     } else {
         outcome.with_finding("doctor", format!("failed checks: {}", failed.join(", ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_result_is_read() {
+        let tmp = tempfile::tempdir().expect("dir");
+        let path = tmp.path().join("window.json");
+        let err = window_opened(&path).expect_err("no result");
+        assert!(err.to_string().contains("did not start"), "{err}");
+        std::fs::write(&path, r#"{"error":"the film is not a film"}"#).expect("write");
+        let err = window_opened(&path).expect_err("failed");
+        assert_eq!(err.code(), "setup");
+        assert!(err.to_string().contains("the film is not a film"), "{err}");
+        std::fs::write(&path, r#"{"ok":true}"#).expect("write");
+        assert!(window_opened(&path).is_ok());
     }
 }

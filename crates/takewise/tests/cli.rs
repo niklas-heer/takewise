@@ -621,6 +621,45 @@ fn record_refuses_an_invalid_script() {
     assert_eq!(value["data"]["problems"][0]["code"], "bad-id", "{value}");
 }
 
+#[test]
+fn record_refuses_a_missing_film() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::remove_file(tmp.path().join("film.wav")).unwrap();
+    // A bundle that would open is not even looked for.
+    let (code, value) = json(takewise().arg("record").arg(&dir));
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["error"]["code"], "setup", "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("film.wav") && message.contains("does not exist"),
+        "{value}"
+    );
+}
+
+#[test]
+fn window_writes_why_it_could_not_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::remove_file(tmp.path().join("film.wav")).unwrap();
+    let result = tmp.path().join("window.json");
+    takewise()
+        .arg("window")
+        .arg(&dir)
+        .arg("--result")
+        .arg(&result)
+        .assert()
+        .code(2);
+    let reply: Value = serde_json::from_str(&fs::read_to_string(&result).unwrap()).unwrap();
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("does not exist")),
+        "{reply}"
+    );
+}
+
 /// Writes an executable shell script.
 fn script(dir: &Path, name: &str, body: &str) {
     use std::os::unix::fs::PermissionsExt as _;

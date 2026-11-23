@@ -191,15 +191,39 @@ fn checker(project: &Project) -> Checker {
     }
 }
 
-/// Opens the recording window on the project in `dir` and runs until it
-/// closes. Runs inside Takewise.app (see `takewise record`).
-pub fn run(dir: &Path) -> Result<(), String> {
+/// Writes whether the window opened to `result` (for `takewise record`,
+/// which waits for the app and then reads it); nothing without a path.
+fn report_start(result: Option<&Path>, outcome: Result<(), &str>) {
+    let Some(path) = result else {
+        return;
+    };
+    let reply = match outcome {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(error) => serde_json::json!({ "error": error }),
+    };
+    if let Err(err) = std::fs::write(path, reply.to_string()) {
+        eprintln!("error: {}: {err}", path.display());
+    }
+}
+
+/// Loads the project in `dir` and checks its film is there.
+fn prepare(dir: &Path) -> Result<(PathBuf, Loaded), String> {
     let dir = std::path::absolute(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     let loaded = load(&dir).map_err(|err| err.to_string())?;
     let film = loaded.project.film_path();
     if !film.is_file() {
         return Err(format!("the film {} does not exist", film.display()));
     }
+    Ok((dir, loaded))
+}
+
+/// Opens the recording window on the project in `dir` and runs until it
+/// closes; writes whether it opened to `result`. Runs inside Takewise.app
+/// (see `takewise record`).
+pub fn run(dir: &Path, result: Option<&Path>) -> Result<(), String> {
+    let (dir, loaded) = prepare(dir).inspect_err(|err| report_start(result, Err(err)))?;
+    let film = loaded.project.film_path();
+    let result = result.map(Path::to_path_buf);
     let title = format!(
         "Takewise — {}",
         dir.file_name().map_or_else(
@@ -220,6 +244,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
             Ok(media) => media,
             Err(err) => {
                 eprintln!("error: {err}");
+                report_start(result.as_deref(), Err(&err));
                 cx.quit();
                 return;
             }
@@ -253,10 +278,13 @@ pub fn run(dir: &Path) -> Result<(), String> {
             })
         });
         if let Err(err) = opened {
-            eprintln!("error: cannot open the window: {err}");
+            let err = format!("cannot open the window: {err}");
+            eprintln!("error: {err}");
+            report_start(result.as_deref(), Err(&err));
             cx.quit();
             return;
         }
+        report_start(result.as_deref(), Ok(()));
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
