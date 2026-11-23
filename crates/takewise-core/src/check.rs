@@ -121,10 +121,7 @@ pub fn build_checked(
         );
     }
     if let Transcript::Failed(error) = transcript {
-        add(
-            reason("words-not-checked", format!("words not checked: {error}")),
-            Verdict::Listen,
-        );
+        add(words_not_checked(error), Verdict::Listen);
     }
     if let Some(names) = named(&word_diffs, WordDiffKind::Substituted) {
         add(
@@ -235,6 +232,11 @@ fn split_sounds(
         .map(|sound| format!("“{}”", sound.text))
         .collect();
     (Some(spoken.into_iter().cloned().collect()), sounds)
+}
+
+/// The reason of a check whose transcription failed with `error`.
+pub(crate) fn words_not_checked(error: &str) -> Reason {
+    reason("words-not-checked", format!("words not checked: {error}"))
 }
 
 fn reason(code: &str, message: String) -> Reason {

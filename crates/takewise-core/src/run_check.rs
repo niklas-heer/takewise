@@ -16,13 +16,13 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::check::{Transcript, build_checked, rebuild_checked};
+use crate::check::{Transcript, build_checked, rebuild_checked, words_not_checked};
 use crate::error::{Error, Result};
 use crate::ledger::{self, Checked, Event, EventKind, Ledger, Snapshot};
 use crate::project::Project;
 use crate::speech::analyze;
 use crate::takes::{TakeRef, read_take_wav};
-use crate::whisper::{PREPROCESSING, Transcriber, keep_within};
+use crate::whisper::{PREPROCESSING, Transcriber, WhisperCli, keep_within};
 
 /// The `checker` field of a `checked` event: the Takewise version, the
 /// whisper model and how the audio is prepared before transcription (see
@@ -83,9 +83,27 @@ pub fn check_take(
             &by,
         )
     });
-    let event = Event::new(&take.line, take.take, EventKind::Checked(checked.clone()));
-    ledger::append(dir, &event)?;
+    // A failure exactly like the take's newest check adds nothing: it is
+    // reported, not recorded again.
+    let repeated = checked.transcript.is_none() && latest_check(&ledger, take) == Some(&checked);
+    if !repeated {
+        let event = Event::new(&take.line, take.take, EventKind::Checked(checked.clone()));
+        ledger::append(dir, &event)?;
+    }
     Ok(checked)
+}
+
+/// The take's newest `checked` event, which the fold shows.
+fn latest_check<'a>(ledger: &'a Ledger, take: &TakeRef) -> Option<&'a Checked> {
+    ledger
+        .events
+        .iter()
+        .rev()
+        .filter(|e| e.line == take.line && e.take == take.take)
+        .find_map(|e| match &e.kind {
+            EventKind::Checked(check) => Some(check),
+            _ => None,
+        })
 }
 
 /// The take's latest check whose words can stand for a check against
@@ -127,11 +145,34 @@ pub struct Unchecked {
 }
 
 /// The takes of the script's lines without a current check, in script and
-/// take order: a `checked` event matching the line as it is now whose words
-/// were checked. One whose transcription failed (`words-not-checked`) is not
-/// current, so the take is checked again. Takes whose file is missing are
-/// left out: there is nothing to check.
+/// take order. A take's check is the newest `checked` event matching the
+/// line as it is now, as the fold shows it; it is current when its words
+/// were checked. One whose transcription failed (`words-not-checked`) is
+/// listed only when checking again could end differently: transcription
+/// can be set up now, it failed for another reason than the setup fails
+/// for now, or it timed out. Takes whose file is missing are left out:
+/// there is nothing to check.
 pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
+    let setup = WhisperCli::discover(&project.config.check).err();
+    select_unchecked(project, ledger, setup.map(|err| err.to_string()).as_deref())
+}
+
+/// Whether checking a take again could change its failed check: `setup` is
+/// why transcription cannot be set up now (`None` when it can).
+fn failure_could_change(failed: &Checked, setup: Option<&str>) -> bool {
+    let timed_out = failed
+        .reasons
+        .iter()
+        .any(|r| r.code == "words-not-checked" && r.message.contains(" timed out after "));
+    match setup {
+        None => true,
+        Some(error) => timed_out || !failed.reasons.contains(&words_not_checked(error)),
+    }
+}
+
+/// [`unchecked_takes`] with why transcription cannot be set up now, `None`
+/// when it can.
+fn select_unchecked(project: &Project, ledger: &Ledger, setup: Option<&str>) -> Vec<Unchecked> {
     let mut found = Vec::new();
     for line in &project.script.lines {
         let Some(current) = project.snapshot(&line.id) else {
@@ -161,9 +202,9 @@ pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
                     _ => None,
                 })
                 .collect();
-            let matching = || checks.iter().filter(|c| c.snapshot.matches(&current));
+            let newest = checks.iter().rev().find(|c| c.snapshot.matches(&current));
             // A failed transcription leaves `transcript` empty.
-            if matching().any(|c| c.transcript.is_some()) {
+            if newest.is_some_and(|c| c.transcript.is_some() || !failure_could_change(c, setup)) {
                 continue;
             }
             found.push(Unchecked {
@@ -171,7 +212,7 @@ pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
                     line: line.id.clone(),
                     take,
                 },
-                stale: !checks.is_empty() && matching().next().is_none(),
+                stale: !checks.is_empty() && newest.is_none(),
             });
         }
     }
@@ -330,10 +371,11 @@ mod tests {
         assert_eq!(checked.reasons[0].code, "words-not-checked");
         assert!(checked.reasons[0].message.contains("status 1"));
 
-        // Such a check is not current: the take is checked again.
+        // Such a check is not current: with transcription set up, the take
+        // is checked again.
         let project = Project::open(&dir).unwrap();
         assert_eq!(
-            unchecked_takes(&project, &read(&dir).unwrap()),
+            select_unchecked(&project, &read(&dir).unwrap(), None),
             vec![Unchecked {
                 take: t.clone(),
                 stale: false
@@ -341,6 +383,87 @@ mod tests {
         );
         check_take(&dir, &t, &Fake::new(), "0.1.0").unwrap();
         assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);
+    }
+
+    /// Fails every transcription with `reason`.
+    struct Failing(String);
+
+    impl Transcriber for Failing {
+        fn transcribe(&self, _: &Path) -> Transcript {
+            Transcript::Failed(self.0.clone())
+        }
+        fn model(&self) -> String {
+            "ggml-large-v3-turbo.bin".to_owned()
+        }
+    }
+
+    #[test]
+    fn a_failed_check_is_rerun_only_when_the_failure_could_change() {
+        let missing = "whisper-cli not found on PATH or in /opt/homebrew/bin; install it with `brew install whisper-cpp`";
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        check_take(&dir, &t, &Failing(missing.to_owned()), "0.1.0").unwrap();
+        let project = Project::open(&dir).unwrap();
+        let ledger = read(&dir).unwrap();
+        let listed = vec![Unchecked {
+            take: t.clone(),
+            stale: false,
+        }];
+        // The tools are still missing: checking again would fail the same way.
+        assert_eq!(select_unchecked(&project, &ledger, Some(missing)), []);
+        // Now set up, or failing for another reason: checked again.
+        assert_eq!(select_unchecked(&project, &ledger, None), listed);
+        assert_eq!(
+            select_unchecked(&project, &ledger, Some("whisper model x not found")),
+            listed
+        );
+
+        // A timeout may pass, whatever the setup.
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        let timeout = "/opt/homebrew/bin/whisper-cli timed out after 120 s and was stopped";
+        check_take(&dir, &t, &Failing(timeout.to_owned()), "0.1.0").unwrap();
+        let project = Project::open(&dir).unwrap();
+        assert_eq!(
+            select_unchecked(&project, &read(&dir).unwrap(), Some(missing)),
+            vec![Unchecked {
+                take: t,
+                stale: false
+            }]
+        );
+    }
+
+    #[test]
+    fn an_identical_failed_check_is_not_appended_again() {
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        let missing = Failing("whisper-cli not found".to_owned());
+        let first = check_take(&dir, &t, &missing, "0.1.0").unwrap();
+        let again = check_take(&dir, &t, &missing, "0.1.0").unwrap();
+        assert_eq!(again, first, "the failure is still reported");
+        assert_eq!(checked_events(&dir), vec![first.clone()]);
+        // Another reason is news.
+        let other = check_take(&dir, &t, &Failing("crashed".to_owned()), "0.1.0").unwrap();
+        assert_eq!(checked_events(&dir), vec![first, other]);
+    }
+
+    #[test]
+    fn a_failed_recheck_after_a_success_is_listed_like_the_state_shows_it() {
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        check_take(&dir, &t, &Fake::new(), "0.1.0").unwrap();
+        check_take(&dir, &t, &Failing("crashed".to_owned()), "0.1.0").unwrap();
+        let project = Project::open(&dir).unwrap();
+        let ledger = read(&dir).unwrap();
+        let take = &fold(&project, &ledger).lines[0].takes[0];
+        assert_eq!(take.effective, Some(Verdict::Listen), "the newest check");
+        assert_eq!(
+            select_unchecked(&project, &ledger, None),
+            vec![Unchecked {
+                take: t,
+                stale: false
+            }]
+        );
     }
 
     #[test]
