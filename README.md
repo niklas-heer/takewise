@@ -51,6 +51,16 @@ Start a project on your own film, an H.264 or HEVC `.mp4` or `.mov` that plays i
 takewise init demo.takewise --film /path/to/your-cut.mp4
 ```
 
+Add a first line to `demo.takewise/script.toml`. `start` and `end` are seconds of film time, so this line's slot runs from 2.0 to 6.0 s. Set them to a stretch of your film with room for the sentence, about four seconds, and `text` to what you will say there:
+
+```toml
+[[line]]
+id = "first"
+start = 2.0
+end = 6.0
+text = "This is my first line in Takewise."
+```
+
 No footage at hand? Fetch the demo film the screenshots use, NASA's public-domain "Earth Views from the International Space Station" (120 MB), cut it to 60 seconds and start the project on that:
 
 ```sh
@@ -61,7 +71,7 @@ ffmpeg -ss 16 -t 60 -i earth-views.mp4 -c:v libx264 -c:a aac film.mp4
 takewise init demo.takewise --film film.mp4
 ```
 
-Add one line to `demo.takewise/script.toml`. `start` and `end` are seconds of film time, so this line's slot runs from 25.0 to 29.1 s; on your own film, pick a slot inside it. On the demo film, those seconds show a capsule docked at the station:
+On the demo film, add this line instead; from 25.0 to 29.1 s the film shows a capsule docked at the station:
 
 ```toml
 [[line]]
