@@ -19,6 +19,7 @@ takewise-core.workspace = true
 takewise-media.workspace = true
 
 [dev-dependencies]
+takewise-core = { workspace = true, features = ["test-faults"] }
 gpui-kit = { version = "=0.10.0", default-features = false, features = ["test-support"] }
 assert_cmd = "2.2.2"
 predicates = "3.1.4"

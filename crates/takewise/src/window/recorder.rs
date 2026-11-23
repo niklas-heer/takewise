@@ -10,8 +10,8 @@ use takewise_core::takes::FULL_SCALE;
 use takewise_core::timing::film_shift_s;
 use takewise_core::{
     Dropout, PartialTake, Project, RECORD_RATE, RecordPlan, RecordedInput, Snapshot, TakeRef,
-    TakeState, Timebase, WavLock, begin_take, commit_take, line_offset_s, plan_take,
-    sample_film_time, update_take_meta, write_take_wav,
+    TakeState, Timebase, WavLock, begin_take, commit_take, finish_interrupted_commit,
+    line_offset_s, plan_take, sample_film_time, update_take_meta, write_take_wav,
 };
 use takewise_media::CaptureBuffer;
 
@@ -763,6 +763,14 @@ fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<TakeRef, String> {
         unsaved.partial = Some(partial.clone());
         partial
     };
+    // An earlier commit renamed the take's files but failed before logging
+    // it: finish that commit (the take's lock is still held).
+    if !partial.meta.exists()
+        && let Some(committed) =
+            finish_interrupted_commit(dir, &partial).map_err(|err| err.to_string())?
+    {
+        return Ok(committed);
+    }
     if !unsaved.complete {
         // Rewritten only while holding the file's lock (kept from the
         // recording, else taken now), so a repair never adopts it meanwhile.

@@ -1201,6 +1201,46 @@ fn a_take_whose_finish_failed_stays_locked_until_saved(cx: &mut TestAppContext) 
     assert!(!takes[0].2.recovered);
 }
 
+/// Records a take whose commit fails after `renames` of its two renames,
+/// checks that a concurrent repair leaves it alone, and that the retry
+/// completes it with exactly one recorded event.
+fn a_partly_committed_take_is_finished_by_its_window(cx: &mut TestAppContext, renames: u8) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    tw::takes::fail_commits_after_renames(Some(renames));
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    tw::takes::fail_commits_after_renames(None);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("could not be saved"), "{shown}");
+
+    let report = tw::repair(&f.dir).expect("repair");
+    assert!(report.adopted.is_empty(), "{:?}", report.adopted);
+    assert!(report.unadopted.is_empty(), "{:?}", report.unadopted);
+    assert_eq!(recorded(&f.dir).len(), 0);
+
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "saved on retry");
+    assert_eq!((takes[0].1, takes[0].2.samples), (1, 2400));
+    assert!(!takes[0].2.recovered);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
+    f.media.set_now(120.0);
+    frame(cx, f.window);
+    assert_eq!(recorded(&f.dir).len(), 1, "exactly one recorded event");
+}
+
+#[gpui_kit::test]
+fn a_take_whose_commit_failed_after_renaming_its_metadata_is_finished(cx: &mut TestAppContext) {
+    a_partly_committed_take_is_finished_by_its_window(cx, 1);
+}
+
+#[gpui_kit::test]
+fn a_take_whose_commit_failed_after_renaming_its_audio_is_finished(cx: &mut TestAppContext) {
+    a_partly_committed_take_is_finished_by_its_window(cx, 2);
+}
+
 #[gpui_kit::test]
 fn a_take_begun_late_is_rewritten_under_its_lock(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);

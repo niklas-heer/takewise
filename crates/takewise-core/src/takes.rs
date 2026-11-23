@@ -167,13 +167,99 @@ fn publish_locked(
     let meta = line_dir.join(format!("{take:03}.json"));
     let wav = line_dir.join(format!("{take:03}.wav"));
     fs::rename(&partial.meta, &meta).map_err(io(&meta))?;
+    injected_fault(1, &meta)?;
     fs::rename(&partial.wav, &wav).map_err(io(&wav))?;
+    injected_fault(2, &wav)?;
     let event = recorded_event(&partial.line, take, input, sample_rate, samples, recovered);
     ledger::append_locked(dir, &event)?;
     Ok(TakeRef {
         line: partial.line.clone(),
         take,
     })
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+thread_local! {
+    static FAIL_AFTER_RENAMES: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes commits on this thread fail after renaming the first `renames` of
+/// the take's two files (1: the metadata, 2: both), as a failing disk can,
+/// and [`finish_interrupted_commit`] fail before it changes anything; `None`
+/// lets them succeed again. For tests.
+#[cfg(any(test, feature = "test-faults"))]
+pub fn fail_commits_after_renames(renames: Option<u8>) {
+    FAIL_AFTER_RENAMES.set(renames);
+}
+
+/// The failure [`fail_commits_after_renames`] asked for, after `renames`
+/// renames of a commit (`None`: when finishing an interrupted one).
+#[allow(clippy::unnecessary_wraps)]
+fn injected_fault(renames: impl Into<Option<u8>>, path: &Path) -> Result<()> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if let Some(set) = FAIL_AFTER_RENAMES.get()
+        && renames.into().is_none_or(|renames| renames == set)
+    {
+        return Err(io(path)(std::io::Error::other("the commit failed (test)")));
+    }
+    #[cfg(not(any(test, feature = "test-faults")))]
+    let _ = (renames.into(), path);
+    Ok(())
+}
+
+/// Finishes the commit of `partial` when an earlier [`commit_take`] renamed
+/// its files but failed before appending the `recorded` event. Its partial
+/// metadata is then gone, so its `NNN.json` is found by the partial audio's
+/// name stored in it (the take's uuid); the audio is renamed when it is
+/// still partial, and the event is appended once. `Ok(None)` when the
+/// partial metadata still exists: commit it with [`commit_take`]. The
+/// caller keeps the audio locked, so [`repair`] leaves the take alone.
+pub fn finish_interrupted_commit(dir: &Path, partial: &PartialTake) -> Result<Option<TakeRef>> {
+    let _guard = lock(dir)?;
+    if partial.meta.exists() {
+        return Ok(None);
+    }
+    let missing = || io(&partial.meta)(std::io::ErrorKind::NotFound.into());
+    let wav_name = partial
+        .wav
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(missing)?;
+    let files = scan(dir)?;
+    let found = files
+        .numbered
+        .iter()
+        .filter(|f| !f.is_wav && f.line == partial.line)
+        .find_map(|f| {
+            let meta = read_meta(&dir.join(&f.path)).ok()?;
+            (meta.partial_wav.as_deref() == Some(wav_name)).then_some((f, meta))
+        });
+    let Some((numbered, meta)) = found else {
+        return Err(missing());
+    };
+    let take = TakeRef {
+        line: partial.line.clone(),
+        take: numbered.take,
+    };
+    if ledger::read(dir)?.recorded(&take.line, take.take).is_some() {
+        return Ok(Some(take));
+    }
+    injected_fault(None, &partial.meta)?;
+    let wav = dir.join(numbered.path.with_extension("wav"));
+    if !wav.exists() {
+        fs::rename(&partial.wav, &wav).map_err(io(&wav))?;
+    }
+    let (sample_rate, samples) = wav_header(&wav)?;
+    let event = recorded_event(
+        &take.line,
+        take.take,
+        meta.input,
+        sample_rate,
+        samples,
+        false,
+    );
+    ledger::append_locked(dir, &event)?;
+    Ok(Some(take))
 }
 
 fn recorded_event(
@@ -645,11 +731,35 @@ pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
     Ok(files)
 }
 
+/// How a take's audio file is held.
+enum Hold {
+    /// Locked here (released when dropped).
+    Free(#[allow(dead_code)] fs::File),
+    /// Locked by its recording window, which finishes the take itself.
+    Recorder,
+    /// Not openable for locking; treated as before locks.
+    Unopened,
+}
+
+/// Locks the audio at `path` without blocking. The recording window's lock
+/// follows the file through a commit's renames.
+fn hold(path: &Path) -> Hold {
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return Hold::Unopened;
+    };
+    match file.try_lock() {
+        Ok(()) => Hold::Free(file),
+        Err(fs::TryLockError::WouldBlock) => Hold::Recorder,
+        Err(fs::TryLockError::Error(_)) => Hold::Unopened,
+    }
+}
+
 /// Adopts `NNN.wav` files that lack a `recorded` event from their `NNN.json`
 /// (marked `recovered`), completes commits interrupted between renaming the
 /// metadata and the audio, adopts takes whose recording ended without a
 /// commit (a crash: an unlocked `.partial` metadata and audio pair), and
-/// reports the rest. Never deletes anything.
+/// reports the rest. Audio a recording window still holds locked is left
+/// alone: the window finishes that commit itself. Never deletes anything.
 pub fn repair(dir: &Path) -> Result<RepairReport> {
     let _guard = lock(dir)?;
     let ledger = ledger::read(dir)?;
@@ -658,8 +768,13 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
     for meta in scan(dir)?.unlogged_metadata(&ledger) {
         match interrupted_commit(dir, meta) {
             Some(partial_wav) => {
+                let held = hold(&partial_wav);
+                if matches!(held, Hold::Recorder) {
+                    continue;
+                }
                 let wav = dir.join(meta.path.with_extension("wav"));
                 fs::rename(&partial_wav, &wav).map_err(io(&wav))?;
+                drop(held);
             }
             None => metadata_without_audio.push(meta.path.clone()),
         }
@@ -679,6 +794,10 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
         ..RepairReport::default()
     };
     for wav in files.unlogged_wavs(&ledger) {
+        let held = hold(&dir.join(&wav.path));
+        if matches!(held, Hold::Recorder) {
+            continue;
+        }
         if !files.has_meta(&wav.line, wav.take) {
             report.unadopted.push(wav.path.clone());
             continue;
@@ -699,6 +818,7 @@ pub fn repair(dir: &Path) -> Result<RepairReport> {
             }
             Err(_) => report.unadopted.push(wav.path.clone()),
         }
+        drop(held);
     }
     report.adopted = adopted.into_iter().collect();
     Ok(report)
@@ -795,6 +915,52 @@ mod tests {
         drop(lock);
         let adopted = repair(dir).unwrap().adopted;
         assert_eq!(adopted.len(), 1, "a crash leaves it adoptable");
+    }
+
+    #[test]
+    fn a_partly_committed_take_is_left_to_its_recorder_and_finished_once() {
+        for renames in [1, 2] {
+            let tmp = crate::testutil::project_tempdir();
+            let dir = tmp.path();
+            let partial = begin_take(dir, "hook", &input()).unwrap();
+            let lock = WavLock::acquire(&partial.wav).unwrap();
+            write_take_wav(&partial.wav, &[1000; 480], 48_000).unwrap();
+            fail_commits_after_renames(Some(renames));
+            assert!(commit_take(dir, partial.clone()).is_err(), "{renames}");
+            fail_commits_after_renames(None);
+
+            let report = repair(dir).unwrap();
+            assert_eq!(report.adopted, Vec::new(), "{renames}: {report:?}");
+            assert_eq!(report.unadopted, Vec::<PathBuf>::new(), "{renames}");
+            assert!(read(dir).unwrap().events.is_empty(), "{renames}");
+
+            let take = TakeRef {
+                line: "hook".to_owned(),
+                take: 1,
+            };
+            for _ in 0..2 {
+                let finished = finish_interrupted_commit(dir, &partial).unwrap();
+                assert_eq!(finished, Some(take.clone()), "{renames}");
+            }
+            let events = read(dir).unwrap().events;
+            assert_eq!(events.len(), 1, "{renames}: exactly one recorded event");
+            let EventKind::Recorded(rec) = &events[0].kind else {
+                panic!("{events:?}");
+            };
+            assert_eq!((rec.samples, rec.recovered), (480, false));
+            assert!(dir.join("takes/hook/001.wav").is_file());
+            drop(lock);
+            assert_eq!(repair(dir).unwrap().adopted, Vec::new());
+        }
+    }
+
+    #[test]
+    fn an_untouched_partial_take_is_not_an_interrupted_commit() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        write_take_wav(&partial.wav, &[1000; 480], 48_000).unwrap();
+        assert_eq!(finish_interrupted_commit(dir, &partial).unwrap(), None);
     }
 
     fn record(dir: &Path, line: &str, samples: usize) -> TakeRef {
