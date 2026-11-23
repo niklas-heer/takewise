@@ -353,9 +353,9 @@ fn pinned_model() -> tw::models::ModelSpec {
     tw::models::PINNED.spec()
 }
 
-/// "1.5 GB".
+/// "1.5 GB" (binary gigabytes, as the design names the model's size).
 fn gigabytes(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1e9)
+    format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
 }
 
 fn models_status() -> Outcome {

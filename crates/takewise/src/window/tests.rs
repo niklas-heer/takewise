@@ -2644,3 +2644,120 @@ fn setup_writes_project_toml(cx: &mut TestAppContext) {
     assert_eq!(setup_step(cx, &f), None);
     assert!(message(cx, &f.view).contains("Setup check saved"));
 }
+
+/// An installer that reports half the model, waits for the test to let it
+/// finish, then hears with its transcriber.
+struct FakeInstaller {
+    gate: Mutex<Receiver<()>>,
+    transcriber: SharedTranscriber,
+}
+
+impl super::model::Installer for FakeInstaller {
+    fn install(
+        &self,
+        progress: &mut dyn FnMut(tw::models::Progress) -> std::ops::ControlFlow<()>,
+    ) -> Result<(), String> {
+        let _ = progress(tw::models::Progress {
+            bytes: 812_277_637,
+            total: 1_624_555_275,
+            verifying: false,
+        });
+        let _ = self.gate.lock().expect("gate").recv();
+        Ok(())
+    }
+
+    fn checker(&self, _: &Project) -> Checker {
+        Checker {
+            transcriber: Arc::clone(&self.transcriber),
+            tools: Vec::new(),
+        }
+    }
+}
+
+fn offer_model(cx: &mut TestAppContext, f: &Fixture, installer: FakeInstaller) {
+    f.view.update(cx, |view, _| {
+        view.model = Some(super::model::ModelPrompt::new(
+            Arc::new(installer),
+            1_624_555_275,
+        ));
+    });
+}
+
+fn banner(cx: &mut TestAppContext, f: &Fixture) -> Option<String> {
+    f.view
+        .read_with(cx, |view, _| view.model.as_ref().map(|m| m.text()))
+}
+
+#[gpui_kit::test]
+fn banner_when_model_missing(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    assert_eq!(banner(cx, &f), None, "no banner while the model is there");
+
+    let (_release, gate) = channel();
+    offer_model(
+        cx,
+        &f,
+        FakeInstaller {
+            gate: Mutex::new(gate),
+            transcriber: no_transcriber(),
+        },
+    );
+    frame(cx, f.window);
+    let text = banner(cx, &f).expect("a banner");
+    assert!(text.contains("Install the speech model (1.5 GB)"), "{text}");
+}
+
+#[gpui_kit::test]
+fn progress_then_checks_resume(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // Recorded before the model is there: checked without words.
+    record_take(cx, &f);
+    wait_until(cx, &f, || checked_events(&f.dir) == 1);
+    let take = tw::TakeRef {
+        line: "a".to_owned(),
+        take: 1,
+    };
+    let unheard = |dir: &Path| {
+        let project = Project::open(dir).expect("project");
+        tw::words_not_checked_takes(&project, &tw::read(dir).expect("ledger"))
+    };
+    assert_eq!(unheard(&f.dir), vec![take.clone()]);
+
+    let (release, gate) = channel();
+    let (_, heard_gate) = channel();
+    let hears = Arc::new(Gated {
+        gate: Mutex::new(heard_gate),
+        heard: Mutex::new(Vec::new()),
+    });
+    offer_model(
+        cx,
+        &f,
+        FakeInstaller {
+            gate: Mutex::new(gate),
+            transcriber: hears.clone(),
+        },
+    );
+    press(cx, f.window, &["i"]);
+    wait_for(cx, &f.view, |view| {
+        view.model
+            .as_ref()
+            .and_then(super::model::ModelPrompt::fraction)
+            .is_some_and(|f| f > 0.0)
+    });
+    let text = banner(cx, &f).expect("the banner shows progress");
+    assert!(text.contains("0.8 GB of 1.5 GB (50 %)"), "{text}");
+    assert_eq!(hears.heard.lock().expect("heard").len(), 0);
+
+    release.send(()).expect("the install waits");
+    wait_until(cx, &f, || checked_events(&f.dir) == 2);
+    assert_eq!(banner(cx, &f), None, "the banner is gone once installed");
+    assert_eq!(
+        *hears.heard.lock().expect("heard"),
+        vec![f.dir.join("takes/a/001.wav")],
+        "the take is checked again, now with words"
+    );
+    assert_eq!(unheard(&f.dir), Vec::<tw::TakeRef>::new());
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("checking the words of 1 take"), "{shown}");
+}

@@ -14,6 +14,7 @@ mod clock;
 mod lines;
 mod media;
 mod meter;
+mod model;
 mod panel;
 mod prompter;
 mod recorder;
@@ -32,8 +33,9 @@ use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::base::slider::SliderEvent;
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render, Styled as _, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use std::sync::Arc;
 
@@ -74,6 +76,7 @@ gpui_kit::actions!(
         SetupListen,
         SetupNext,
         CloseSetup,
+        InstallModel,
         Quit,
     ]
 );
@@ -125,6 +128,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(",", MonitorQuieter, Some(CONTEXT)),
         KeyBinding::new(".", MonitorLouder, Some(CONTEXT)),
         KeyBinding::new("c", ToggleSetup, Some(CONTEXT)),
+        KeyBinding::new("i", InstallModel, Some(CONTEXT)),
         KeyBinding::new("space", SetupListen, Some(SETUP)),
         KeyBinding::new("enter", SetupNext, Some(SETUP)),
         KeyBinding::new("escape", CloseSetup, Some(SETUP)),
@@ -234,6 +238,8 @@ pub fn run(dir: &Path) -> Result<(), String> {
                     cx,
                 );
                 view.defaults_path = tw::settings_path();
+                view.model =
+                    model::prompt_for(&view.project.config.check, &tw::whisper::models_dir());
                 view
             })
         });
@@ -301,6 +307,9 @@ pub struct RecordingWindow {
     /// Why the setup check should run (none ran, or the devices changed),
     /// shown as an offer.
     setup_offer: Option<String>,
+    /// The offer to install the speech model while it is missing; none in
+    /// tests unless a test sets one.
+    model: Option<model::ModelPrompt>,
 }
 
 impl RecordingWindow {
@@ -377,6 +386,7 @@ impl RecordingWindow {
             text_layout: None,
             setup: None,
             setup_offer: None,
+            model: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -426,6 +436,9 @@ impl RecordingWindow {
         self.media.stop_channel_meter();
         self.save_volumes(true);
         self.checks.cancel();
+        if let Some(prompt) = &self.model {
+            prompt.cancel();
+        }
     }
 
     fn line_id(&self) -> Option<&str> {
@@ -508,6 +521,44 @@ impl RecordingWindow {
                 self.checks.queue(&u.take, &snapshot);
             }
         }
+    }
+
+    /// Starts installing the speech model (I), unless a take records.
+    fn install_model(&mut self) {
+        if self.recorder.is_recording() {
+            return;
+        }
+        if let Some(prompt) = &mut self.model {
+            prompt.start();
+        }
+    }
+
+    /// The model is in place: checks now hear words, and the takes whose
+    /// words went unchecked are checked again.
+    fn model_installed(&mut self) {
+        let Some(prompt) = self.model.take() else {
+            return;
+        };
+        // The old worker checks without words; dropping it cancels it.
+        self.checks = Checks::new(self.dir.clone(), prompt.installer().checker(&self.project));
+        self.reload();
+        let again = match tw::read(&self.dir) {
+            Ok(ledger) => tw::words_not_checked_takes(&self.project, &ledger),
+            Err(_) => Vec::new(),
+        };
+        for take in &again {
+            if let Some(snapshot) = self.project.snapshot(&take.line) {
+                self.checks.queue(take, &snapshot);
+            }
+        }
+        self.message = Some(if again.is_empty() {
+            "Installed the speech model; takes are now checked with words.".to_owned()
+        } else {
+            format!(
+                "Installed the speech model; checking the words of {} take(s).",
+                again.len()
+            )
+        });
     }
 
     /// Takes in finished checks: reloads to show their verdicts, and says
@@ -653,6 +704,9 @@ impl RecordingWindow {
             self.reload();
         }
         self.collect_checks();
+        if self.model.as_mut().is_some_and(model::ModelPrompt::poll) {
+            self.model_installed();
+        }
         let busy = self.recorder.is_recording() || self.recorder.is_playing();
         let now = self.media.host_now_s();
         if !busy
@@ -981,6 +1035,77 @@ impl RecordingWindow {
     }
 }
 
+impl RecordingWindow {
+    /// The offer to run the setup check, while it is closed.
+    fn render_setup_offer(&self) -> Option<gpui_kit::AnyElement> {
+        self.setup_offer
+            .as_ref()
+            .filter(|_| self.setup.is_none())
+            .map(|why| {
+                div()
+                    .px(px(16.))
+                    .pt(px(8.))
+                    .text_size(px(13.))
+                    .text_color(rgb(colors::WARN))
+                    .child(format!("Setup: {why}. Press C for the setup check."))
+                    .into_any_element()
+            })
+    }
+
+    /// The speech model banner: the offer with an Install button, then a
+    /// progress bar while it downloads.
+    fn render_model_banner(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let prompt = self.model.as_ref()?;
+        // 0 to 1, so the cast loses nothing visible.
+        #[allow(clippy::cast_possible_truncation)]
+        let fraction = prompt.fraction().map(|f| f.clamp(0.0, 1.0) as f32);
+        let button = (!prompt.installing()).then(|| {
+            div()
+                .id("install-model")
+                .px(px(10.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .bg(rgb(colors::SELECTED))
+                .text_color(rgb(colors::TEXT))
+                .cursor_pointer()
+                .child("Install")
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.install_model();
+                    cx.notify();
+                }))
+        });
+        let bar = fraction.map(|f| {
+            div()
+                .w(px(240.))
+                .h(px(6.))
+                .rounded(px(3.))
+                .bg(rgb(colors::SELECTED))
+                .child(
+                    div()
+                        .h_full()
+                        .rounded(px(3.))
+                        .bg(rgb(colors::ACCENT))
+                        .w(px(240. * f)),
+                )
+        });
+        Some(
+            div()
+                .px(px(16.))
+                .pt(px(8.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.))
+                .text_size(px(13.))
+                .text_color(rgb(colors::WARN))
+                .child(prompt.text())
+                .children(button)
+                .children(bar)
+                .into_any_element(),
+        )
+    }
+}
+
 /// The audio keys: the panel (A), monitoring (H), the clipping light (K)
 /// and the film and monitor volume.
 fn audio_actions(
@@ -1072,18 +1197,8 @@ impl Render for RecordingWindow {
         } else {
             CONTEXT
         };
-        let offer = self
-            .setup_offer
-            .as_ref()
-            .filter(|_| self.setup.is_none())
-            .map(|why| {
-                div()
-                    .px(px(16.))
-                    .pt(px(8.))
-                    .text_size(px(13.))
-                    .text_color(rgb(colors::WARN))
-                    .child(format!("Setup: {why}. Press C for the setup check."))
-            });
+        let offer = self.render_setup_offer();
+        let model_view = self.render_model_banner(cx);
 
         let root = div()
             .id("recording-window")
@@ -1097,6 +1212,10 @@ impl Render for RecordingWindow {
             .on_action(cx.listener(Self::mark))
             .on_action(cx.listener(Self::edit))
             .on_action(cx.listener(Self::cancel_edit))
+            .on_action(cx.listener(|view, _: &InstallModel, _, cx| {
+                view.install_model();
+                cx.notify();
+            }))
             .on_action(cx.listener(|view, _: &PrevLine, _, cx| view.move_line(-1, cx)))
             .on_action(cx.listener(|view, _: &NextLine, _, cx| view.move_line(1, cx)))
             .on_action(cx.listener(|view, _: &PrevTake, _, cx| view.move_take(-1, cx)))
@@ -1125,6 +1244,7 @@ impl Render for RecordingWindow {
                     .children(setup_view)
                     .child(self.side_column()),
             )
+            .children(model_view)
             .children(offer)
             .child(
                 div()
