@@ -28,10 +28,20 @@
 //! offsets' positions are not), or at the next word's start, whichever is
 //! first. Confidence is the lowest token probability in the word.
 //! Annotations such as `[BLANK_AUDIO]` or `(sighs)` are dropped.
+//!
+//! Every failure is soft (a [`Transcript::Failed`]): a tool that does not
+//! finish within its timeout is killed, token text is read as bytes so a
+//! character split over two tokens joins up again (anything still invalid
+//! becomes U+FFFD), and word times out of order or out of range are
+//! rejected rather than trusted.
 
 use std::fmt::Write as _;
+use std::io::Read as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -45,6 +55,10 @@ use crate::words::drop_annotations;
 pub const SPEECH_MARGIN_S: f64 = 0.3;
 /// The models directory used when `$TAKEWISE_MODELS` is not set, under `$HOME`.
 pub const DEFAULT_MODELS_DIR: &str = ".local/share/takewise/models";
+/// How long `ffmpeg` may take to convert a take before it is stopped.
+pub const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `whisper-cli` may take to transcribe a take before it is stopped.
+pub const WHISPER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Searched after `$PATH`, since an app started from Finder gets a minimal one.
 const FALLBACK_TOOL_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 /// whisper.cpp's DTW alignment-head presets.
@@ -110,6 +124,10 @@ pub struct WhisperCli {
     pub language: String,
     /// The DTW preset matching the model, such as `large.v3.turbo`.
     pub dtw_preset: String,
+    /// [`FFMPEG_TIMEOUT`] unless changed.
+    pub ffmpeg_timeout: Duration,
+    /// [`WHISPER_TIMEOUT`] unless changed.
+    pub whisper_timeout: Duration,
 }
 
 impl WhisperCli {
@@ -132,6 +150,8 @@ impl WhisperCli {
             model,
             language: language.to_owned(),
             dtw_preset: preset.to_owned(),
+            ffmpeg_timeout: FFMPEG_TIMEOUT,
+            whisper_timeout: WHISPER_TIMEOUT,
         })
     }
 
@@ -156,7 +176,7 @@ impl WhisperCli {
             tool_dirs
                 .iter()
                 .map(|dir| dir.join(tool))
-                .find(|path| path.is_file())
+                .find(|path| is_executable(path))
                 .ok_or(SetupError::MissingTool { tool, formula })
         };
         let whisper = find("whisper-cli", "whisper-cpp")?;
@@ -190,6 +210,7 @@ impl WhisperCli {
                 .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
                 .arg(&pcm),
             &self.ffmpeg,
+            self.ffmpeg_timeout,
         )?;
         run_tool(
             Command::new(&self.whisper)
@@ -203,15 +224,16 @@ impl WhisperCli {
                 .arg(&out)
                 .arg("-np"),
             &self.whisper,
+            self.whisper_timeout,
         )?;
         let json_path = out.with_extension("json");
-        let text = std::fs::read_to_string(&json_path).map_err(|err| {
+        let json = std::fs::read(&json_path).map_err(|err| {
             format!(
                 "could not read whisper-cli output {}: {err}",
                 json_path.display()
             )
         })?;
-        parse_full_json(&text)
+        parse_full_json(json)
     }
 }
 
@@ -235,24 +257,63 @@ pub fn models_dir() -> PathBuf {
         .join(DEFAULT_MODELS_DIR)
 }
 
-/// Runs a tool to completion; a failure to start it or a nonzero exit is an
-/// error naming the tool and quoting the end of its stderr.
-fn run_tool(command: &mut Command, tool: &Path) -> Result<(), String> {
-    let output = command
+/// A regular file anyone may execute.
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Runs a tool to completion; a failure to start it, a nonzero exit or
+/// running longer than `timeout` (the tool is then killed) is an error naming
+/// the tool and quoting the end of its stderr.
+fn run_tool(command: &mut Command, tool: &Path, timeout: Duration) -> Result<(), String> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|err| format!("could not run {}: {err}", tool.display()))?;
-    if output.status.success() {
+    // Read stderr on the side, so a chatty tool never blocks on a full pipe.
+    let (sender, receiver) = mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+            let _ = sender.send(buffer);
+        });
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            waited => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match waited {
+                    Err(err) => format!("could not wait for {}: {err}", tool.display()),
+                    Ok(_) => format!(
+                        "{} timed out after {} s and was stopped",
+                        tool.display(),
+                        timeout.as_secs_f64()
+                    ),
+                });
+            }
+        }
+    };
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A child the tool left behind may hold stderr open; do not wait for it.
+    let stderr = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines
         .get(lines.len().saturating_sub(3)..)
         .unwrap_or_default();
-    let mut message = format!("{} failed ({})", tool.display(), output.status);
+    let mut message = format!("{} failed ({status})", tool.display());
     if !tail.is_empty() {
         let _ = write!(message, ": {}", tail.join(" / "));
     }
@@ -266,7 +327,13 @@ pub fn dtw_preset(model_file: &str) -> Option<&'static str> {
     let name = name.strip_prefix("ggml-").unwrap_or(name);
     // Drop a quantization suffix such as `-q5_0` or `-q8_0`.
     let name = match name.rfind("-q") {
-        Some(at) if name[at + 2..].starts_with(|c: char| c.is_ascii_digit()) => &name[..at],
+        Some(at)
+            if name
+                .get(at + 2..)
+                .is_some_and(|q| q.starts_with(|c: char| c.is_ascii_digit())) =>
+        {
+            name.get(..at).unwrap_or(name)
+        }
         _ => name,
     };
     let dotted = name.replace('-', ".");
@@ -285,10 +352,34 @@ struct Segment {
 
 #[derive(Deserialize)]
 struct Token {
-    text: String,
+    text: RawText,
     offsets: Offsets,
     p: f32,
-    t_dtw: i64,
+    #[serde(default)]
+    t_dtw: Option<i64>,
+}
+
+/// A JSON string's bytes, which need not be valid UTF-8: whisper may split a
+/// character over two tokens.
+struct RawText(Vec<u8>);
+
+impl<'de> Deserialize<'de> for RawText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<RawText, D::Error> {
+        struct Bytes;
+        impl serde::de::Visitor<'_> for Bytes {
+            type Value = RawText;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<RawText, E> {
+                Ok(RawText(bytes.to_vec()))
+            }
+            fn visit_str<E>(self, text: &str) -> Result<RawText, E> {
+                Ok(RawText(text.as_bytes().to_vec()))
+            }
+        }
+        deserializer.deserialize_bytes(Bytes)
+    }
 }
 
 #[derive(Deserialize)]
@@ -299,73 +390,95 @@ struct Offsets {
 
 /// A word being assembled from tokens.
 struct Partial {
-    text: String,
+    text: Vec<u8>,
     start_cs: i64,
     duration_ms: i64,
     confidence: f32,
 }
 
 /// Parses `whisper-cli -ojf -dtw …` output into words (see the module doc).
-pub fn parse_full_json(text: &str) -> Result<Vec<Word>, String> {
-    let json: FullJson = serde_json::from_str(text)
+pub fn parse_full_json(json: impl AsRef<[u8]>) -> Result<Vec<Word>, String> {
+    let json: FullJson = serde_json::from_slice(json.as_ref())
         .map_err(|err| format!("could not parse whisper-cli output: {err}"))?;
+    let out_of_range = || "whisper-cli gave token times out of range".to_owned();
     let mut partials: Vec<Partial> = Vec::new();
     // Punctuation after a space (an opening quote) waits for the next word.
-    let mut prefix = String::new();
+    let mut prefix: Vec<u8> = Vec::new();
     for token in json.transcription.iter().flat_map(|s| &s.tokens) {
-        let special = token.text.starts_with("[_") && token.text.ends_with(']');
+        let bytes = token.text.0.as_slice();
+        let text = String::from_utf8_lossy(bytes);
+        let special = text.starts_with("[_") && text.ends_with(']');
         if special {
             continue;
         }
-        let wordy = token.text.chars().any(char::is_alphanumeric);
-        let spaced = token.text.starts_with(char::is_whitespace);
+        let wordy = text.chars().any(char::is_alphanumeric);
+        let spaced = text.starts_with(char::is_whitespace);
         if !wordy {
             match partials.last_mut() {
-                Some(word) if !spaced && prefix.is_empty() => word.text.push_str(&token.text),
-                _ => prefix.push_str(&token.text),
+                Some(word) if !spaced && prefix.is_empty() => word.text.extend_from_slice(bytes),
+                _ => prefix.extend_from_slice(bytes),
             }
             continue;
         }
-        if token.t_dtw < 0 {
+        let Some(t_dtw) = token.t_dtw.filter(|&t| t >= 0) else {
             return Err(format!(
                 "whisper-cli gave no word times (DTW) for {:?}; is it whisper.cpp 1.7 or later?",
-                token.text.trim()
+                text.trim()
             ));
-        }
-        let duration_ms = (token.offsets.to - token.offsets.from).max(0);
+        };
+        let duration_ms = token
+            .offsets
+            .to
+            .checked_sub(token.offsets.from)
+            .ok_or_else(out_of_range)?
+            .max(0);
         match partials.last_mut() {
             Some(word) if !spaced && prefix.is_empty() => {
-                word.text.push_str(&token.text);
-                word.duration_ms += duration_ms;
+                word.text.extend_from_slice(bytes);
+                word.duration_ms = word
+                    .duration_ms
+                    .checked_add(duration_ms)
+                    .ok_or_else(out_of_range)?;
                 word.confidence = word.confidence.min(token.p);
             }
-            _ => partials.push(Partial {
-                text: std::mem::take(&mut prefix) + &token.text,
-                start_cs: token.t_dtw,
-                duration_ms,
-                confidence: token.p,
-            }),
+            _ => {
+                let mut text = std::mem::take(&mut prefix);
+                text.extend_from_slice(bytes);
+                partials.push(Partial {
+                    text,
+                    start_cs: t_dtw,
+                    duration_ms,
+                    confidence: token.p,
+                });
+            }
         }
     }
     let starts: Vec<f64> = partials.iter().map(|p| p.start_cs as f64 / 100.0).collect();
     let words = partials
         .iter()
+        .zip(&starts)
         .enumerate()
-        .map(|(i, partial)| {
-            let start = starts[i];
+        .map(|(i, (partial, &start))| {
             let mut end = start + partial.duration_ms as f64 / 1000.0;
             if let Some(&next) = starts.get(i + 1) {
                 end = end.min(next).max(start);
             }
             Word {
-                text: partial.text.trim().to_owned(),
+                text: String::from_utf8_lossy(&partial.text).trim().to_owned(),
                 start,
                 end,
                 confidence: Some(partial.confidence),
             }
         })
         .collect();
-    Ok(drop_annotations(words))
+    let words = drop_annotations(words);
+    if let Some(pair) = words.windows(2).find(|pair| pair[1].start < pair[0].start) {
+        return Err(format!(
+            "whisper-cli gave word times out of order ({:.2} s after {:.2} s)",
+            pair[1].start, pair[0].start
+        ));
+    }
+    Ok(words)
 }
 
 /// Drops words entirely outside the energy speech range widened by
@@ -383,7 +496,6 @@ pub fn keep_within(words: Vec<Word>, speech: Option<(f64, f64)>) -> Vec<Word> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
     use crate::words::{align, normalize};
@@ -450,7 +562,7 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
 
     #[test]
     fn parses_full_json_words() {
-        let words = parse_full_json(&fs::read_to_string(FIXTURE).unwrap()).unwrap();
+        let words = parse_full_json(fs::read(FIXTURE).unwrap()).unwrap();
         let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(
             text.join(" "),
@@ -599,6 +711,134 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         let message = failure(cli(tmp.path(), whisper).transcribe(&tmp.path().join("t.wav")));
         assert!(message.contains("failed to load model"), "{message}");
         assert!(message.contains('3'), "{message}");
+    }
+
+    #[test]
+    fn a_hung_tool_is_stopped_and_fails_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whisper = fake_whisper(tmp.path(), "exec sleep 30");
+        let mut cli = cli(tmp.path(), whisper);
+        cli.whisper_timeout = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let message = failure(cli.transcribe(&tmp.path().join("t.wav")));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(message.contains("whisper-cli"), "{message}");
+        assert!(message.contains("timed out after 0.2 s"), "{message}");
+
+        cli.ffmpeg = script(tmp.path(), "slow-ffmpeg", "exec sleep 30");
+        cli.ffmpeg_timeout = std::time::Duration::from_millis(200);
+        let message = failure(cli.transcribe(&tmp.path().join("t.wav")));
+        assert!(message.contains("slow-ffmpeg"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+    }
+
+    #[test]
+    fn default_timeouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = cli(tmp.path(), tmp.path().join("whisper-cli"));
+        assert_eq!(cli.ffmpeg_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(cli.whisper_timeout, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn reads_output_with_split_utf8_lossily() {
+        let tmp = tempfile::tempdir().unwrap();
+        // whisper splits a multibyte character over two tokens, so each
+        // token's text is invalid UTF-8 on its own.
+        // `@1` and `@2` stand for the two halves of "é".
+        let template = r#"{"transcription": [{"tokens": [
+            {"text": " Caf", "offsets": {"from": 0, "to": 300}, "p": 0.9, "t_dtw": 100},
+            {"text": "@1", "offsets": {"from": 300, "to": 350}, "p": 0.5, "t_dtw": 120},
+            {"text": "@2", "offsets": {"from": 350, "to": 400}, "p": 0.5, "t_dtw": 125},
+            {"text": " open", "offsets": {"from": 500, "to": 800}, "p": 0.9, "t_dtw": 150}
+        ]}]}"#;
+        let mut json = Vec::new();
+        for (i, piece) in template.split('@').enumerate() {
+            let piece = piece.as_bytes();
+            match (i, piece.first()) {
+                (0, _) => json.extend_from_slice(piece),
+                (_, Some(b'1')) => json.push(0xc3),
+                (_, _) => json.push(0xa9),
+            }
+            if i > 0 {
+                json.extend_from_slice(&piece[1..]);
+            }
+        }
+        let source = tmp.path().join("split.json");
+        fs::write(&source, json).unwrap();
+        let whisper = fake_whisper(
+            tmp.path(),
+            &format!(r#"cp "{}" "$out.json""#, source.display()),
+        );
+        let Transcript::Words(words) =
+            cli(tmp.path(), whisper).transcribe(&tmp.path().join("t.wav"))
+        else {
+            panic!("expected words");
+        };
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["Café", "open"]);
+        // A byte that never completes a character becomes U+FFFD.
+        let json = br#"{"transcription": [{"tokens": [
+            {"text": " Caf", "offsets": {"from": 0, "to": 300}, "p": 0.9, "t_dtw": 100}
+        ]}]}"#;
+        let mut broken = json.to_vec();
+        let at = broken.iter().position(|&b| b == b'C').unwrap();
+        broken.insert(at + 3, 0xc3);
+        let words = parse_full_json(&broken).unwrap();
+        assert_eq!(words[0].text, "Caf\u{fffd}");
+    }
+
+    #[test]
+    fn parses_without_a_dtw_key_fails_helpfully() {
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": " Hello", "offsets": {"from": 0, "to": 460}, "p": 0.6}
+        ]}]}"#;
+        let err = parse_full_json(json).unwrap_err();
+        assert!(err.contains("word times (DTW)"), "{err}");
+    }
+
+    #[test]
+    fn parses_out_of_order_or_out_of_range_times_fails_soft() {
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": " Nobody", "offsets": {"from": 0, "to": 300}, "p": 0.9, "t_dtw": 150},
+            {"text": " misses", "offsets": {"from": 300, "to": 600}, "p": 0.9, "t_dtw": 120}
+        ]}]}"#;
+        let err = parse_full_json(json).unwrap_err();
+        assert!(err.contains("out of order"), "{err}");
+
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": " Nobody", "offsets": {"from": -9223372036854775808, "to": 9223372036854775807}, "p": 0.9, "t_dtw": 150}
+        ]}]}"#;
+        let err = parse_full_json(json).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": " Kind", "offsets": {"from": 0, "to": 9223372036854775807}, "p": 0.9, "t_dtw": 150},
+            {"text": "red", "offsets": {"from": 0, "to": 9223372036854775807}, "p": 0.9, "t_dtw": 160}
+        ]}]}"#;
+        let err = parse_full_json(json).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn discover_skips_files_that_are_not_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let models = tmp.path().join("models");
+        for dir in [&first, &second, &models] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(first.join("whisper-cli"), "not a program").unwrap();
+        fs::write(first.join("ffmpeg"), "not a program").unwrap();
+        fake_whisper(&second, "exit 0");
+        fake_ffmpeg(&second);
+        fs::write(models.join("ggml-large-v3-turbo.bin"), "").unwrap();
+        let cli =
+            WhisperCli::discover_in(&CheckConfig::default(), &[first, second.clone()], &models)
+                .unwrap();
+        assert_eq!(cli.whisper, second.join("whisper-cli"));
+        assert_eq!(cli.ffmpeg, second.join("ffmpeg"));
     }
 
     #[test]

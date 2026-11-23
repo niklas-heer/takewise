@@ -169,7 +169,7 @@ All local, run after each take and by `takewise check`. Recording and choosing w
   2. Clipping → `retake`.
   3. One or more missing or extra words → `retake`, naming them.
   4. Overrun beyond 0.25 s or early start beyond 0.3 s → `retake`, with the amount. Early start is measured from the energy speech start, unless that lies more than 0.25 s before the first transcribed word: then it is a breath before the words (seen on the real Kindred take, line 4: 0.52 s early) and the first word's time counts. Word times from DTW land 0.08 to 0.20 s after the real onset, so an energy start just before the first word is the onset itself.
-  5. Transcription failed or unavailable → `listen` ("words not checked").
+  5. Transcription failed or unavailable → `listen` ("words not checked"). This includes a tool that does not finish in time (`ffmpeg` 30 s, `whisper-cli` 120 s), which is stopped, and output with word times missing, out of order or out of range.
   6. Only substitutions (likely mishearings of names or numbers) → `listen`, naming them.
   7. Otherwise → `keep`.
   Thresholds are tuned on real takes (the Kindred narration recorded on 2026-11-22), not only on synthetic `say` fixtures.
