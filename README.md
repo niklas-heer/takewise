@@ -63,6 +63,10 @@ With Rust (pinned in `rust-toolchain.toml`) and [mise](https://mise.jdx.dev): `m
 | K | Clear the clipping light |
 | I | Install the speech model, while it is missing |
 
+### The start window
+
+Opening `Takewise.app` from the Dock or Finder shows the start window. **Open project…** (⌘O) opens a `.takewise` folder; any other folder asks for the finished film and starts a project there (in a new `<film>.takewise` folder inside it, unless the folder is empty or named `….takewise`). If that `<film>.takewise` project exists already, it opens. Recent projects are listed below; a project that is already open comes to the front instead of opening twice.
+
 ## Agents
 
 Every state the window shows is readable with `--json`, and the folder is plain TOML, JSONL and WAV, so an agent can run everything but the recording itself: write the script, read the checks, judge and choose takes, export, and place the narration in Resolve. [docs/agents.md](docs/agents.md) walks through that loop with the exact commands and JSON shapes; a test runs every command in it.

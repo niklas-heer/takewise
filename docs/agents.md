@@ -11,6 +11,7 @@ This guide walks one project through the whole loop. Every command in it is run 
 - Never edit `takes.jsonl` or anything under `takes/`. Takes are only ever added; choices and judgments are new events written by `choose` and `judge`.
 - Write `script.toml` freely before recording. Once takes exist, change one field at a time with `takewise script set … --expect <script_version>`, so an edit made against a script the narrator changed meanwhile is refused instead of lost.
 - Flag, don't decide: checks and judgments rank takes; only `choose` (yours or the narrator's) picks one.
+- Work through the `takewise` command, never the app's windows: `takewise record <dir>` opens the recording window for the narrator.
 
 ## 1. Check the setup
 

@@ -34,10 +34,10 @@ use std::path::{Path, PathBuf};
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::base::slider::SliderEvent;
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, px, rgb, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Global,
+    InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use std::sync::Arc;
 
@@ -305,6 +305,37 @@ fn set_up_app(cx: &mut App) {
     .detach();
 }
 
+/// The recording windows open in this app, by project folder.
+#[derive(Default)]
+struct OpenProjects(Vec<(PathBuf, WeakEntity<RecordingWindow>, AnyWindowHandle)>);
+
+impl Global for OpenProjects {}
+
+/// The folder as compared between windows: resolved, so two paths to one
+/// project match.
+fn folder_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Brings the recording window open on `dir` to the front, if there is
+/// one; returns whether there was.
+fn focus_open(dir: &Path, cx: &mut App) -> bool {
+    let key = folder_key(dir);
+    let open = cx.try_global::<OpenProjects>().and_then(|open| {
+        open.0
+            .iter()
+            .find(|(folder, view, _)| *folder == key && view.upgrade().is_some())
+            .map(|(_, _, window)| *window)
+    });
+    open.is_some_and(|window| {
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    })
+}
+
 /// Opens a recording window on the loaded project in `dir`, inside the
 /// running app.
 fn open_recording(dir: PathBuf, loaded: Loaded, cx: &mut App) -> Result<(), String> {
@@ -432,6 +463,12 @@ impl RecordingWindow {
             view.shutdown();
             async {}
         });
+        let handle = window.window_handle();
+        let me = cx.weak_entity();
+        let key = folder_key(&dir);
+        let open = cx.default_global::<OpenProjects>();
+        open.0.retain(|(_, view, _)| view.upgrade().is_some());
+        open.0.push((key, me, handle));
         let checks = Checks::new(dir.clone(), checker);
         let checks_for = check_key(&loaded.project);
         let loaded_unchecked = loaded.unchecked;

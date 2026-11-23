@@ -3411,3 +3411,32 @@ fn a_denied_microphone_blocks_recording_with_the_settings_path(cx: &mut TestAppC
     press(cx, f.window, &["space"]);
     assert!(f.media.capturing(), "the take starts and macOS asks");
 }
+
+// The start window.
+
+#[gpui_kit::test]
+fn opening_a_project_already_open_focuses_its_window(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let start = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| super::start::StartWindow::new(Vec::new(), window, cx))
+        })
+        .expect("open the start window")
+    });
+    assert_eq!(cx.windows().len(), 2);
+    // The same folder by another path.
+    let again = f.dir.join("takes").join("..");
+    cx.update_window(start.0, |_, window, cx| {
+        start
+            .1
+            .update(cx, |view, cx| view.open_project(&again, window, cx));
+    })
+    .expect("start window");
+    let message = start.1.read_with(cx, |view, _| view.message.clone());
+    assert_eq!(message, None, "no error");
+    assert_eq!(
+        cx.windows(),
+        vec![f.window],
+        "no second window on the project"
+    );
+}

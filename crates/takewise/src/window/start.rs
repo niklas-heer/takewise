@@ -1,7 +1,9 @@
 //! The start window: what Takewise.app shows when it is opened without a
 //! project (from the Dock or Finder). It opens a project folder, starts a
 //! new one from a finished film, lists the projects opened recently, and
-//! installs the command line tool.
+//! installs the command line tool. A project already open is brought to
+//! the front instead of opening twice, and a film whose project was
+//! started before opens that project.
 //!
 //! The recent projects are a convenience kept beside the app's settings
 //! (`recent.json` next to `settings.toml`); failing to read or write them
@@ -16,7 +18,7 @@ use gpui_kit::{
 };
 use takewise_core as tw;
 
-use super::{InstallCommand, colors, open_recording, prepare};
+use super::{InstallCommand, colors, focus_open, open_recording, prepare};
 
 gpui_kit::actions!(takewise_start, [OpenProject]);
 
@@ -59,6 +61,13 @@ pub fn new_project_dir(folder: &Path, film: &Path) -> PathBuf {
         .file_stem()
         .map_or_else(|| "narration".into(), |stem| stem.to_string_lossy());
     folder.join(format!("{stem}.takewise"))
+}
+
+/// What starting a project for `film` in `folder` does: open the project
+/// already at [`new_project_dir`] (the film's `<film>.takewise` made
+/// before), or start one there.
+pub fn start_target(folder: &Path, film: &Path) -> Picked {
+    classify(&new_project_dir(folder, film))
 }
 
 /// The recent projects file: `recent.json` beside the settings file.
@@ -210,7 +219,8 @@ impl StartWindow {
         .detach();
     }
 
-    /// Starts a project for `film` as `takewise init` would, then opens it.
+    /// Starts a project for `film` as `takewise init` would, then opens it;
+    /// opens the one already started for it there instead.
     fn start_project(
         &mut self,
         folder: &Path,
@@ -218,7 +228,10 @@ impl StartWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dir = new_project_dir(folder, film);
+        let dir = match start_target(folder, film) {
+            Picked::Project(dir) => return self.open_project(&dir, window, cx),
+            Picked::New(dir) => dir,
+        };
         match crate::cli::init(&dir, film) {
             Ok(_) => self.open_project(&dir, window, cx),
             Err(err) => {
@@ -228,9 +241,17 @@ impl StartWindow {
         }
     }
 
-    /// Opens the recording window on the project in `dir` and closes this
-    /// window; says why not when it cannot.
+    /// Opens the recording window on the project in `dir` (brings it to
+    /// the front when it is open already) and closes this window; says why
+    /// not when it cannot.
     pub fn open_project(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if focus_open(dir, cx) {
+            if let Ok(dir) = std::path::absolute(dir) {
+                remember_opened(&dir);
+            }
+            window.remove_window();
+            return;
+        }
         let opened = prepare(dir).and_then(|(dir, loaded)| {
             remember_opened(&dir);
             open_recording(dir, loaded, cx)
@@ -415,6 +436,19 @@ mod tests {
             new_project_dir(&films, &film),
             films.join("Kindred Promo.takewise")
         );
+    }
+
+    #[test]
+    fn a_film_whose_project_exists_opens_it() {
+        let tmp = tempfile::tempdir().expect("dir");
+        let films = tmp.path().join("Films");
+        std::fs::create_dir(&films).expect("dir");
+        let film = films.join("Kindred Promo.mov");
+        std::fs::write(&film, b"").expect("film");
+        let project = films.join("Kindred Promo.takewise");
+        assert_eq!(start_target(&films, &film), Picked::New(project.clone()));
+        project_at(&project);
+        assert_eq!(start_target(&films, &film), Picked::Project(project));
     }
 
     #[test]
