@@ -55,6 +55,12 @@ use crate::words::isolate_annotations;
 /// Words this far outside the energy speech range are dropped as
 /// hallucinations (whisper likes to hear "Thank you." in silence).
 pub const SPEECH_MARGIN_S: f64 = 0.3;
+/// How a take's audio is prepared before transcription, named in the
+/// `checked` event's `checker` field as `pre=none` (or, say,
+/// `pre=hp80+norm`; a checker without one means `none`). A transcript is
+/// reused for a moved slot only while this is unchanged, so change it with
+/// anything that changes what whisper hears.
+pub const PREPROCESSING: &str = "none";
 /// The models directory used when `$TAKEWISE_MODELS` is not set, under `$HOME`.
 pub const DEFAULT_MODELS_DIR: &str = ".local/share/takewise/models";
 /// How long `ffmpeg` may take to convert a take before it is stopped.

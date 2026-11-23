@@ -549,7 +549,7 @@ fn cli_check_reports_verdicts_json() {
     assert_eq!(
         first["checker"],
         format!(
-            "takewise {} whisper ggml-large-v3-turbo.bin",
+            "takewise {} whisper ggml-large-v3-turbo.bin pre=none",
             env!("CARGO_PKG_VERSION")
         )
     );

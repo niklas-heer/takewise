@@ -174,6 +174,7 @@ All local, run after each take and by `takewise check`. Recording and choosing w
   7. A sound whisper annotates inside the speech, such as `(coughs)` or `[Music]` → `listen` (`non-speech-sound`), naming it; an annotation outside the speech (`[BLANK_AUDIO]` in the pre-roll) is dropped.
   8. Otherwise → `keep`.
   Thresholds are tuned on real takes (the Kindred narration recorded on 2026-11-22), not only on synthetic `say` fixtures.
+- **Re-checks:** when only a line's slot moved since a take's check (the same text), checking it again recomputes the verdict from that check's words and a fresh energy analysis, without running whisper; the sound finding of rule 7 carries over. The `checked` event's `checker` names the whisper model and how the audio is prepared before transcription (`pre=none` for now; a high-pass filter would be, say, `pre=hp80+norm`); a check by another model or preprocessing is transcribed again, as is a take whose current check is re-run explicitly.
 - **Ranking** among a line's takes, using effective verdicts: takes whose file is missing rank last and are never proposed; then `keep` before `listen` and `unchecked` (equal) before `retake`; then fewer word differences; then smaller overrun; then outside `score`; then newest. The top take is proposed, never chosen automatically.
 
 ## CLI

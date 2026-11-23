@@ -157,6 +157,39 @@ pub fn build_checked(
     }
 }
 
+/// [`build_checked`] for a take whose words were transcribed by an earlier
+/// check against the same text and another slot: the words come from
+/// `previous`, and since the sounds whisper annotated are not stored, its
+/// `non-speech-sound` finding (rule 7, from the same audio) carries over.
+/// `None` when `previous` has no words.
+pub fn rebuild_checked(
+    snapshot: &Snapshot,
+    line_offset_s: f64,
+    analysis: &Analysis,
+    previous: &Checked,
+    checker: &str,
+) -> Option<Checked> {
+    let words = previous.transcript.clone()?;
+    let mut rebuilt = build_checked(
+        snapshot,
+        line_offset_s,
+        analysis,
+        &Transcript::Words(words),
+        checker,
+    );
+    if let Some(sound) = previous
+        .reasons
+        .iter()
+        .find(|r| r.code == "non-speech-sound")
+    {
+        if rebuilt.verdict == Verdict::Keep {
+            rebuilt.verdict = Verdict::Listen;
+        }
+        rebuilt.reasons.push(sound.clone());
+    }
+    Some(rebuilt)
+}
+
 /// When the speech starts, in seconds from the take's first sample, for the
 /// early-start rule (see [`build_checked`]).
 fn speech_onset(analysis: &Analysis, heard: Option<&[Word]>) -> Option<f64> {

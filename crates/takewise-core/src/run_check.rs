@@ -6,23 +6,40 @@
 //! `checked` event under the project lock. A script edited while the check
 //! runs leaves the event with the older snapshot, so the fold shows it as
 //! stale instead of it vouching for text it never saw.
+//!
+//! When only the line's slot moved since an earlier check of the take (the
+//! same text, transcribed by the same model with the same preprocessing),
+//! the verdict is recomputed from that check's words and a fresh energy
+//! analysis, without transcribing again.
 
 use std::path::Path;
 
 use serde::Serialize;
 
-use crate::check::{Transcript, build_checked};
+use crate::check::{Transcript, build_checked, rebuild_checked};
 use crate::error::{Error, Result};
-use crate::ledger::{self, Checked, Event, EventKind, Ledger};
+use crate::ledger::{self, Checked, Event, EventKind, Ledger, Snapshot};
 use crate::project::Project;
 use crate::speech::analyze;
 use crate::takes::{TakeRef, read_take_wav};
-use crate::whisper::{Transcriber, keep_within};
+use crate::whisper::{PREPROCESSING, Transcriber, keep_within};
 
-/// The `checker` field of a `checked` event: the Takewise version and the
-/// whisper model, such as `takewise 0.1.0 whisper ggml-large-v3-turbo.bin`.
+/// The `checker` field of a `checked` event: the Takewise version, the
+/// whisper model and how the audio is prepared before transcription (see
+/// [`PREPROCESSING`]), such as `takewise 0.1.0 whisper
+/// ggml-large-v3-turbo.bin pre=none`.
 pub fn checker(version: &str, model: &str) -> String {
-    format!("takewise {version} whisper {model}")
+    format!("takewise {version} whisper {model} pre={PREPROCESSING}")
+}
+
+/// What a check's words depend on, from its `checker`: the model and the
+/// preprocessing, `none` for a checker from before it was named.
+fn transcription_key(checker: &str) -> Option<(&str, &str)> {
+    let (_, rest) = checker.split_once(" whisper ")?;
+    Some(match rest.split_once(" pre=") {
+        Some((model, pre)) => (model, pre),
+        None => (rest, "none"),
+    })
 }
 
 /// Checks one recorded take against its line as the script has it now and
@@ -49,20 +66,56 @@ pub fn check_take(
     let wav = dir.join(&recorded.file);
     let (samples, rate) = read_take_wav(&wav)?;
     let analysis = analyze(&samples, rate, project.config.record.preroll_s);
-    let transcript = match transcriber.transcribe(&wav) {
-        Transcript::Words(words) => Transcript::Words(keep_within(words, analysis.speech)),
-        failed @ Transcript::Failed(_) => failed,
-    };
-    let checked = build_checked(
-        &snapshot,
-        recorded.line_offset_s,
-        &analysis,
-        &transcript,
-        &checker(version, &transcriber.model()),
-    );
+    let by = checker(version, &transcriber.model());
+    let reused = moved_slot_check(&ledger, take, &snapshot, &by).and_then(|previous| {
+        rebuild_checked(&snapshot, recorded.line_offset_s, &analysis, previous, &by)
+    });
+    let checked = reused.unwrap_or_else(|| {
+        let transcript = match transcriber.transcribe(&wav) {
+            Transcript::Words(words) => Transcript::Words(keep_within(words, analysis.speech)),
+            failed @ Transcript::Failed(_) => failed,
+        };
+        build_checked(
+            &snapshot,
+            recorded.line_offset_s,
+            &analysis,
+            &transcript,
+            &by,
+        )
+    });
     let event = Event::new(&take.line, take.take, EventKind::Checked(checked.clone()));
     ledger::append(dir, &event)?;
     Ok(checked)
+}
+
+/// The take's latest check whose words can stand for a check against
+/// `snapshot`: the same text against another slot, with words transcribed
+/// the way the checker `by` would. `None` when a check against `snapshot`
+/// exists (checking it again transcribes again) or there is no such check.
+fn moved_slot_check<'a>(
+    ledger: &'a Ledger,
+    take: &TakeRef,
+    snapshot: &Snapshot,
+    by: &str,
+) -> Option<&'a Checked> {
+    let key = transcription_key(by)?;
+    let checks: Vec<&Checked> = ledger
+        .events
+        .iter()
+        .filter(|e| e.line == take.line && e.take == take.take)
+        .filter_map(|e| match &e.kind {
+            EventKind::Checked(check) => Some(check),
+            _ => None,
+        })
+        .collect();
+    if checks.iter().any(|c| c.snapshot.matches(snapshot)) {
+        return None;
+    }
+    checks.into_iter().rev().find(|c| {
+        c.snapshot.text == snapshot.text
+            && c.transcript.is_some()
+            && transcription_key(&c.checker) == Some(key)
+    })
 }
 
 /// A take without a current check.
@@ -242,7 +295,10 @@ mod tests {
         // The hallucinated "Thank you." lies beyond the speech and is dropped.
         assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
         assert_eq!(checked.transcript.as_ref().map(Vec::len), Some(4));
-        assert_eq!(checked.checker, "takewise 0.1.0 whisper ggml-fake.bin");
+        assert_eq!(
+            checked.checker,
+            "takewise 0.1.0 whisper ggml-fake.bin pre=none"
+        );
         assert_eq!(checked.snapshot.text, "Nobody misses a birthday.");
         let (start, end) = checked.speech.unwrap();
         assert!((start - 2.0).abs() < 0.02 && (end - 3.5).abs() < 0.02);
@@ -318,6 +374,129 @@ mod tests {
                 stale: true
             }]
         );
+    }
+
+    /// Counts its transcriptions; hears the line on time.
+    struct Counting {
+        model: &'static str,
+        calls: Mutex<u32>,
+    }
+
+    impl Counting {
+        fn new(model: &'static str) -> Self {
+            Self {
+                model,
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl Transcriber for Counting {
+        fn transcribe(&self, path: &Path) -> Transcript {
+            *self.calls.lock().unwrap() += 1;
+            Fake::new().transcribe(path)
+        }
+        fn model(&self) -> String {
+            self.model.to_owned()
+        }
+    }
+
+    #[test]
+    fn a_moved_slot_reuses_the_transcript() {
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        let whisper = Counting::new("ggml-fake.bin");
+        assert_eq!(
+            check_take(&dir, &t, &whisper, "0.1.0").unwrap().verdict,
+            Verdict::Keep
+        );
+        assert_eq!(whisper.calls(), 1);
+
+        // A 1 s slot: the speech now ends 0.5 s after it. The verdict is
+        // recomputed from the stored words, without transcribing.
+        set_line_field(&dir, "hook", Field::End(Some(11.0)), None).unwrap();
+        let checked = check_take(&dir, &t, &whisper, "0.1.1").unwrap();
+        assert_eq!(whisper.calls(), 1);
+        assert_eq!(checked.verdict, Verdict::Retake);
+        assert_eq!(checked.reasons[0].code, "overrun");
+        assert_eq!(checked.snapshot.end, 11.0);
+        assert_eq!(checked.transcript.as_ref().map(Vec::len), Some(4));
+        assert_eq!(
+            checked.checker,
+            "takewise 0.1.1 whisper ggml-fake.bin pre=none"
+        );
+        let project = Project::open(&dir).unwrap();
+        assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);
+
+        // A changed text, or another model, transcribes again.
+        set_line_field(&dir, "hook", Field::Start(9.0), None).unwrap();
+        let other = Counting::new("ggml-other.bin");
+        check_take(&dir, &t, &other, "0.1.1").unwrap();
+        assert_eq!(other.calls(), 1);
+        set_line_field(
+            &dir,
+            "hook",
+            Field::Text("Nobody forgets a birthday.".to_owned()),
+            None,
+        )
+        .unwrap();
+        let checked = check_take(&dir, &t, &whisper, "0.1.1").unwrap();
+        assert_eq!(whisper.calls(), 2);
+        assert_eq!(checked.verdict, Verdict::Listen);
+    }
+
+    #[test]
+    fn a_reused_transcript_keeps_the_sound_finding() {
+        struct Coughing;
+        impl Transcriber for Coughing {
+            fn transcribe(&self, _: &Path) -> Transcript {
+                Transcript::Words(vec![
+                    word("Nobody", 2.1),
+                    word("(coughs)", 2.4),
+                    word("misses", 2.7),
+                    word("a", 2.9),
+                    word("birthday.", 3.1),
+                ])
+            }
+            fn model(&self) -> String {
+                "ggml-fake.bin".to_owned()
+            }
+        }
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        let checked = check_take(&dir, &t, &Coughing, "0.1.0").unwrap();
+        assert_eq!(checked.verdict, Verdict::Listen);
+        set_line_field(&dir, "hook", Field::End(Some(14.0)), None).unwrap();
+        let reused = check_take(&dir, &t, &Fake::new(), "0.1.0").unwrap();
+        assert_eq!(reused.verdict, Verdict::Listen);
+        assert_eq!(reused.reasons, checked.reasons);
+    }
+
+    #[test]
+    fn transcription_key_names_model_and_preprocessing() {
+        let key = transcription_key;
+        assert_eq!(
+            key("takewise 0.1.0 whisper ggml-a.bin"),
+            Some(("ggml-a.bin", "none"))
+        );
+        assert_eq!(
+            key("takewise 0.1.0 whisper ggml-a.bin pre=hp80+norm"),
+            Some(("ggml-a.bin", "hp80+norm"))
+        );
+        // Another preprocessing or model transcribes again.
+        assert_ne!(
+            key("takewise 0.1.0 whisper ggml-a.bin pre=hp80+norm"),
+            key("takewise 0.1.0 whisper ggml-a.bin")
+        );
+        assert_eq!(
+            key(&checker("0.1.0", "ggml-a.bin")),
+            Some(("ggml-a.bin", PREPROCESSING))
+        );
+        assert_eq!(key("hand-written"), None);
     }
 
     #[test]
