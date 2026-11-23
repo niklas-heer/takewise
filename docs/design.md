@@ -27,7 +27,7 @@ Takewise is a small macOS app for exactly that job: speak a script over a finish
 - Retiming the film to the voice. The manifest gives agents the measured timings to do that.
 - Driving Resolve from Takewise. Agents place the export in Resolve with their own Resolve tools.
 - Hearing the previous line's take during pre-roll (later).
-- Loudness control beyond the fixed `clean` export profile (one static gain to −16 LUFS, peaks at −1 dBTP).
+- Loudness control beyond the fixed `clean` export profile (one gain and a look-ahead peak limiter to −16 LUFS, true peak at most −1 dBTP).
 - Windows and Linux. Apple Silicon macOS only.
 
 ## Anti-goals
