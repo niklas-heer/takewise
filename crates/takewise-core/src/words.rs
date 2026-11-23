@@ -3,11 +3,15 @@
 //! Both the script line and the transcript go through [`normalize`], so that
 //! spoken and written forms compare equal: case, punctuation and hyphens are
 //! dropped, contractions expand ("don't" is `do not`), and numbers become
-//! words. Four-digit numbers from 1100 to 1999 and from 2010 to 2099 written
-//! without a thousands separator are read as years, in pairs ("1867" is
-//! `eighteen sixty seven`, "1905" `nineteen oh five`, "1900" `nineteen
-//! hundred`); 2000 to 2009 are read as "two thousand five", as people say
-//! them.
+//! values, however they are written or said: "1,500", "1500", "fifteen
+//! hundred" and "one thousand five hundred" are all `1500`; "one hundred and
+//! five" is `105`, "two thousand and five" `2005`; a year said in two parts
+//! ("eighteen sixty seven", "nineteen oh five") is its value; "1990s" and
+//! "nineteen nineties" are `1990s`, "21st" and "twenty first" `21st`, "3.5"
+//! and "three point five" `3.5`, "$5" and "five dollars" `5 dollars`. A lone
+//! whole one stays the word `one`, since it is often not a number ("every
+//! one"). A number said over several heard words is one token, timed from
+//! its first word to its last.
 //!
 //! An `'s` or a trailing apostrophe is kept as a mark on its [`Token`], since
 //! it changes what the token may be heard as. [`align`] accepts a heard
@@ -123,21 +127,29 @@ fn same(expected: &Token, heard: &Token) -> bool {
 }
 
 /// Two adjacent tokens heard or written as one: a compound (`every day` and
-/// `everyday`), or a contracted "is" (`link is` and `link's`).
+/// `everyday`), a contracted "is" (`link is` and `link's`), or a time read
+/// like a year (`11:30` and "eleven thirty", which is `1130`).
 fn pair_is_one(first: &Token, second: &Token, one: &Token) -> bool {
     let contracted =
         one.apostrophe == Apostrophe::S && first.is_plain(&one.text) && second.is_plain("is");
-    let compound = first.is_plain_word()
-        && second.is_plain_word()
-        && one.is_plain_word()
-        && one.text.len() == first.text.len() + second.text.len()
-        && one.text.starts_with(&first.text)
-        && one.text.ends_with(&second.text);
-    contracted || compound
+    let joined = || {
+        one.text.len() == first.text.len() + second.text.len()
+            && one.text.starts_with(&first.text)
+            && one.text.ends_with(&second.text)
+    };
+    let compound =
+        first.is_plain_word() && second.is_plain_word() && one.is_plain_word() && joined();
+    let digits = |token: &Token, lengths: std::ops::RangeInclusive<usize>| {
+        token.apostrophe == Apostrophe::None
+            && lengths.contains(&token.text.len())
+            && token.text.chars().all(|c| c.is_ascii_digit())
+    };
+    let time = digits(first, 1..=2) && digits(second, 2..=2) && digits(one, 3..=4) && joined();
+    contracted || compound || time
 }
 
 /// Lowercase words with punctuation removed, contractions expanded and
-/// numbers spelled out.
+/// numbers as values.
 pub fn normalize(text: &str) -> Vec<Token> {
     normalize_parts(&[text])
         .into_iter()
@@ -146,43 +158,449 @@ pub fn normalize(text: &str) -> Vec<Token> {
 }
 
 /// [`normalize`] over the consecutive parts of one text (the heard words),
-/// each token with the first and last part it came from.
+/// each token with the first and last part it came from: a number said in
+/// several heard words is one token.
 fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
-    let mut out = Vec::new();
+    let mut items: Vec<(Item, usize)> = Vec::new();
     for (index, part) in parts.iter().enumerate() {
         for raw in raw_tokens(part) {
-            let mut tokens = Vec::new();
-            word_tokens(&raw, &mut tokens);
-            out.extend(tokens.into_iter().map(|token| (token, index, index)));
+            lex(&raw, index, &mut items);
         }
+    }
+    let words: Vec<Option<&str>> = items
+        .iter()
+        .map(|(item, _)| match item {
+            Item::Word(token) if token.apostrophe == Apostrophe::None => Some(token.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut k = 0;
+    while let Some((item, part)) = items.get(k) {
+        if let Some((tokens, next)) = number_phrase(&items, &words, k) {
+            let last = items
+                .get(next.saturating_sub(1))
+                .map_or(*part, |(_, last)| *last);
+            out.extend(tokens.into_iter().map(|token| (token, *part, last)));
+            k = next.max(k + 1);
+            continue;
+        }
+        if let Item::Word(token) | Item::Other(token) = item {
+            out.push((token.clone(), *part, *part));
+        }
+        k += 1;
     }
     out
 }
 
-/// One raw token as normalized tokens.
-fn word_tokens(raw: &str, out: &mut Vec<Token>) {
+/// A raw token before numbers are read.
+enum Item {
+    Word(Token),
+    Number(Number),
+    /// Has digits but is not a number, such as `mp3`.
+    Other(Token),
+}
+
+/// A number written with digits.
+struct Number {
+    value: Value,
+    form: Form,
+    /// The singular and plural of a currency symbol before it.
+    currency: Option<(&'static str, &'static str)>,
+}
+
+/// A number's value as written: digits before and after the decimal point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Value {
+    int: u64,
+    frac: String,
+}
+
+impl Value {
+    fn whole(int: u64) -> Value {
+        Value {
+            int,
+            frac: String::new(),
+        }
+    }
+
+    /// The value times a power of ten, when that is whole and fits: `1.5`
+    /// million is 1500000.
+    fn scaled(&self, scale: u64) -> Option<Value> {
+        let zeros = usize::try_from(scale.checked_ilog10()?).ok()?;
+        let pad = zeros.checked_sub(self.frac.len())?;
+        let frac = if self.frac.is_empty() {
+            0
+        } else {
+            self.frac.parse::<u64>().ok()?
+        };
+        let pad = 10_u64.checked_pow(u32::try_from(pad).ok()?)?;
+        let int = self
+            .int
+            .checked_mul(scale)?
+            .checked_add(frac.checked_mul(pad)?)?;
+        Some(Value::whole(int))
+    }
+
+    /// The canonical token: `1867`, `3.5`, `21st`, `1990s`; a lone whole
+    /// one stays the word `one` ("every one", "no one").
+    fn render(&self, form: Form) -> String {
+        match form {
+            Form::Cardinal if self.frac.is_empty() && self.int == 1 => "one".to_owned(),
+            Form::Cardinal if self.frac.is_empty() => self.int.to_string(),
+            Form::Cardinal => format!("{}.{}", self.int, self.frac),
+            Form::Ordinal => {
+                let suffix = match (self.int % 10, self.int % 100) {
+                    (_, 11..=13) => "th",
+                    (1, _) => "st",
+                    (2, _) => "nd",
+                    (3, _) => "rd",
+                    _ => "th",
+                };
+                format!("{}{suffix}", self.int)
+            }
+            Form::Plural => format!("{}s", self.int),
+        }
+    }
+}
+
+/// How a number is said: `five`, `fifth`, or `fifties` (a decade).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    Cardinal,
+    Ordinal,
+    Plural,
+}
+
+/// Where a number word may stand in a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Zero to nine.
+    Unit,
+    /// Ten to nineteen.
+    Teen,
+    /// Twenty to ninety.
+    Tens,
+    Hundred,
+    /// Thousand and up.
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NumberWord {
+    value: u64,
+    kind: Kind,
+    form: Form,
+}
+
+const SCALES: [(&str, u64); 5] = [
+    ("hundred", 100),
+    ("thousand", 1_000),
+    ("million", 1_000_000),
+    ("billion", 1_000_000_000),
+    ("trillion", 1_000_000_000_000),
+];
+
+fn number_word(word: &str) -> Option<NumberWord> {
+    let found = |value, kind, form| Some(NumberWord { value, kind, form });
+    for (value, name) in (0_u64..).zip(ONES) {
+        let kind = if value < 10 { Kind::Unit } else { Kind::Teen };
+        if word == name {
+            return found(value, kind, Form::Cardinal);
+        }
+        if word == ordinal(name) {
+            return found(value, kind, Form::Ordinal);
+        }
+    }
+    for (tens, name) in (0_u64..).zip(TENS).skip(2) {
+        let value = tens * 10;
+        if word == name {
+            return found(value, Kind::Tens, Form::Cardinal);
+        }
+        if word == ordinal(name) {
+            return found(value, Kind::Tens, Form::Ordinal);
+        }
+        if name
+            .strip_suffix('y')
+            .is_some_and(|stem| word.strip_suffix("ies") == Some(stem))
+        {
+            return found(value, Kind::Tens, Form::Plural);
+        }
+    }
+    for (name, value) in SCALES {
+        let kind = if value == 100 {
+            Kind::Hundred
+        } else {
+            Kind::Scale
+        };
+        if word == name {
+            return found(value, kind, Form::Cardinal);
+        }
+        if word == ordinal(name) {
+            return found(value, kind, Form::Ordinal);
+        }
+        if value == 100 && word == "hundreds" {
+            return found(value, kind, Form::Plural);
+        }
+    }
+    None
+}
+
+fn word_at<'a>(words: &[Option<&'a str>], i: usize) -> Option<&'a str> {
+    words.get(i).copied().flatten()
+}
+
+fn number_at(words: &[Option<&str>], i: usize) -> Option<NumberWord> {
+    word_at(words, i).and_then(number_word)
+}
+
+/// A digit said as a word in a decimal: `five`, `zero` or `oh`.
+fn digit_at(words: &[Option<&str>], i: usize) -> Option<char> {
+    if word_at(words, i) == Some("oh") {
+        return Some('0');
+    }
+    let word = number_at(words, i).filter(|w| w.kind == Kind::Unit && w.form == Form::Cardinal)?;
+    char::from_digit(u32::try_from(word.value).ok()?, 10)
+}
+
+/// A number from 0 to 99 in words starting at `i`: its value, form and the
+/// index after it.
+fn small(words: &[Option<&str>], i: usize) -> Option<(u64, Form, usize)> {
+    let word = number_at(words, i)?;
+    match word.kind {
+        Kind::Unit | Kind::Teen => Some((word.value, word.form, i + 1)),
+        Kind::Tens => {
+            if word.form == Form::Cardinal
+                && let Some(unit) = number_at(words, i + 1)
+                && unit.kind == Kind::Unit
+                && unit.value > 0
+            {
+                return Some((word.value + unit.value, unit.form, i + 2));
+            }
+            Some((word.value, word.form, i + 1))
+        }
+        Kind::Hundred | Kind::Scale => None,
+    }
+}
+
+/// A number below ten thousand without a scale word: up to 99 hundreds and
+/// a rest ("fifteen hundred", "three hundred and five", "a hundred"), or a
+/// year said in two parts ("eighteen sixty seven", "nineteen oh five",
+/// "nineteen nineties").
+fn group(words: &[Option<&str>], i: usize) -> Option<(u64, Form, usize)> {
+    let a_hundred = word_at(words, i) == Some("a")
+        && number_at(words, i + 1).is_some_and(|w| w.kind == Kind::Hundred);
+    let (value, form, j) = if a_hundred {
+        (1, Form::Cardinal, i + 1)
+    } else {
+        small(words, i)?
+    };
+    if form != Form::Cardinal {
+        return Some((value, form, j));
+    }
+    if let Some(hundred) = number_at(words, j)
+        && hundred.kind == Kind::Hundred
+        && value > 0
+    {
+        let hundreds = value * 100;
+        if hundred.form != Form::Cardinal {
+            return Some((hundreds, hundred.form, j + 1));
+        }
+        let rest_at = if word_at(words, j + 1) == Some("and") {
+            j + 2
+        } else {
+            j + 1
+        };
+        if let Some((rest, rest_form, next)) = small(words, rest_at)
+            && rest > 0
+            && rest_form != Form::Plural
+        {
+            return Some((hundreds + rest, rest_form, next));
+        }
+        return Some((hundreds, Form::Cardinal, j + 1));
+    }
+    // A year in two parts starts with one word from ten to twenty.
+    if (10..=20).contains(&value) && j == i + 1 {
+        if word_at(words, j) == Some("oh")
+            && let Some(unit) = number_at(words, j + 1)
+            && unit.kind == Kind::Unit
+            && unit.value > 0
+        {
+            return Some((value * 100 + unit.value, unit.form, j + 2));
+        }
+        if let Some((low, low_form, next)) = small(words, j)
+            && low >= 10
+        {
+            return Some((value * 100 + low, low_form, next));
+        }
+    }
+    Some((value, form, j))
+}
+
+/// A whole number in words starting at `i`: groups joined by falling scale
+/// words, as in "two thousand and five" or "a million two hundred
+/// thousand". `None` when no number starts there or it does not fit.
+fn cardinal(words: &[Option<&str>], i: usize) -> Option<(u64, Form, usize)> {
+    let a_scale = word_at(words, i) == Some("a")
+        && number_at(words, i + 1).is_some_and(|w| w.kind == Kind::Scale);
+    let (mut value, mut form, mut next) = if a_scale {
+        (1, Form::Cardinal, i + 1)
+    } else {
+        group(words, i)?
+    };
+    let mut total: u64 = 0;
+    let mut last_scale = u64::MAX;
+    loop {
+        let scale = number_at(words, next).filter(|w| {
+            w.kind == Kind::Scale && w.value < last_scale && form == Form::Cardinal && value > 0
+        });
+        let Some(scale) = scale else {
+            return Some((total.checked_add(value)?, form, next));
+        };
+        total = total.checked_add(value.checked_mul(scale.value)?)?;
+        last_scale = scale.value;
+        next += 1;
+        if scale.form != Form::Cardinal {
+            return Some((total, scale.form, next));
+        }
+        let rest_at = if word_at(words, next) == Some("and") {
+            next + 1
+        } else {
+            next
+        };
+        let larger_scale_after = |at: usize| {
+            number_at(words, at).is_some_and(|w| w.kind == Kind::Scale && w.value >= last_scale)
+        };
+        match group(words, rest_at) {
+            Some((rest, rest_form, after)) if !larger_scale_after(after) => {
+                value = rest;
+                form = rest_form;
+                next = after;
+            }
+            _ => return Some((total, Form::Cardinal, next)),
+        }
+    }
+}
+
+/// The canonical tokens of a number starting at item `k` and the index after
+/// it, or `None` when no number starts there.
+fn number_phrase(
+    items: &[(Item, usize)],
+    words: &[Option<&str>],
+    k: usize,
+) -> Option<(Vec<Token>, usize)> {
+    let (value, form, mut next, currency) = match &items.get(k)?.0 {
+        Item::Number(number) => (number.value.clone(), number.form, k + 1, number.currency),
+        Item::Word(_) => {
+            let (int, form, mut next) = cardinal(words, k)?;
+            let mut value = Value::whole(int);
+            if form == Form::Cardinal && word_at(words, next) == Some("point") {
+                let digits: String = (next + 1..).map_while(|i| digit_at(words, i)).collect();
+                if !digits.is_empty() {
+                    next += 1 + digits.len();
+                    value.frac = digits;
+                }
+            }
+            (value, form, next, None)
+        }
+        Item::Other(_) => return None,
+    };
+    let mut value = value;
+    if form == Form::Cardinal
+        && (matches!(items.get(k).map(|(item, _)| item), Some(Item::Number(_)))
+            || !value.frac.is_empty())
+        && let Some(scale) = number_at(words, next).filter(|w| w.form == Form::Cardinal)
+        && matches!(scale.kind, Kind::Hundred | Kind::Scale)
+        && let Some(scaled) = value.scaled(scale.value)
+    {
+        value = scaled;
+        next += 1;
+    }
+    let text = value.render(form);
+    let mut tokens = Vec::new();
+    if let Some((one, many)) = currency {
+        let unit = if text == "one" { one } else { many };
+        tokens.push(Token::plain(text));
+        tokens.push(Token::plain(unit));
+    } else {
+        tokens.push(Token::plain(text));
+    }
+    Some((tokens, next))
+}
+
+/// One raw token as items: words, contractions, or a number in digits.
+fn lex(raw: &str, part: usize, items: &mut Vec<(Item, usize)>) {
     let token = raw.trim_start_matches('\'');
     let bare = token.trim_end_matches('\'');
     if bare.is_empty() {
         return;
     }
     if bare.chars().any(|c| c.is_ascii_digit()) {
-        let mut words = Vec::new();
-        numeric(bare, &mut words);
-        out.extend(words.into_iter().map(Token::plain));
+        let item = lex_number(bare).map_or_else(|| Item::Other(Token::plain(bare)), Item::Number);
+        items.push((item, part));
     } else if bare.len() < token.len() {
-        out.push(Token {
+        let token = Token {
             text: bare.to_owned(),
             apostrophe: Apostrophe::Trailing,
-        });
+        };
+        items.push((Item::Word(token), part));
     } else {
-        expand_contraction(bare, out);
+        let mut tokens = Vec::new();
+        expand_contraction(bare, &mut tokens);
+        items.extend(tokens.into_iter().map(|token| (Item::Word(token), part)));
     }
 }
 
+/// A number in digits: `1,500`, `3.5`, `21st`, `1990s`, `$5`; `None` for
+/// anything else (`mp3`) or a number too large to hold.
+fn lex_number(token: &str) -> Option<Number> {
+    let mut chars = token.chars();
+    let currency = match chars.next() {
+        Some('$') => Some(("dollar", "dollars")),
+        Some('€') => Some(("euro", "euros")),
+        Some('£') => Some(("pound", "pounds")),
+        _ => None,
+    };
+    let rest = if currency.is_some() {
+        chars.as_str()
+    } else {
+        token
+    };
+    let ends_in_digit = |s: &str| s.ends_with(|c: char| c.is_ascii_digit());
+    let ordinal = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix).filter(|d| ends_in_digit(d)));
+    let plural = rest
+        .strip_suffix("'s")
+        .or_else(|| rest.strip_suffix('s'))
+        .filter(|d| ends_in_digit(d));
+    let (digits, form) = match (ordinal, plural) {
+        (Some(digits), _) => (digits, Form::Ordinal),
+        (None, Some(digits)) => (digits, Form::Plural),
+        (None, None) => (rest, Form::Cardinal),
+    };
+    let plain: String = digits.chars().filter(|&c| c != ',').collect();
+    let (whole, frac) = plain.split_once('.').unwrap_or((&plain, ""));
+    let all_digits = |s: &str| s.chars().all(|c| c.is_ascii_digit());
+    if whole.is_empty() || !all_digits(whole) || !all_digits(frac) {
+        return None;
+    }
+    if form != Form::Cardinal && !frac.is_empty() {
+        return None;
+    }
+    Some(Number {
+        value: Value {
+            int: whole.parse().ok()?,
+            frac: frac.to_owned(),
+        },
+        form,
+        currency,
+    })
+}
+
 /// Splits lowercased text into runs of letters, digits and apostrophes;
-/// `.` and `,` stay inside a run between two digits; `%` and `&` become
-/// words of their own.
+/// `.` and `,` stay inside a run between two digits, a currency symbol
+/// starts a run before a digit; `%` and `&` become words of their own.
 fn raw_tokens(text: &str) -> Vec<String> {
     let chars: Vec<char> = text
         .chars()
@@ -201,6 +619,13 @@ fn raw_tokens(text: &str) -> Vec<String> {
                 && chars.get(i + 1).is_some_and(char::is_ascii_digit)
         };
         if c.is_alphanumeric() || c == '\'' || ((c == '.' || c == ',') && between_digits()) {
+            current.push(c);
+            continue;
+        }
+        if matches!(c, '$' | '€' | '£') && chars.get(i + 1).is_some_and(char::is_ascii_digit) {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
             current.push(c);
             continue;
         }
@@ -263,120 +688,7 @@ fn expand_contraction(token: &str, out: &mut Vec<Token>) {
     out.push(Token::plain(token));
 }
 
-/// A token containing a digit: an integer, a decimal, an ordinal such as
-/// `21st`, or something else (`mp3`), which stays as it is.
-fn numeric(token: &str, out: &mut Vec<String>) {
-    let plain: String = token.chars().filter(|&c| c != ',').collect();
-    let had_separator = plain.len() != token.len();
-    if let Some((whole, fraction)) = plain.split_once('.')
-        && let Ok(n) = whole.parse::<u64>()
-        && !fraction.is_empty()
-        && fraction.chars().all(|c| c.is_ascii_digit())
-    {
-        cardinal(n, out);
-        out.push("point".to_owned());
-        for digit in fraction.chars() {
-            let idx = digit.to_digit(10).map_or(0, |d| d as usize);
-            out.push(ONES.get(idx).copied().unwrap_or("zero").to_owned());
-        }
-        return;
-    }
-    if let Ok(n) = plain.parse::<u64>() {
-        if !had_separator && plain.len() == 4 && is_year(n) {
-            year(n, out);
-        } else {
-            cardinal(n, out);
-        }
-        return;
-    }
-    for suffix in ["st", "nd", "rd", "th"] {
-        if let Some(digits) = plain.strip_suffix(suffix)
-            && let Ok(n) = digits.parse::<u64>()
-        {
-            cardinal(n, out);
-            if let Some(last) = out.last_mut() {
-                *last = ordinal(last);
-            }
-            return;
-        }
-    }
-    out.push(token.to_owned());
-}
-
-fn is_year(n: u64) -> bool {
-    (1100..=1999).contains(&n) || (2010..=2099).contains(&n)
-}
-
-fn year(n: u64, out: &mut Vec<String>) {
-    cardinal(n / 100, out);
-    match n % 100 {
-        0 => out.push("hundred".to_owned()),
-        low @ 1..=9 => {
-            out.push("oh".to_owned());
-            cardinal(low, out);
-        }
-        low => cardinal(low, out),
-    }
-}
-
-fn cardinal(n: u64, out: &mut Vec<String>) {
-    if n == 0 {
-        out.push("zero".to_owned());
-        return;
-    }
-    let mut rest = n;
-    for (scale, name) in [
-        (1_000_000_000_000, "trillion"),
-        (1_000_000_000, "billion"),
-        (1_000_000, "million"),
-        (1_000, "thousand"),
-    ] {
-        if rest >= scale {
-            below_thousand_or_more(rest / scale, out);
-            out.push(name.to_owned());
-            rest %= scale;
-        }
-    }
-    if rest > 0 {
-        below_thousand(rest, out);
-    }
-}
-
-/// The multiplier of a scale word, which may itself exceed 999 for very
-/// large numbers.
-fn below_thousand_or_more(n: u64, out: &mut Vec<String>) {
-    if n >= 1000 {
-        cardinal(n, out);
-    } else {
-        below_thousand(n, out);
-    }
-}
-
-/// `n` in 1..=999.
-fn below_thousand(n: u64, out: &mut Vec<String>) {
-    let word = |i: u64, table: &[&'static str]| {
-        usize::try_from(i)
-            .ok()
-            .and_then(|i| table.get(i).copied())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let hundreds = n / 100;
-    let rest = n % 100;
-    if hundreds > 0 {
-        out.push(word(hundreds, &ONES));
-        out.push("hundred".to_owned());
-    }
-    if rest >= 20 {
-        out.push(word(rest / 10, &TENS));
-        if !rest.is_multiple_of(10) {
-            out.push(word(rest % 10, &ONES));
-        }
-    } else if rest > 0 {
-        out.push(word(rest, &ONES));
-    }
-}
-
+/// The ordinal of a number word: `five` is `fifth`, `twenty` `twentieth`.
 fn ordinal(word: &str) -> String {
     match word {
         "one" => "first".to_owned(),
@@ -552,30 +864,99 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_numbers_and_years() {
-        assert_eq!(shown("1867"), tokens("eighteen sixty seven"));
-        assert_eq!(shown("in 1900"), tokens("in nineteen hundred"));
-        assert_eq!(shown("1905"), tokens("nineteen oh five"));
-        assert_eq!(shown("2024"), tokens("twenty twenty four"));
-        assert_eq!(shown("2005"), tokens("two thousand five"));
-        assert_eq!(shown("0"), tokens("zero"));
-        assert_eq!(shown("7 days"), tokens("seven days"));
-        assert_eq!(shown("42"), tokens("forty two"));
-        assert_eq!(shown("100"), tokens("one hundred"));
-        assert_eq!(shown("305"), tokens("three hundred five"));
-        assert_eq!(shown("1,000"), tokens("one thousand"));
+    fn normalizes_numbers_to_values() {
+        assert_eq!(shown("1867"), tokens("1867"));
+        assert_eq!(shown("eighteen sixty-seven"), tokens("1867"));
+        assert_eq!(shown("in nineteen hundred"), tokens("in 1900"));
+        assert_eq!(shown("nineteen oh five"), tokens("1905"));
+        assert_eq!(shown("twenty twenty four"), tokens("2024"));
+        assert_eq!(shown("two thousand and five"), tokens("2005"));
+        assert_eq!(shown("zero"), tokens("0"));
+        assert_eq!(shown("seven days"), tokens("7 days"));
+        assert_eq!(shown("forty two"), tokens("42"));
+        assert_eq!(shown("a hundred"), tokens("100"));
+        assert_eq!(shown("three hundred and five"), tokens("305"));
+        assert_eq!(shown("1,000"), tokens("1000"));
         assert_eq!(
-            shown("9999"),
-            tokens("nine thousand nine hundred ninety nine")
+            shown("nine thousand nine hundred ninety nine"),
+            tokens("9999")
         );
-        assert_eq!(shown("3.5"), tokens("three point five"));
+        assert_eq!(shown("three point five"), tokens("3.5"));
         assert_eq!(
-            shown("1st 2nd 3rd 21st"),
-            tokens("first second third twenty first")
+            shown("first second third twenty first"),
+            tokens("1st 2nd 3rd 21st")
         );
-        assert_eq!(shown("50%"), tokens("fifty percent"));
-        // Spoken and written forms agree.
-        assert_eq!(shown("eighteen sixty-seven"), shown("1867"));
+        assert_eq!(
+            shown("1st 2nd 3rd 21st 11th"),
+            tokens("1st 2nd 3rd 21st 11th")
+        );
+        assert_eq!(shown("50%"), tokens("50 percent"));
+        assert_eq!(shown("$5 and $1"), tokens("5 dollars and one dollar"));
+        assert_eq!(shown("the '90s"), tokens("the 90s"));
+        // A lone "one" stays a word, so "every one" can be "everyone".
+        assert_eq!(shown("1 and one"), tokens("one and one"));
+        // "and" joins only the parts of one number.
+        assert_eq!(shown("one and two"), tokens("one and 2"));
+        // Not numbers.
+        assert_eq!(shown("mp3 a point oh"), tokens("mp3 a point oh"));
+        // Too large for a number stays as words.
+        assert_eq!(
+            shown("ninety nine trillion trillion"),
+            tokens("99000000000000 trillion")
+        );
+        assert_eq!(
+            shown("99999999999999999999"),
+            tokens("99999999999999999999")
+        );
+        assert_eq!(
+            shown("99999999999 trillion"),
+            tokens("99999999999 trillion")
+        );
+    }
+
+    #[test]
+    fn align_matches_numbers_in_any_spelling() {
+        for (written, said) in [
+            ("1,500", "1500"),
+            ("1,500", "fifteen hundred"),
+            ("1500", "one thousand five hundred"),
+            ("105", "one hundred and five"),
+            ("105", "one hundred five"),
+            ("2005", "two thousand and five"),
+            ("2005", "two thousand five"),
+            ("1867", "eighteen sixty seven"),
+            ("1867", "eighteen sixty-seven"),
+            ("1990", "nineteen ninety"),
+            ("1905", "nineteen oh five"),
+            ("1500", "fifteen hundred"),
+            ("the 1990s", "the nineteen nineties"),
+            ("the 1990's", "the nineteen nineties"),
+            ("the 90s", "the nineties"),
+            ("$5", "five dollars"),
+            ("$1", "one dollar"),
+            ("$1.5 million", "one point five million dollars"),
+            ("5 million", "five million"),
+            ("21st", "twenty first"),
+            ("3.5", "three point five"),
+            ("50%", "fifty percent"),
+            ("at 11:30", "at eleven thirty"),
+            ("a hundred", "100"),
+        ] {
+            assert_eq!(
+                align(&normalize(written), &heard(said)),
+                [],
+                "{written} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(written)),
+                [],
+                "{said} / {written}"
+            );
+        }
+        let diffs = align(&normalize("$5"), &heard("six dollars"));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].expected.as_deref(), Some("5"));
+        assert_eq!(diffs[0].heard.as_deref(), Some("6"));
     }
 
     #[test]
@@ -755,13 +1136,29 @@ mod tests {
     }
 
     #[test]
-    fn align_splits_heard_words_into_tokens_with_their_times() {
-        // One heard word "1867" covers three tokens; a missing token after it
-        // is placed at that word's end.
+    fn align_spans_numbers_over_heard_words() {
+        // "eighteen sixty seven" is one token from three heard words; a
+        // missing token after it is placed at the last word's end.
         let expected = normalize("born in 1867 here");
-        let diffs = align(&expected, &heard("born in 1867"));
+        let diffs = align(&expected, &heard("born in eighteen sixty seven"));
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].expected.as_deref(), Some("here"));
-        assert_eq!(diffs[0].at, Some(2.5));
+        assert_eq!(diffs[0].at, Some(4.5));
+        // A substituted number is placed at its first word.
+        let diffs = align(&normalize("in 1867"), &heard("in eighteen sixty eight"));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].heard.as_deref(), Some("1868"));
+        assert_eq!(diffs[0].at, Some(1.0));
+    }
+
+    #[test]
+    fn align_splits_heard_words_into_tokens_with_their_times() {
+        // One heard word "it's" covers two tokens; a missing token after it
+        // is placed at that word's end.
+        let expected = normalize("so it is here");
+        let diffs = align(&expected, &heard("so it's"));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].expected.as_deref(), Some("here"));
+        assert_eq!(diffs[0].at, Some(1.5));
     }
 }
