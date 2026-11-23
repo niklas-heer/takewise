@@ -1230,15 +1230,16 @@ fn calibrate_run(
     Ok(Outcome::new(json!({}), String::new()))
 }
 
-/// Takewise.app: the bundle this binary runs in, else `$TAKEWISE_APP`
-/// (which must then exist), else `/Applications/Takewise.app`, else the
-/// repository's `build/Takewise.app`.
+/// Takewise.app: the bundle this binary runs in (through symlinks, such as
+/// Homebrew's), else `$TAKEWISE_APP` (which must then exist), else
+/// `/Applications/Takewise.app`, else, in debug builds, the repository's
+/// `build/Takewise.app`.
 fn find_bundle() -> Result<PathBuf, CliError> {
     let is_bundle = |app: &Path| app.join("Contents/MacOS/takewise").is_file();
     if let Some(app) = std::env::current_exe()
         .ok()
         .as_deref()
-        .and_then(enclosing_bundle)
+        .and_then(bundle_of_exe)
     {
         return Ok(app);
     }
@@ -1253,23 +1254,47 @@ fn find_bundle() -> Result<PathBuf, CliError> {
             )))
         };
     }
-    let repo_build = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .unwrap_or(Path::new("."))
-        .join("build/Takewise.app");
-    let candidates = [PathBuf::from("/Applications/Takewise.app"), repo_build];
+    let candidates = bundle_candidates();
     candidates
         .iter()
         .find(|app| is_bundle(app))
         .cloned()
         .ok_or_else(|| {
+            let places: Vec<String> = candidates.iter().map(|c| c.display().to_string()).collect();
             CliError::Setup(format!(
-                "Takewise.app is in neither {} nor {}; run `mise run bundle` or set TAKEWISE_APP",
-                candidates[0].display(),
-                candidates[1].display()
+                "Takewise.app is not in {}; install it, run `mise run bundle` or set TAKEWISE_APP",
+                places.join(" or ")
             ))
         })
+}
+
+/// The bundle `exe` runs in, after resolving symlinks.
+fn bundle_of_exe(exe: &Path) -> Option<PathBuf> {
+    enclosing_bundle(&exe.canonicalize().ok()?)
+}
+
+/// Where to look for Takewise.app when this binary is not in one. The
+/// repository's build directory is a candidate only in debug builds: a
+/// release binary must not depend on the path it was built at.
+fn bundle_candidates() -> Vec<PathBuf> {
+    std::iter::once(PathBuf::from("/Applications/Takewise.app"))
+        .chain(repo_build_bundle())
+        .collect()
+}
+
+/// The repository's `build/Takewise.app`, from the path this binary was
+/// built at.
+#[cfg(debug_assertions)]
+fn repo_build_bundle() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .map(|repo| repo.join("build/Takewise.app"))
+}
+
+#[cfg(not(debug_assertions))]
+fn repo_build_bundle() -> Option<PathBuf> {
+    None
 }
 
 /// `X.app` when `exe` is `X.app/Contents/MacOS/<binary>`.
@@ -1602,5 +1627,29 @@ mod tests {
         assert!(err.to_string().contains("the film is not a film"), "{err}");
         std::fs::write(&path, r#"{"ok":true}"#).expect("write");
         assert!(window_opened(&path).is_ok());
+    }
+
+    #[test]
+    fn a_symlinked_binary_finds_its_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let macos = tmp.path().join("Takewise.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("takewise"), "").unwrap();
+        // Homebrew links the binary into its bin directory.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(macos.join("takewise"), bin.join("takewise")).unwrap();
+        let app = tmp.path().join("Takewise.app").canonicalize().unwrap();
+        assert_eq!(bundle_of_exe(&bin.join("takewise")), Some(app.clone()));
+        assert_eq!(bundle_of_exe(&macos.join("takewise")), Some(app));
+        assert_eq!(bundle_of_exe(&bin.join("missing")), None);
+    }
+
+    #[test]
+    fn the_build_directory_is_a_candidate_only_in_debug_builds() {
+        let candidates = bundle_candidates();
+        assert_eq!(candidates[0], Path::new("/Applications/Takewise.app"));
+        let from_build = candidates.iter().any(|c| c.ends_with("build/Takewise.app"));
+        assert_eq!(from_build, cfg!(debug_assertions), "{candidates:?}");
     }
 }
