@@ -9,6 +9,7 @@ pub mod export;
 pub mod fsutil;
 pub mod ledger;
 pub mod project;
+pub mod run_check;
 pub mod script;
 pub mod session;
 pub mod speech;
@@ -20,17 +21,21 @@ pub mod timing;
 pub mod whisper;
 pub mod words;
 
+pub use check::Transcript;
 pub use edit::{
     Field, ScriptVersion, script_version, set_film_info, set_latency_offset, set_line_field,
 };
 pub use error::{Error, Result};
-pub use export::{ExportOptions, ExportReport, ExportWarning, ManifestLine, Refusal, export};
+pub use export::{
+    ExportOptions, ExportReport, ExportWarning, ManifestLine, ManifestWord, Refusal, export,
+};
 pub use fsutil::{ProjectLock, lock, write_atomic};
 pub use ledger::{
     Checked, Chosen, Event, EventKind, Judged, Ledger, Reason, Recorded, Snapshot, Verdict, Word,
     WordDiff, WordDiffKind, append, read,
 };
 pub use project::{CheckConfig, FilmInfo, InputConfig, Project, ProjectConfig, RecordConfig};
+pub use run_check::{Unchecked, check_take, checker, unchecked_takes};
 pub use script::{Line, Problem, Script, validate};
 pub use session::{AvailableInput, RECORD_RATE, SessionState, can_record, check_input};
 pub use speech::{Analysis, analyze};
@@ -44,3 +49,4 @@ pub use timing::{
     Assembler, Dropout, GAP_TOLERANCE_S, RecordPlan, Timebase, TimebaseHistory, clamp_mark,
     line_offset_s, pace_fill, plan_take, sample_film_time,
 };
+pub use whisper::{SetupError, Transcriber, Unavailable, WhisperCli};

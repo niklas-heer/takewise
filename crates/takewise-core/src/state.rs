@@ -55,6 +55,9 @@ pub struct TakeState {
     pub effective: Option<Verdict>,
     /// `check`, or `judge:<by>`.
     pub verdict_source: Option<String>,
+    /// What explains the effective verdict: the check's first reason or the
+    /// judgment's reason; `None` for a `keep` check and when unchecked.
+    pub reason: Option<String>,
     /// The latest check or judgment was made against an older text or slot.
     pub stale_check: bool,
     /// Speech start and end in seconds from the take's first sample.
@@ -160,10 +163,18 @@ fn fold_take(
             EventKind::Recorded(_) | EventKind::Chosen(_) => {}
         }
     }
-    let (effective, verdict_source) = match (matching_judged, matching_checked) {
-        (Some(judged), _) => (Some(judged.verdict), Some(format!("judge:{}", judged.by))),
-        (None, Some(checked)) => (Some(checked.verdict), Some("check".to_owned())),
-        (None, None) => (None, None),
+    let (effective, verdict_source, reason) = match (matching_judged, matching_checked) {
+        (Some(judged), _) => (
+            Some(judged.verdict),
+            Some(format!("judge:{}", judged.by)),
+            Some(judged.reason.clone()),
+        ),
+        (None, Some(checked)) => (
+            Some(checked.verdict),
+            Some("check".to_owned()),
+            checked.reasons.first().map(|r| r.message.clone()),
+        ),
+        (None, None) => (None, None, None),
     };
     let stale_check = latest_checked.is_some_and(|c| !c.snapshot.matches(current))
         || latest_judged.is_some_and(|j| !j.snapshot.matches(current));
@@ -173,6 +184,7 @@ fn fold_take(
         line_offset_s: rec.line_offset_s,
         effective,
         verdict_source,
+        reason,
         stale_check,
         speech: latest_checked.and_then(|c| c.speech),
         missing: !project.dir.join(&rec.file).is_file(),
@@ -425,8 +437,8 @@ mod tests {
     use super::*;
     use crate::edit::{Field, set_line_field};
     use crate::ledger::{
-        Checked, Chosen, Event, EventKind, Judged, Recorded, Verdict, WordDiff, WordDiffKind,
-        append, read,
+        Checked, Chosen, Event, EventKind, Judged, Reason, Recorded, Verdict, WordDiff,
+        WordDiffKind, append, read,
     };
     use crate::project::FilmInfo;
 
@@ -679,6 +691,55 @@ text = "Today we start."
         assert!(!take.stale_check);
         assert_eq!(take.effective, Some(Verdict::Listen));
         assert_eq!(take.verdict_source.as_deref(), Some("check"));
+    }
+
+    #[test]
+    fn effective_verdict_carries_its_first_reason() {
+        let (_tmp, project) = setup(TWO_LINES);
+        recorded(&project, "hook", 1);
+        assert_eq!(line(&fold_now(&project), "hook").takes[0].reason, None);
+        let event = Event::new(
+            "hook",
+            1,
+            EventKind::Checked(Checked {
+                snapshot: snap(&project, "hook"),
+                transcript: Some(Vec::new()),
+                word_diffs: Vec::new(),
+                speech: Some((2.0, 3.0)),
+                overrun_s: Some(0.4),
+                peak_dbfs: -6.0,
+                clipped_samples: 0,
+                noise_floor_dbfs: -70.0,
+                verdict: Verdict::Retake,
+                reasons: vec![
+                    Reason {
+                        code: "overrun".to_owned(),
+                        message: "speech ends 0.40 s after the slot".to_owned(),
+                    },
+                    Reason {
+                        code: "possible-mishearing".to_owned(),
+                        message: "heard \u{201c}b\u{201d} for \u{201c}a\u{201d}".to_owned(),
+                    },
+                ],
+                checker: "test".to_owned(),
+            }),
+        );
+        append(&project.dir, &event).unwrap();
+        let state = fold_now(&project);
+        assert_eq!(
+            line(&state, "hook").takes[0].reason.as_deref(),
+            Some("speech ends 0.40 s after the slot")
+        );
+        // A matching judgment speaks for the take instead.
+        judged(&project, "hook", 1, Verdict::Keep, None);
+        let state = fold_now(&project);
+        assert_eq!(
+            line(&state, "hook").takes[0].reason.as_deref(),
+            Some("listened")
+        );
+        // A stale verdict gives no reason.
+        set_line_field(&project.dir, "hook", Field::Text("Hi.".to_owned()), None).unwrap();
+        assert_eq!(line(&fold_now(&project), "hook").takes[0].reason, None);
     }
 
     #[test]

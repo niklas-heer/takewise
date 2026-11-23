@@ -5,7 +5,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -17,6 +18,7 @@ use takewise_core::{
 };
 use takewise_media::{CaptureBuffer, Frame};
 
+use super::checks::SharedTranscriber;
 use super::clock::FilmClock;
 use super::{Media, RecordingWindow, bind_keys, load};
 
@@ -213,11 +215,29 @@ fn open(cx: &mut TestAppContext, inputs: &[(&str, u32)]) -> Fixture {
     open_with(cx, inputs, |_| {})
 }
 
+/// Takes are checked without words in tests unless a test says otherwise.
+fn no_transcriber() -> SharedTranscriber {
+    Arc::new(tw::Unavailable {
+        reason: "no transcriber in tests".to_owned(),
+        model: "ggml-test.bin".to_owned(),
+    })
+}
+
 /// Opens the window after `prepare` ran on the new project.
 fn open_with(
     cx: &mut TestAppContext,
     inputs: &[(&str, u32)],
     prepare: impl FnOnce(&Path),
+) -> Fixture {
+    open_checked(cx, inputs, prepare, no_transcriber())
+}
+
+/// [`open_with`] with the transcriber the window's checks use.
+fn open_checked(
+    cx: &mut TestAppContext,
+    inputs: &[(&str, u32)],
+    prepare: impl FnOnce(&Path),
+    transcriber: SharedTranscriber,
 ) -> Fixture {
     let (tmp, dir) = project(DEVICE);
     prepare(&dir);
@@ -237,7 +257,15 @@ fn open_with(
         };
         gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                RecordingWindow::new(window_dir, loaded, Box::new(window_media), None, window, cx)
+                RecordingWindow::new(
+                    window_dir,
+                    loaded,
+                    Box::new(window_media),
+                    None,
+                    transcriber,
+                    window,
+                    cx,
+                )
             })
         })
         .expect("open test window")
@@ -1288,4 +1316,116 @@ fn a_take_begun_late_is_rewritten_under_its_lock(cx: &mut TestAppContext) {
     let takes = recorded(&f.dir);
     assert_eq!(takes.len(), 1, "saved on retry");
     assert_eq!((takes[0].1, takes[0].2.samples), (1, 2400));
+}
+
+/// A transcriber that waits for the test to let it finish, then hears the
+/// first line.
+struct Gated {
+    gate: Mutex<Receiver<()>>,
+    heard: Mutex<Vec<PathBuf>>,
+}
+
+impl tw::Transcriber for Gated {
+    fn transcribe(&self, wav: &Path) -> tw::Transcript {
+        self.heard.lock().expect("heard").push(wav.to_path_buf());
+        let _ = self.gate.lock().expect("gate").recv();
+        tw::Transcript::Words(Vec::new())
+    }
+    fn model(&self) -> String {
+        "ggml-gated.bin".to_owned()
+    }
+}
+
+#[gpui_kit::test]
+fn verdict_appears_after_commit(cx: &mut TestAppContext) {
+    let (release, gate) = channel();
+    let gated = Arc::new(Gated {
+        gate: Mutex::new(gate),
+        heard: Mutex::new(Vec::new()),
+    });
+    let f = open_checked(cx, &[(DEVICE, 48_000)], |_| {}, gated.clone());
+    record_take(cx, &f);
+    let take = tw::TakeRef {
+        line: "a".to_owned(),
+        take: 1,
+    };
+    // Committed and queued: the list says "checking…" until the check is in.
+    f.view.read_with(cx, |view, _| {
+        assert!(view.checks.is_pending(&take));
+        let state = view.line_state().expect("line a");
+        let (text, _) = super::takes::label(&state.takes[0], true);
+        assert_eq!(text, "checking…");
+        assert_eq!(state.takes[0].effective, None);
+    });
+    release.send(()).expect("the check waits");
+    for _ in 0..2000 {
+        frame(cx, f.window);
+        if f.view
+            .read_with(cx, |view, _| !view.checks.is_pending(&take))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    f.view.read_with(cx, |view, _| {
+        assert!(!view.checks.is_pending(&take), "the check finished");
+        let state = view.line_state().expect("line a");
+        let checked = &state.takes[0];
+        // The fake capture is one steady level, so no speech stands out.
+        assert_eq!(checked.effective, Some(tw::Verdict::Retake));
+        assert_eq!(checked.reason.as_deref(), Some("no speech detected"));
+        assert_eq!(super::takes::label(checked, false).0, "retake");
+    });
+    assert_eq!(
+        *gated.heard.lock().expect("heard"),
+        vec![f.dir.join("takes/a/001.wav")]
+    );
+    let checked: Vec<tw::Checked> = tw::read(&f.dir)
+        .expect("ledger")
+        .events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::Checked(checked) => Some(checked),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checked.len(), 1);
+    assert_eq!(
+        checked[0].checker,
+        format!(
+            "takewise {} whisper ggml-gated.bin",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+}
+
+#[gpui_kit::test]
+fn a_reload_queues_a_take_whose_check_went_stale(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |_| {});
+    record_take(cx, &f);
+    let take = tw::TakeRef {
+        line: "a".to_owned(),
+        take: 1,
+    };
+    for _ in 0..2000 {
+        frame(cx, f.window);
+        if f.view
+            .read_with(cx, |view, _| !view.checks.is_pending(&take))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // An edit made outside the window makes the check stale; the reload
+    // queues the take again.
+    tw::set_line_field(
+        &f.dir,
+        "a",
+        Field::Text("First line, again.".to_owned()),
+        None,
+    )
+    .expect("edit");
+    f.view.update(cx, |view, _| view.reload());
+    f.view
+        .read_with(cx, |view, _| assert!(view.checks.is_pending(&take)));
 }

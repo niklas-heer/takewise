@@ -152,7 +152,7 @@ The clock mapping is the spike's job to prove. The model: capture buffers carry 
 
 - The current line is large; the next line is dimmed below it. A bar shows the slot running out, and the words fill from left to right at an even pace across the slot (karaoke-style pace guide, by character count; Niklas's original idea, kept because it is small). A level meter shows the input.
 - **Record (Space):** the film starts `preroll_s` before the line's start; a 3-2-1 count-in shows on screen; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is monitored only when the narrator has turned monitoring on.
-- **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…". The top-ranked take gets a hollow star (proposed); a chosen take gets a filled one.
+- **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…", with the reason that explains it below. Checks run one at a time on a worker thread, after every commit and whenever a reload finds takes without a check against their line as it is now (an edited text or a moved slot). When whisper-cli cannot be set up, takes still get their sound and timing checks, with `listen` and the reason. The top-ranked take gets a hollow star (proposed); a chosen take gets a filled one.
 - **Enter** chooses the selected take, **R** records another, **P** plays the line in context (pre-roll, take, tail) with the selected take locked to the film, **↑/↓** move between lines and **←/→** between takes.
 - **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place; the draft belongs to the line and the `script.toml` version it was begun on, so a script changed meanwhile refuses it, and a line removed meanwhile is never replaced by another. Both write `script.toml` as described above.
 - When the input device is missing or not running at 48 kHz, the screen says so, names the available devices, and does not record. On the RØDECaster Duo the mic appears in the two-channel devices "Main Stereo" and "Chat"; which channel carries the mic depends on RØDE Central's routing, so the level meter is how the narrator confirms the choice.
@@ -185,12 +185,12 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | `takewise record <dir>` | Open the recording window. |
 | `takewise status <dir> [--strict] [--repair] [--refresh-film]` | Lines, takes, effective verdicts, proposed and chosen takes, validation problems, stale checks, orphans, film changes. Findings are `problems` (validation, missing chosen take files, film missing or changed) or `notices` (crash leftovers such as torn or bad ledger lines, `.partial` and unadoptable files; choices of takes without a `recorded` event; stale chosen takes; missing files of other takes). `--strict` fails on problems and lines without a chosen take, never on notices. |
 | `takewise script set <dir> <line> --text … / --start … / --end …` | Edit one field of one line safely. |
-| `takewise check <dir> [--line ID] [--take N]` | Run checks; appends `checked` events. |
+| `takewise check <dir> [--line ID] [--take N] [--stale-only]` | Run checks; appends `checked` events. Without `--line`, every take without a check against its line as it is now; `--line` (and `--take`) re-run those takes even when checked; `--stale-only` keeps takes whose latest check was made against older text or an older slot. A `retake` verdict exits 0; whisper-cli, `ffmpeg` or the model missing exits 2. |
 | `takewise judge <dir> <line> <take> --verdict … --reason … --by … [--score …]` | Add an outside judgment. |
 | `takewise choose <dir> <line> <take> [--by …]` | Choose a take; refuses one whose file is missing (exit 1, `missing-file`). |
 | `takewise export <dir> [--use-proposed] [--format …] [--bit-depth …] [--sample-rate …] [--processing raw\|clean]` | Write `export/narration.wav` or `.flac` and `export/manifest.json`. |
 | `takewise calibrate <dir> [--write] [--output <device>]` | Run the loopback latency test; `--write` stores the offset and the device pair. |
-| `takewise doctor [<dir>]` | Check whisper-cli, the model, `ffmpeg`, microphone access, input devices and their sample rates, the output device. |
+| `takewise doctor [<dir>]` | Check whisper-cli, the model and `ffmpeg` (transcribing 1 s of silence to prove they work together), microphone access, input devices and their sample rates, the output device. |
 
 ## Export and Resolve handoff
 
@@ -200,7 +200,7 @@ For each line, the chosen take is used; a line without one makes `export` fail w
 
 Export holds the project lock while it reads and folds the project and writes both files to temp names; it then removes the old manifest, renames the WAV into place, and renames the manifest last, so an interrupted export never leaves an old manifest beside a new WAV. A refused export writes nothing and removes an existing `manifest.json`, so no stale pair looks valid (the export is regenerable; takes are never touched).
 
-`manifest.json` lists the film (path, duration, size, modified), the WAV it describes (`narration`: file, size, SHA-256) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and, once milestone 3 adds transcription, word times in film seconds.
+`manifest.json` lists the film (path, duration, size, modified), the WAV it describes (`narration`: file, size, SHA-256) and per line: id, text, take file, `by` of the choice, source sample range, destination sample range, speech start and end in film seconds, and `words_film_s`: the transcribed words (`{text, start, end}`, film seconds) from the take's latest check against the line as it is now, omitted when there is none.
 
 For Resolve, an agent imports the narration file onto a new audio track at the timeline start, or places the individual takes (always the raw originals) at the manifest's positions, and adds a marker per line. The README documents this recipe; Takewise itself has no Resolve code. The milestone that adds export verifies the narration file against the loopback beeps and imports it into Resolve once.
 

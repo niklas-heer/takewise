@@ -483,18 +483,127 @@ fn record_refuses_an_invalid_script() {
     assert_eq!(value["data"]["problems"][0]["code"], "bad-id", "{value}");
 }
 
+/// Writes an executable shell script.
+fn script(dir: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A directory with fake `ffmpeg` and `whisper-cli` (which hears "Hello
+/// there." 0.1 s into the take's burst) and one with a model file, for
+/// `PATH` and `TAKEWISE_MODELS`.
+fn fake_whisper(tmp: &Path) -> (PathBuf, PathBuf) {
+    let bin = tmp.join("bin");
+    let models = tmp.join("models");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&models).unwrap();
+    fs::write(models.join("ggml-large-v3-turbo.bin"), b"").unwrap();
+    script(&bin, "ffmpeg", r#"for a; do last=$a; done; : > "$last""#);
+    let json = r#"{"transcription":[{"tokens":[
+        {"text":" Hello","offsets":{"from":2100,"to":2400},"p":0.9,"t_dtw":210},
+        {"text":" there","offsets":{"from":2500,"to":2800},"p":0.9,"t_dtw":250},
+        {"text":".","offsets":{"from":2800,"to":2900},"p":0.9,"t_dtw":280}]}]}"#;
+    script(
+        &bin,
+        "whisper-cli",
+        &format!(
+            "while [ $# -gt 0 ]; do if [ \"$1\" = -of ]; then out=$2; fi; shift; done\n\
+             cat > \"$out.json\" <<'EOF'\n{json}\nEOF"
+        ),
+    );
+    (bin, models)
+}
+
+fn check_cmd(dir: &Path, bin: &Path, models: &Path) -> Command {
+    let mut cmd = takewise();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    cmd.arg("check")
+        .arg(dir)
+        .env("PATH", path)
+        .env("TAKEWISE_MODELS", models);
+    cmd
+}
+
 #[test]
-fn check_is_a_stub_exit_2() {
+fn cli_check_reports_verdicts_json() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = init(tmp.path());
-    let (code, value) = json(takewise().arg("check").arg(&dir));
-    assert_eq!(code, 2);
-    assert!(
-        value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("milestone 3")
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    record_take(&dir, "hook");
+    record_take(&dir, "hook");
+    let (bin, models) = fake_whisper(tmp.path());
+
+    let (code, value) = json(&mut check_cmd(&dir, &bin, &models));
+    assert_eq!(code, 0, "{value}");
+    let checks = value["data"]["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 2, "{value}");
+    let first = &checks[0];
+    assert_eq!(
+        (first["line"].as_str(), first["take"].as_u64()),
+        (Some("hook"), Some(1))
     );
+    assert_eq!(first["verdict"], "keep", "{first}");
+    assert_eq!(first["transcript"][0]["text"], "Hello", "{first}");
+    assert_eq!(
+        first["checker"],
+        format!(
+            "takewise {} whisper ggml-large-v3-turbo.bin",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    let take = &status(&dir)["lines"][0]["takes"][0];
+    assert_eq!(take["effective"], "keep", "{take}");
+    assert_eq!(take["verdict_source"], "check", "{take}");
+
+    // Everything is checked now: nothing to do.
+    let (code, value) = json(&mut check_cmd(&dir, &bin, &models));
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["checks"], serde_json::json!([]), "{value}");
+
+    // An explicit take runs again; a different text makes it a retake, and
+    // a retake is a verdict, not an error.
+    takewise()
+        .args(["script", "set"])
+        .arg(&dir)
+        .args(["hook", "--text", "Hello over there."])
+        .assert()
+        .success();
+    let (code, value) =
+        json(check_cmd(&dir, &bin, &models).args(["--line", "hook", "--take", "2"]));
+    assert_eq!(code, 0, "{value}");
+    let checks = value["data"]["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 1, "{value}");
+    assert_eq!(checks[0]["take"], 2);
+    assert_eq!(checks[0]["verdict"], "retake", "{value}");
+    assert_eq!(checks[0]["reasons"][0]["code"], "missing-words", "{value}");
+
+    // Take 1 is stale now; take 2 is current.
+    let (code, value) = json(check_cmd(&dir, &bin, &models).arg("--stale-only"));
+    assert_eq!(code, 0, "{value}");
+    let checks = value["data"]["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 1, "{value}");
+    assert_eq!(checks[0]["take"], 1);
+}
+
+#[test]
+fn cli_check_setup_errors_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    record_take(&dir, "hook");
+    let (bin, _) = fake_whisper(tmp.path());
+    let (code, value) = json(&mut check_cmd(&dir, &bin, &tmp.path().join("no-models")));
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "missing-model", "{value}");
+
+    let (code, value) = json(
+        check_cmd(&dir, &bin, &tmp.path().join("no-models"))
+            .args(["--line", "hook", "--take", "9"]),
+    );
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "unknown-take", "{value}");
 }
 
 #[test]

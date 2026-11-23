@@ -88,13 +88,22 @@ enum Command {
         #[command(subcommand)]
         command: ScriptCommand,
     },
-    /// Run checks on takes (milestone 3).
+    /// Check takes: speech, sound, timing and words (whisper-cli), and
+    /// append a `checked` event for each. Without --line, checks every take
+    /// without a check against its line as it is now. Retake verdicts exit
+    /// 0; whisper-cli or the model missing exits 2.
     Check {
         dir: PathBuf,
+        /// Check this line's takes, even those already checked.
         #[arg(long)]
         line: Option<String>,
-        #[arg(long)]
+        /// With --line: only this take.
+        #[arg(long, requires = "line")]
         take: Option<u32>,
+        /// Only takes whose latest check was made against older text or an
+        /// older slot.
+        #[arg(long)]
+        stale_only: bool,
     },
     /// Add an outside judgment of a take.
     #[command(allow_negative_numbers = true)]
@@ -128,7 +137,8 @@ enum Command {
         #[arg(long)]
         use_proposed: bool,
     },
-    /// Check whisper-cli, the whisper model, ffprobe and the film.
+    /// Check whisper-cli (with a 1 s transcription), the whisper model,
+    /// ffmpeg, ffprobe, the film and the audio devices.
     Doctor { dir: Option<PathBuf> },
 }
 
@@ -190,7 +200,8 @@ fn parse_score(s: &str) -> Result<f64, String> {
 pub enum CliError {
     Core(tw::Error),
     Setup(String),
-    NotYet(String),
+    /// Transcription cannot be set up: whisper-cli, ffmpeg or the model.
+    Whisper(tw::SetupError),
 }
 
 impl CliError {
@@ -198,7 +209,7 @@ impl CliError {
         match self {
             CliError::Core(err) => err.code(),
             CliError::Setup(_) => "setup",
-            CliError::NotYet(_) => "not-implemented",
+            CliError::Whisper(err) => err.code(),
         }
     }
 }
@@ -207,7 +218,8 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CliError::Core(err) => err.fmt(f),
-            CliError::Setup(message) | CliError::NotYet(message) => f.write_str(message),
+            CliError::Setup(message) => f.write_str(message),
+            CliError::Whisper(err) => err.fmt(f),
         }
     }
 }
@@ -266,10 +278,12 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             };
             script_set(&dir, &line, field, expect.as_ref())
         }
-        Command::Check { .. } => Err(CliError::NotYet(
-            "checks arrive in milestone 3; agents can add judgments with `takewise judge` now"
-                .to_owned(),
-        )),
+        Command::Check {
+            dir,
+            line,
+            take,
+            stale_only,
+        } => check(&dir, line.as_deref(), take, stale_only),
         Command::Judge {
             dir,
             line,
@@ -547,6 +561,140 @@ fn export(dir: &Path, use_proposed: bool) -> Result<Outcome, CliError> {
         .join("\n");
     Ok(Outcome::new(&report, "")
         .with_finding("export-refused", format!("export refused:\n{message}")))
+}
+
+/// One take's check, as `check --json` lists it.
+#[derive(Serialize)]
+struct TakeCheck<'a> {
+    line: &'a str,
+    take: u32,
+    #[serde(flatten)]
+    checked: &'a tw::Checked,
+}
+
+/// A take that could not be checked at all, such as an unreadable file.
+#[derive(Serialize)]
+struct CheckError {
+    line: String,
+    take: u32,
+    code: &'static str,
+    message: String,
+}
+
+/// The takes `check` runs on: one take, a line's takes, or every take
+/// without a current check; `stale_only` keeps those checked against an
+/// older text or slot.
+fn takes_to_check(
+    dir: &Path,
+    line: Option<&str>,
+    take: Option<u32>,
+    stale_only: bool,
+) -> Result<Vec<tw::TakeRef>, CliError> {
+    let project = Project::open(dir)?;
+    let ledger = tw::read(dir)?;
+    if let Some(id) = line {
+        if project.snapshot(id).is_none() {
+            return Err(tw::Error::UnknownLine(id.to_owned()).into());
+        }
+        if let Some(n) = take
+            && ledger.recorded(id, n).is_none()
+        {
+            return Err(tw::Error::UnknownTake {
+                line: id.to_owned(),
+                take: n,
+            }
+            .into());
+        }
+    }
+    let selected =
+        |t: &tw::TakeRef| line.is_none_or(|id| t.line == id) && take.is_none_or(|n| t.take == n);
+    if stale_only || line.is_none() {
+        return Ok(tw::unchecked_takes(&project, &ledger)
+            .into_iter()
+            .filter(|u| !stale_only || u.stale)
+            .map(|u| u.take)
+            .filter(selected)
+            .collect());
+    }
+    let mut takes: Vec<tw::TakeRef> = ledger
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, tw::EventKind::Recorded(_)))
+        .map(|e| tw::TakeRef {
+            line: e.line.clone(),
+            take: e.take,
+        })
+        .filter(selected)
+        .collect();
+    takes.sort();
+    takes.dedup();
+    Ok(takes)
+}
+
+fn check(
+    dir: &Path,
+    line: Option<&str>,
+    take: Option<u32>,
+    stale_only: bool,
+) -> Result<Outcome, CliError> {
+    let takes = takes_to_check(dir, line, take, stale_only)?;
+    if takes.is_empty() {
+        return Ok(Outcome::new(
+            json!({ "checks": [], "errors": [] }),
+            "Nothing to check.",
+        ));
+    }
+    let config = Project::open(dir)?.config.check;
+    let transcriber = tw::WhisperCli::discover(&config).map_err(CliError::Whisper)?;
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for take in &takes {
+        match tw::check_take(dir, take, &transcriber, env!("CARGO_PKG_VERSION")) {
+            Ok(checked) => results.push((take, checked)),
+            Err(err) => errors.push(CheckError {
+                line: take.line.clone(),
+                take: take.take,
+                code: err.code(),
+                message: err.to_string(),
+            }),
+        }
+    }
+    let mut text = String::new();
+    for (take, checked) in &results {
+        let _ = write!(
+            text,
+            "{} take {}: {}",
+            take.line,
+            take.take,
+            checked.verdict.as_str()
+        );
+        for reason in &checked.reasons {
+            let _ = write!(text, "; {}", reason.message);
+        }
+        text.push('\n');
+    }
+    for err in &errors {
+        let _ = writeln!(
+            text,
+            "{} take {}: not checked: {}",
+            err.line, err.take, err.message
+        );
+    }
+    let checks: Vec<TakeCheck> = results
+        .iter()
+        .map(|(take, checked)| TakeCheck {
+            line: &take.line,
+            take: take.take,
+            checked,
+        })
+        .collect();
+    let outcome = Outcome::new(json!({ "checks": checks, "errors": errors }), text);
+    if errors.is_empty() {
+        Ok(outcome)
+    } else {
+        let message = format!("{} take(s) could not be checked", errors.len());
+        Ok(outcome.with_finding("check-failed", message))
+    }
 }
 
 #[derive(Serialize)]
@@ -926,25 +1074,53 @@ fn audio_devices(project: Option<&Project>) -> AudioReport {
     report
 }
 
-/// `$TAKEWISE_MODELS`, else `~/.local/share/takewise/models`.
-fn models_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("TAKEWISE_MODELS") {
-        return PathBuf::from(dir);
+/// Transcribes one second of silence, to prove whisper-cli, ffmpeg and
+/// the model work together.
+fn transcription_check(config: &CheckConfig) -> Check {
+    let fail = |detail: String| Check {
+        name: "transcription",
+        ok: false,
+        detail,
+    };
+    let transcriber = match tw::WhisperCli::discover(config) {
+        Ok(transcriber) => transcriber,
+        Err(err) => return fail(err.to_string()),
+    };
+    let silence = match tempfile::Builder::new()
+        .prefix("takewise-doctor-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(err) => return fail(format!("could not create a temporary directory: {err}")),
+    };
+    let wav = silence.path().join("silence.wav");
+    if let Err(err) = tw::write_take_wav(&wav, &vec![0; 48_000], 48_000) {
+        return fail(err.to_string());
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".local/share/takewise/models")
+    let began = std::time::Instant::now();
+    match tw::Transcriber::transcribe(&transcriber, &wav) {
+        tw::Transcript::Words(_) => Check {
+            name: "transcription",
+            ok: true,
+            detail: format!(
+                "transcribed 1 s of silence in {:.1} s with {}",
+                began.elapsed().as_secs_f64(),
+                transcriber.model_name()
+            ),
+        },
+        tw::Transcript::Failed(err) => fail(err),
+    }
 }
 
 fn doctor(dir: Option<&Path>) -> Outcome {
     let mut checks = vec![tool_check("whisper-cli", "brew install whisper-cpp")];
     let project = dir.map(Project::open);
-    let model = match &project {
-        Some(Ok(project)) => project.config.check.whisper_model.clone(),
-        _ => CheckConfig::default().whisper_model,
+    let config = match &project {
+        Some(Ok(project)) => project.config.check.clone(),
+        _ => CheckConfig::default(),
     };
-    let model_path = models_dir().join(&model);
+    let model = config.whisper_model.clone();
+    let model_path = tw::whisper::models_dir().join(&model);
     checks.push(Check {
         name: "whisper-model",
         ok: model_path.is_file(),
@@ -957,7 +1133,11 @@ fn doctor(dir: Option<&Path>) -> Outcome {
             )
         },
     });
+    checks.push(tool_check("ffmpeg", "brew install ffmpeg"));
     checks.push(tool_check("ffprobe", "brew install ffmpeg"));
+    if checks.iter().all(|check| check.ok) {
+        checks.push(transcription_check(&config));
+    }
     match &project {
         None => {}
         Some(Err(err)) => checks.push(Check {

@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, rename_temp, write_temp};
-use crate::ledger::{Verdict, read};
+use crate::ledger::{EventKind, Ledger, Verdict, read};
 use crate::project::Project;
 use crate::script::{Line, validate};
 use crate::speech::analyze;
@@ -68,6 +68,19 @@ pub struct ManifestLine {
     /// Detected speech start and end in film seconds, clamped to the film;
     /// a `speech-cropped` warning gives the unclamped values.
     pub speech_film_s: [f64; 2],
+    /// The transcribed words in film seconds, from the take's latest check
+    /// against the line as it is now; absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words_film_s: Option<Vec<ManifestWord>>,
+}
+
+/// A transcribed word placed in the film.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ManifestWord {
+    pub text: String,
+    /// Film seconds, as heard: not clamped to the film.
+    pub start: f64,
+    pub end: f64,
 }
 
 #[derive(Serialize)]
@@ -147,11 +160,17 @@ impl Refusals {
 pub fn export(dir: &Path, opts: &ExportOptions) -> Result<ExportReport> {
     let _guard = lock(dir)?;
     let project = Project::open(dir)?;
-    let state = fold(&project, &read(dir)?);
-    export_locked(&project, &state, opts.use_proposed)
+    let ledger = read(dir)?;
+    let state = fold(&project, &ledger);
+    export_locked(&project, &ledger, &state, opts.use_proposed)
 }
 
-fn export_locked(project: &Project, state: &State, use_proposed: bool) -> Result<ExportReport> {
+fn export_locked(
+    project: &Project,
+    ledger: &Ledger,
+    state: &State,
+    use_proposed: bool,
+) -> Result<ExportReport> {
     let dir = project.dir.join(EXPORT_DIR);
     let mut refused = Vec::new();
     let problems = validate(&project.script, project.film_duration());
@@ -168,7 +187,7 @@ fn export_locked(project: &Project, state: &State, use_proposed: bool) -> Result
     let mut refusals = Refusals::default();
     let mut placed: Vec<Placed> = Vec::new();
     for line in &project.script.lines {
-        match place(project, state, use_proposed, line) {
+        match place(project, ledger, state, use_proposed, line) {
             Ok(p) => placed.push(p),
             Err((code, message)) => refusals.add(code, &line.id, message),
         }
@@ -258,6 +277,7 @@ fn export_locked(project: &Project, state: &State, use_proposed: bool) -> Result
 /// why it cannot (a refusal code and the reason for the message).
 fn place(
     project: &Project,
+    ledger: &Ledger,
     state: &State,
     use_proposed: bool,
     line: &Line,
@@ -339,6 +359,7 @@ fn place(
             source_samples: [to_u64(src0), to_u64(src1)],
             dest_samples: [to_u64(dest0), to_u64(dest1)],
             speech_film_s: [clamped.0, clamped.1],
+            words_film_s: words_film_s(project, ledger, line, take_no, take_start_film),
         },
         samples,
         src: src0,
@@ -346,6 +367,38 @@ fn place(
         old_text: take.recorded_against_old_text,
         cropped_speech,
     })
+}
+
+/// The words of the take's latest check against the line as it is now, in
+/// film seconds; `None` without such a check or without a transcript.
+fn words_film_s(
+    project: &Project,
+    ledger: &Ledger,
+    line: &Line,
+    take: u32,
+    take_start_film: f64,
+) -> Option<Vec<ManifestWord>> {
+    let current = project.snapshot(&line.id)?;
+    let checked = ledger
+        .events
+        .iter()
+        .rev()
+        .filter(|e| e.line == line.id && e.take == take)
+        .find_map(|e| match &e.kind {
+            EventKind::Checked(checked) if checked.snapshot.matches(&current) => Some(checked),
+            _ => None,
+        })?;
+    let words = checked.transcript.as_ref()?;
+    Some(
+        words
+            .iter()
+            .map(|w| ManifestWord {
+                text: w.text.clone(),
+                start: take_start_film + w.start,
+                end: take_start_film + w.end,
+            })
+            .collect(),
+    )
 }
 
 fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
@@ -571,6 +624,60 @@ mod tests {
                 .ends_with("film.mp4")
         );
         assert_eq!(manifest["lines"][0]["dest_samples"][0], 472_800);
+    }
+
+    #[test]
+    fn export_includes_word_times() {
+        struct Hears;
+        impl crate::whisper::Transcriber for Hears {
+            fn transcribe(&self, _: &Path) -> crate::check::Transcript {
+                let word = |text: &str, start: f64, end: f64| crate::ledger::Word {
+                    text: text.to_owned(),
+                    start,
+                    end,
+                    confidence: Some(0.9),
+                };
+                crate::check::Transcript::Words(vec![
+                    word("Hello", 2.1, 2.4),
+                    word("there.", 2.5, 2.9),
+                ])
+            }
+            fn model(&self) -> String {
+                "ggml-fake.bin".to_owned()
+            }
+        }
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let manifest = |dir: &Path| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap()
+        };
+
+        // Unchecked: no word times.
+        let report = run(&dir, false);
+        assert_eq!(report.lines[0].words_film_s, None);
+        assert!(manifest(&dir)["lines"][0].get("words_film_s").is_none());
+
+        crate::run_check::check_take(&dir, &t, &Hears, "0.1.0").unwrap();
+        let report = run(&dir, false);
+        let words = report.lines[0].words_film_s.as_ref().expect("word times");
+        let got: Vec<(&str, f64, f64)> = words
+            .iter()
+            .map(|w| (w.text.as_str(), w.start, w.end))
+            .collect();
+        // Film time = line start 10.0 + offset -2.0 + time in the take.
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].0, got[1].0), ("Hello", "there."));
+        assert!((got[0].1 - 10.1).abs() < 1e-9 && (got[0].2 - 10.4).abs() < 1e-9);
+        assert!((got[1].1 - 10.5).abs() < 1e-9 && (got[1].2 - 10.9).abs() < 1e-9);
+        let json = &manifest(&dir)["lines"][0]["words_film_s"];
+        assert_eq!(json[0]["text"], "Hello", "{json}");
+        assert!((json[1]["start"].as_f64().unwrap() - 10.5).abs() < 1e-9);
+
+        // Moving the line makes the check stale: no word times until rechecked.
+        set_line_field(&dir, "hook", Field::Start(12.0), None).unwrap();
+        let report = run(&dir, false);
+        assert_eq!(report.lines[0].words_film_s, None);
     }
 
     #[test]

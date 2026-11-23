@@ -3,8 +3,11 @@
 //!
 //! All writes go through `takewise-core`; the project lock is only held for
 //! those short writes, never while recording. The microphone is never
-//! monitored: capture feeds the take and the level meter only.
+//! monitored: capture feeds the take and the level meter only. Takes are
+//! checked on a worker thread after each commit and whenever a reload finds
+//! takes without a current check.
 
+mod checks;
 mod clock;
 mod lines;
 mod media;
@@ -25,11 +28,14 @@ use gpui_kit::{
     IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render, Styled as _, Subscription,
     TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
+use std::sync::Arc;
+
 use takewise_core::{
     self as tw, AvailableInput, Field, LineState, Project, ScriptVersion, State, TakeRef,
-    check_input, clamp_mark, plan_take,
+    Unavailable, Unchecked, WhisperCli, check_input, clamp_mark, plan_take,
 };
 
+use checks::{Checks, SharedTranscriber};
 pub use clock::FilmClock;
 pub use media::{Media, RealMedia};
 use recorder::Recorder;
@@ -97,17 +103,34 @@ struct Loaded {
     project: Project,
     version: ScriptVersion,
     state: State,
+    /// Takes without a check against their line as it is now.
+    unchecked: Vec<Unchecked>,
 }
 
 fn load(dir: &Path) -> Result<Loaded, tw::Error> {
     let (project, version) = Project::open_versioned(dir)?;
     let ledger = tw::read(dir)?;
     let state = tw::fold(&project, &ledger);
+    let unchecked = tw::unchecked_takes(&project, &ledger);
     Ok(Loaded {
         project,
         version,
         state,
+        unchecked,
     })
+}
+
+/// whisper-cli with the project's model, or, when it cannot be set up, a
+/// stand-in that leaves every take's words unchecked with the reason.
+fn transcriber(project: &Project) -> SharedTranscriber {
+    let config = &project.config.check;
+    match WhisperCli::discover(config) {
+        Ok(whisper) => Arc::new(whisper),
+        Err(err) => Arc::new(Unavailable {
+            reason: err.to_string(),
+            model: config.whisper_model.clone(),
+        }),
+    }
 }
 
 /// Opens the recording window on the project in `dir` and runs until it
@@ -140,6 +163,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
             }
         };
         let watcher = Watcher::new(&dir).ok();
+        let transcriber = transcriber(&loaded.project);
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -150,7 +174,17 @@ pub fn run(dir: &Path) -> Result<(), String> {
             ..WindowOptions::default()
         };
         let opened = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| RecordingWindow::new(dir, loaded, Box::new(media), watcher, window, cx))
+            cx.new(|cx| {
+                RecordingWindow::new(
+                    dir,
+                    loaded,
+                    Box::new(media),
+                    watcher,
+                    transcriber,
+                    window,
+                    cx,
+                )
+            })
         });
         if let Err(err) = opened {
             eprintln!("error: cannot open the window: {err}");
@@ -189,6 +223,7 @@ pub struct RecordingWindow {
     inputs_checked_at: Option<f64>,
     editing: Option<Draft>,
     watcher: Option<Watcher>,
+    checks: Checks,
     focus: FocusHandle,
     subscriptions: Vec<Subscription>,
 }
@@ -199,6 +234,7 @@ impl RecordingWindow {
         loaded: Loaded,
         media: Box<dyn Media>,
         watcher: Option<Watcher>,
+        transcriber: SharedTranscriber,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -214,6 +250,8 @@ impl RecordingWindow {
             view.shutdown();
             async {}
         });
+        let checks = Checks::new(dir.clone(), transcriber);
+        let loaded_unchecked = loaded.unchecked;
         let mut view = Self {
             dir,
             media,
@@ -229,10 +267,12 @@ impl RecordingWindow {
             inputs_checked_at: None,
             editing: None,
             watcher,
+            checks,
             focus,
             subscriptions: vec![on_quit],
         };
         view.after_reload(None);
+        view.queue_checks(&loaded_unchecked);
         view.recover();
         view.check_inputs();
         view.park();
@@ -316,8 +356,39 @@ impl RecordingWindow {
                 self.version = loaded.version;
                 self.state = loaded.state;
                 self.after_reload(current.as_deref());
+                self.queue_checks(&loaded.unchecked);
             }
             Err(err) => self.message = Some(format!("Could not reload the project: {err}")),
+        }
+    }
+
+    /// Queues a check of each take without a current one (a new take, or a
+    /// line whose text or slot changed).
+    fn queue_checks(&mut self, unchecked: &[Unchecked]) {
+        for u in unchecked {
+            if let Some(snapshot) = self.project.snapshot(&u.take.line) {
+                self.checks.queue(&u.take, &snapshot);
+            }
+        }
+    }
+
+    /// Takes in finished checks: reloads to show their verdicts, and says
+    /// which takes could not be checked at all.
+    fn collect_checks(&mut self) {
+        let done = self.checks.poll();
+        if done.is_empty() {
+            return;
+        }
+        self.reload();
+        let failed: Vec<String> = done
+            .iter()
+            .filter_map(|d| {
+                let err = d.result.as_ref().err()?;
+                Some(format!("{} take {}: {err}", d.take.line, d.take.take))
+            })
+            .collect();
+        if !failed.is_empty() {
+            self.message = Some(format!("Could not check {}.", failed.join("; ")));
         }
     }
 
@@ -420,6 +491,7 @@ impl RecordingWindow {
         if self.watcher.as_ref().is_some_and(Watcher::changed) {
             self.reload();
         }
+        self.collect_checks();
         let busy = self.recorder.is_recording() || self.recorder.is_playing();
         let now = self.media.host_now_s();
         if !busy
@@ -750,7 +822,14 @@ impl Render for RecordingWindow {
                             .flex_col()
                             .bg(rgb(colors::PANEL))
                             .child(lines::lines(&self.state, self.line, self.recorder.recording_line()))
-                            .child(takes::takes(self.line_state(), self.take)),
+                            .child(takes::takes(
+                                self.line_state(),
+                                self.take,
+                                &self
+                                    .line_id()
+                                    .map(|id| self.checks.pending_of(id))
+                                    .unwrap_or_default(),
+                            )),
                     ),
             )
             .child(

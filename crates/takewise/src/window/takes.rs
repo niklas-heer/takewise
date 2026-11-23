@@ -1,5 +1,6 @@
-//! The takes of the current line with their effective verdicts: a hollow
-//! star for the proposed take, a filled one for the chosen take.
+//! The takes of the current line with their effective verdicts and the
+//! reason for each ("checking…" while a check runs): a hollow star for the
+//! proposed take, a filled one for the chosen take.
 
 use gpui_kit::{
     AnyElement, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -9,9 +10,13 @@ use takewise_core::{LineState, TakeState, Verdict};
 
 use super::colors;
 
-fn verdict(take: &TakeState) -> (String, u32) {
+/// What the list says about a take, and in which color.
+pub fn label(take: &TakeState, checking: bool) -> (String, u32) {
     if take.missing {
         return ("file missing".to_owned(), colors::RECORD);
+    }
+    if checking {
+        return ("checking…".to_owned(), colors::DIM);
     }
     let stale = if take.stale_check { " (stale)" } else { "" };
     match take.effective {
@@ -22,7 +27,8 @@ fn verdict(take: &TakeState) -> (String, u32) {
     }
 }
 
-pub fn takes(line: Option<&LineState>, selected: Option<u32>) -> AnyElement {
+/// `checking`: the line's takes whose check is running or queued.
+pub fn takes(line: Option<&LineState>, selected: Option<u32>, checking: &[u32]) -> AnyElement {
     let Some(line) = line else {
         return div().into_any_element();
     };
@@ -53,7 +59,9 @@ pub fn takes(line: Option<&LineState>, selected: Option<u32>) -> AnyElement {
             )
         })
         .children(line.takes.iter().map(|take| {
-            let (text, color) = verdict(take);
+            let checking = checking.contains(&take.take);
+            let (text, color) = label(take, checking);
+            let reason = take.reason.clone().filter(|_| !checking && !take.missing);
             let star = if chosen == Some(take.take) {
                 "★"
             } else if line.proposed == Some(take.take) {
@@ -63,9 +71,6 @@ pub fn takes(line: Option<&LineState>, selected: Option<u32>) -> AnyElement {
             };
             div()
                 .id(("take", take.take as usize))
-                .flex()
-                .flex_row()
-                .justify_between()
                 .px(px(14.))
                 .py(px(5.))
                 .text_size(px(14.))
@@ -75,11 +80,26 @@ pub fn takes(line: Option<&LineState>, selected: Option<u32>) -> AnyElement {
                 .child(
                     div()
                         .flex()
-                        .gap(px(10.))
-                        .child(format!("{}", take.take))
-                        .child(div().text_color(rgb(color)).child(text)),
+                        .flex_row()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(10.))
+                                .child(format!("{}", take.take))
+                                .child(div().text_color(rgb(color)).child(text)),
+                        )
+                        .child(div().text_color(rgb(colors::ACCENT)).child(star)),
                 )
-                .child(div().text_color(rgb(colors::ACCENT)).child(star))
+                .when_some(reason, |el, reason| {
+                    el.child(
+                        div()
+                            .pl(px(22.))
+                            .text_size(px(12.))
+                            .text_color(rgb(colors::DIM))
+                            .child(reason),
+                    )
+                })
         }))
         .into_any_element()
 }

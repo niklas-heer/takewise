@@ -81,6 +81,27 @@ const DTW_PRESETS: [&str; 12] = [
 /// [`Transcript::Failed`] with the reason, never a panic or an error.
 pub trait Transcriber {
     fn transcribe(&self, wav: &Path) -> Transcript;
+    /// The model's file name, for the `checked` event's `checker` field.
+    fn model(&self) -> String;
+}
+
+/// Stands in when transcription cannot be set up (see [`SetupError`]):
+/// every take's words go unchecked, with the reason, so the sound and timing
+/// checks still run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    pub reason: String,
+    /// The configured model's file name.
+    pub model: String,
+}
+
+impl Transcriber for Unavailable {
+    fn transcribe(&self, _: &Path) -> Transcript {
+        Transcript::Failed(self.reason.clone())
+    }
+    fn model(&self) -> String {
+        self.model.clone()
+    }
 }
 
 /// Why transcription cannot be set up at all.
@@ -243,6 +264,9 @@ impl Transcriber for WhisperCli {
             Ok(words) => Transcript::Words(words),
             Err(message) => Transcript::Failed(message),
         }
+    }
+    fn model(&self) -> String {
+        self.model_name()
     }
 }
 
