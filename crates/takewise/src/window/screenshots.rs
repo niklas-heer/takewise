@@ -10,8 +10,11 @@
 //! AVPlayer, which is only ever seeked, never played; the host clock is
 //! the harness's; the "microphone" is fed from the spoken files. Each window
 //! is put into the state to show through its own methods and rendered
-//! offscreen to `<out>/*.png`. Nothing plays, no microphone opens, no window
-//! appears and no key or mouse event is sent.
+//! offscreen to `<out>/*.png`; the short loop `<out>/loop.webp` is a series
+//! of such renders of two takes recorded and checked in a window, put
+//! together with `img2webp`. Nothing plays, no microphone opens, no window
+//! appears and no key or mouse event is sent. `scripts/screenshots`
+//! compresses the PNGs afterwards.
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -30,7 +33,7 @@ use gpui_kit::{
 use takewise_core::{self as tw, AvailableInput, Project, RECORD_RATE, TakeRef, Timebase};
 use takewise_media::{CaptureBuffer, DeviceInfo, FilmPlayer, Frame, Monitor, Transport};
 
-use super::checks::{Checker, worker_tag};
+use super::checks::{Checker, SharedTranscriber, worker_tag};
 use image::RgbaImage;
 
 use super::{Media, RecordingWindow, bind_keys, load};
@@ -124,8 +127,17 @@ const LEAD_S: f64 = 0.25;
 const SPEECH_PEAK_DBFS: f64 = -9.0;
 const ROOM_DBFS: f64 = -66.0;
 const FULL_SCALE: f64 = 8_388_607.0;
-/// The window's size, as Takewise opens it.
+/// The window's size, as Takewise opens it: the audio panel and the setup
+/// check are cut from a window of this size.
 const WINDOW: (f32, f32) = (1280.0, 820.0);
+/// A smaller window for the hero and the loop, so their text stays legible
+/// in a README's column.
+const HERO: (f32, f32) = (1000.0, 640.0);
+/// The takes of the loop: the indices in [`TAKES`] of the capsule line
+/// without "home", and read right.
+const LOOP_TAKES: [usize; 2] = [4, 5];
+/// The loop's width in pixels.
+const LOOP_WIDTH: u32 = 1000;
 
 /// Runs `takewise screenshots <work> <out>`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -151,7 +163,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         gpui_kit::init(cx);
         bind_keys(cx);
         cx.spawn(async move |cx| {
-            match shoot(&demo, &out, cx).await {
+            match shoot(&demo, &work, &out, cx).await {
                 Ok(()) => done.store(true, Ordering::SeqCst),
                 Err(err) => eprintln!("error: {err}"),
             }
@@ -169,6 +181,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
 /// The demo project and what the harness feeds its windows.
 struct Demo {
     dir: PathBuf,
+    /// The project of the loop: the demo before the capsule line's takes.
+    anim: PathBuf,
+    /// What is spoken in each of [`TAKES`], in order.
+    spoken: Vec<Vec<i32>>,
     /// The spoken text of each line's last good take, by line id, and the
     /// setup check's sentence.
     voices: Vec<(String, Vec<i32>)>,
@@ -228,21 +244,32 @@ fn prepare(work: &Path) -> Result<Demo, String> {
     std::fs::write(dir.join("script.toml"), SCRIPT).map_err(|err| err.to_string())?;
     let preroll_s = project.config.record.preroll_s;
 
+    let anim = work.join("anim.takewise");
     let mut voices = Vec::new();
+    let mut spoken = Vec::new();
     for (n, (line, text)) in TAKES.iter().enumerate() {
+        if *line == "capsule" && !TAKES[..n].iter().any(|(l, _)| *l == "capsule") {
+            // The loop starts before the capsule line has takes.
+            copy_dir(&dir, &anim)?;
+        }
         let wav = voices_dir.join(format!("{n:02}-{line}.wav"));
         let speech = speak(text, &wav)?;
+        spoken.push(speech.clone());
         let samples = take_samples(&speech, preroll_s, u32::try_from(n).unwrap_or(0));
         commit(&dir, line, &samples, preroll_s)?;
         voices.push(((*line).to_owned(), speech));
     }
     let sentence = speak(super::setup::SENTENCE, &voices_dir.join("sentence.wav"))?;
 
-    check_all(&dir)?;
-    tw::choose_take(&dir, "orbit", 1, "narrator").map_err(fail)?;
-    tw::choose_take(&dir, "coast", 1, "narrator").map_err(fail)?;
+    for project in [&dir, &anim] {
+        check_all(project)?;
+        tw::choose_take(project, "orbit", 1, "narrator").map_err(fail)?;
+        tw::choose_take(project, "coast", 1, "narrator").map_err(fail)?;
+    }
     Ok(Demo {
         dir,
+        anim,
+        spoken,
         voices,
         sentence,
     })
@@ -596,6 +623,20 @@ impl Media for DemoMedia {
     }
 }
 
+/// A transcriber that starts a little later than the one it wraps, so a
+/// render of the window can show "checking…" before the check is in.
+struct Unhurried(SharedTranscriber);
+
+impl tw::Transcriber for Unhurried {
+    fn transcribe(&self, wav: &Path) -> tw::Transcript {
+        std::thread::sleep(Duration::from_secs(2));
+        self.0.transcribe(wav)
+    }
+    fn model(&self) -> String {
+        self.0.model()
+    }
+}
+
 /// A hidden recording window on the demo project, and its media.
 struct Shot {
     window: AnyWindowHandle,
@@ -604,18 +645,39 @@ struct Shot {
 }
 
 impl Shot {
-    /// Opens a hidden window on the project in `dir` with [`DemoMedia`]
-    /// and waits for its film to load.
-    async fn open(dir: &Path, cx: &mut AsyncApp) -> Result<Self, String> {
+    /// Opens a hidden window of `size` on the project in `dir` with
+    /// [`DemoMedia`] and waits for its film to load. With `checks`, the
+    /// window checks new takes as Takewise does; otherwise its takes are
+    /// all checked before it opens.
+    async fn open(
+        dir: &Path,
+        (width, height): (f32, f32),
+        checks: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<Self, String> {
         let loaded = load(dir).map_err(|err| err.to_string())?;
         let media = DemoMedia::open(&loaded.project.film_path())?;
+        let checker = if checks {
+            let mut checker = super::checker(&loaded.project);
+            checker.transcriber = Arc::new(Unhurried(checker.transcriber));
+            checker
+        } else {
+            Checker {
+                transcriber: Arc::new(tw::Unavailable {
+                    reason: "not checked in screenshots".to_owned(),
+                    model: "none".to_owned(),
+                }),
+                tools: Vec::new(),
+                tag: worker_tag(),
+            }
+        };
         let window_media = media.clone();
         let dir = dir.to_path_buf();
         let (window, view) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.), px(0.)),
-                    size: size(px(WINDOW.0), px(WINDOW.1)),
+                    size: size(px(width), px(height)),
                 })),
                 focus: false,
                 show: false,
@@ -628,15 +690,7 @@ impl Shot {
                         loaded,
                         Box::new(window_media),
                         None,
-                        // Every take is checked before the windows open.
-                        Checker {
-                            transcriber: Arc::new(tw::Unavailable {
-                                reason: "not checked in screenshots".to_owned(),
-                                model: "none".to_owned(),
-                            }),
-                            tools: Vec::new(),
-                            tag: worker_tag(),
-                        },
+                        checker,
                         window,
                         cx,
                     )
@@ -660,6 +714,33 @@ impl Shot {
 
     fn update(&self, cx: &mut AsyncApp, f: impl FnOnce(&mut RecordingWindow)) {
         cx.update(|cx| self.view.update(cx, |view, _| f(view)));
+    }
+
+    /// The film time the window plays at, while it plays.
+    fn playhead(&self, cx: &mut AsyncApp) -> Option<f64> {
+        cx.update(|cx| {
+            let view = self.view.read(cx);
+            view.recorder.playhead_s(&*view.media)
+        })
+    }
+
+    /// Draws frames, the clock standing still, until `done` holds for the
+    /// window; work off the UI thread (saving a take, checking it) runs
+    /// meanwhile.
+    async fn wait_for(
+        &self,
+        cx: &mut AsyncApp,
+        what: &str,
+        done: impl Fn(&RecordingWindow) -> bool,
+    ) -> Result<(), String> {
+        for _ in 0..1800 {
+            self.draw(cx);
+            if cx.update(|cx| done(self.view.read(cx))) {
+                return Ok(());
+            }
+            wait(cx, 0.1).await;
+        }
+        Err(format!("timed out waiting for {what}"))
     }
 
     /// Draws a frame (the window's tick runs in it).
@@ -714,68 +795,122 @@ async fn wait(cx: &mut AsyncApp, s: f64) {
         .await;
 }
 
-/// The part of a window's `image` at `x`, `y`, `w`, `h` in logical pixels.
-fn crop(image: &RgbaImage, (x, y, w, h): (f32, f32, f32, f32)) -> RgbaImage {
+/// The part of a render of a window `window_width` wide at `x`, `y`,
+/// `w`, `h` in logical pixels.
+fn crop(image: &RgbaImage, window_width: f32, (x, y, w, h): (f32, f32, f32, f32)) -> RgbaImage {
+    let scale = scale_of(image, window_width);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let scale = |v: f32| (v * image.width() as f32 / WINDOW.0).round() as u32;
-    image::imageops::crop_imm(image, scale(x), scale(y), scale(w), scale(h)).to_image()
+    let px = |v: f32| (v * scale).round() as u32;
+    image::imageops::crop_imm(image, px(x), px(y), px(w), px(h)).to_image()
 }
 
-/// `images` one below the other, divided by a line in the panels' border
-/// color.
-fn stack(images: &[RgbaImage]) -> RgbaImage {
-    let divider = 2;
-    let width = images.iter().map(RgbaImage::width).max().unwrap_or(0);
-    let height = images.iter().map(RgbaImage::height).sum::<u32>()
-        + divider * u32::try_from(images.len().saturating_sub(1)).unwrap_or(0);
-    let [r, g, b] = rgb_bytes(super::colors::SELECTED);
-    let mut out = RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
-    let mut y = 0;
+/// Pixels per logical pixel in a render of a window `window_width` wide.
+#[allow(clippy::cast_precision_loss)]
+fn scale_of(image: &RgbaImage, window_width: f32) -> f32 {
+    image.width() as f32 / window_width
+}
+
+/// How [`compose`] lays images out.
+#[derive(Clone, Copy)]
+enum Axis {
+    /// Side by side, top-aligned.
+    Row,
+    /// One below the other, left-aligned.
+    Column,
+}
+
+/// `images` laid out along `axis`, `gap` pixels apart, on `fill`.
+fn compose(images: &[RgbaImage], axis: Axis, gap: u32, fill: image::Rgba<u8>) -> RgbaImage {
+    let gaps = gap * u32::try_from(images.len().saturating_sub(1)).unwrap_or(0);
+    let (width, height) = match axis {
+        Axis::Row => (
+            images.iter().map(RgbaImage::width).sum::<u32>() + gaps,
+            images.iter().map(RgbaImage::height).max().unwrap_or(0),
+        ),
+        Axis::Column => (
+            images.iter().map(RgbaImage::width).max().unwrap_or(0),
+            images.iter().map(RgbaImage::height).sum::<u32>() + gaps,
+        ),
+    };
+    let mut out = RgbaImage::from_pixel(width, height, fill);
+    let mut at = 0;
     for image in images {
-        image::imageops::replace(&mut out, image, 0, i64::from(y));
-        y += image.height() + divider;
+        match axis {
+            Axis::Row => {
+                image::imageops::replace(&mut out, image, i64::from(at), 0);
+                at += image.width() + gap;
+            }
+            Axis::Column => {
+                image::imageops::replace(&mut out, image, 0, i64::from(at));
+                at += image.height() + gap;
+            }
+        }
     }
     out
 }
 
-fn rgb_bytes(color: u32) -> [u8; 3] {
+fn opaque(color: u32) -> image::Rgba<u8> {
     let [_, r, g, b] = color.to_be_bytes();
-    [r, g, b]
+    image::Rgba([r, g, b, 255])
 }
 
-/// Writes `image` as an optimized PNG: reduced to a 256-color palette
-/// (`NeuQuant`), which keeps the screenshots small enough for a README.
+const TRANSPARENT: image::Rgba<u8> = image::Rgba([0, 0, 0, 0]);
+/// The frame around every image: light enough to set the dark window
+/// apart from a dark page, quiet on a light one.
+const FRAME: [f32; 3] = [86.0, 86.0, 96.0];
+
+/// `image` with rounded corners (transparent outside them) and a thin
+/// light border; `scale` is pixels per logical pixel.
+fn framed(image: &RgbaImage, scale: f32) -> RgbaImage {
+    let radius = 6.0 * scale;
+    let border = scale.max(1.0);
+    #[allow(clippy::cast_precision_loss)]
+    let (width, height) = (image.width() as f32, image.height() as f32);
+    let mut out = image.clone();
+    #[allow(clippy::cast_precision_loss)]
+    for (x, y, pixel) in out.enumerate_pixels_mut() {
+        // The signed distance of the pixel's centre from the rounded
+        // rectangle's edge, negative inside.
+        let qx = (x as f32 + 0.5 - width / 2.0).abs() - (width / 2.0 - radius);
+        let qy = (y as f32 + 0.5 - height / 2.0).abs() - (height / 2.0 - radius);
+        let outside = qx.max(0.0).hypot(qy.max(0.0));
+        let distance = outside + qx.max(qy).min(0.0) - radius;
+        let coverage = (0.5 - distance).clamp(0.0, 1.0);
+        let edge = (distance + border + 0.5).clamp(0.0, 1.0);
+        let [r, g, b, a] = pixel.0;
+        let mix = |c: u8, f: f32| f32::from(c) * (1.0 - edge) + f * edge;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+        *pixel = image::Rgba([
+            byte(mix(r, FRAME[0])),
+            byte(mix(g, FRAME[1])),
+            byte(mix(b, FRAME[2])),
+            byte(f32::from(a) * coverage),
+        ]);
+    }
+    out
+}
+
+/// Writes `image` as a full-color PNG; `scripts/screenshots` compresses it
+/// afterwards.
 fn write_png(path: &Path, image: &RgbaImage) -> Result<(), String> {
     let fail = |err: &dyn std::fmt::Display| format!("{}: {err}", path.display());
-    let pixels = image.as_raw();
-    let quant = color_quant::NeuQuant::new(3, 256, pixels);
-    let palette: Vec<u8> = quant.color_map_rgb().into_iter().collect();
-    #[allow(clippy::cast_possible_truncation)]
-    let indices: Vec<u8> = pixels
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|pixel| quant.index_of(pixel) as u8)
-        .collect();
     let file = std::fs::File::create(path).map_err(|err| fail(&err))?;
     let mut encoder =
         png::Encoder::new(std::io::BufWriter::new(file), image.width(), image.height());
-    encoder.set_color(png::ColorType::Indexed);
+    encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_palette(palette);
-    encoder.set_compression(png::Compression::High);
+    encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header().map_err(|err| fail(&err))?;
     writer
-        .write_image_data(&indices)
+        .write_image_data(image.as_raw())
         .map_err(|err| fail(&err))?;
     writer.finish().map_err(|err| fail(&err))?;
-    let bytes = std::fs::metadata(path).map_or(0, |m| m.len());
     eprintln!(
-        "wrote {} ({}×{}, {} KB)",
+        "wrote {} ({}×{})",
         path.display(),
         image.width(),
-        image.height(),
-        bytes / 1024
+        image.height()
     );
     Ok(())
 }
@@ -811,18 +946,19 @@ fn select_line(view: &mut RecordingWindow, id: &str) {
 
 /// Every screenshot, in an order that keeps each one's state: the setup
 /// check first (it saves `[setup]` and the room tone), the take list last
-/// (it chooses a take).
-async fn shoot(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
+/// (it chooses a take). The loop records into its own project.
+async fn shoot(demo: &Demo, work: &Path, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
     setup_check(demo, out, cx).await?;
     audio_panel(demo, out, cx).await?;
     recording(demo, out, cx).await?;
+    take_loop(demo, work, out, cx).await?;
     take_list(demo, out, cx).await
 }
 
 /// The setup check's voice and room steps with their results: the panel
-/// of each, one below the other.
+/// of each, side by side.
 async fn setup_check(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
-    let shot = Shot::open(&demo.dir, cx).await?;
+    let shot = Shot::open(&demo.dir, WINDOW, false, cx).await?;
     shot.update(cx, |view| select_line(view, "orbit"));
     // The meter's capture starts with the first frames.
     let start = shot.media.now();
@@ -852,16 +988,23 @@ async fn setup_check(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
 
     // The setup panel sits between the film and the side column.
     let x = WINDOW.0 - 300.0 - 380.0;
-    let image = stack(&[
-        crop(&voice, (x, 0.0, 380.0, 236.0)),
-        crop(&room, (x, 0.0, 380.0, 168.0)),
-    ]);
-    write_png(&out.join("setup-check.png"), &image)
+    let scale = scale_of(&voice, WINDOW.0);
+    let steps = [
+        framed(&crop(&voice, WINDOW.0, (x, 0.0, 380.0, 236.0)), scale),
+        framed(&crop(&room, WINDOW.0, (x, 0.0, 380.0, 168.0)), scale),
+    ];
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let gap = (24.0 * scale) as u32;
+    write_png(
+        &out.join("setup-check.png"),
+        &compose(&steps, Axis::Row, gap, TRANSPARENT),
+    )
 }
 
-/// The audio panel, the meter lit red by a peak near clipping.
+/// The audio panel's devices, channel meters and film volume, with the
+/// input meter below it lit red by a peak near clipping.
 async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
-    let shot = Shot::open(&demo.dir, cx).await?;
+    let shot = Shot::open(&demo.dir, WINDOW, false, cx).await?;
     shot.update(cx, |view| {
         select_line(view, "storm");
         view.panel.open = true;
@@ -880,51 +1023,224 @@ async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     shot.run_until(cx, now + 1.9).await;
     let image = shot.render(cx).await?;
     shot.close(cx);
-    write_png(&out.join("audio-panel.png"), &image)
+    // The panel (between the film and the side column) down to the film
+    // volume, and the meter row under the film.
+    let scale = scale_of(&image, WINDOW.0);
+    let panel = crop(
+        &image,
+        WINDOW.0,
+        (WINDOW.0 - 300.0 - 320.0, 0.0, 319.0, 362.0),
+    );
+    let meter = crop(&image, WINDOW.0, (266.0, 541.0, 374.0, 44.0));
+    let both = compose(
+        &[panel, meter],
+        Axis::Column,
+        0,
+        opaque(super::colors::PANEL),
+    );
+    write_png(&out.join("audio-panel.png"), &framed(&both, scale))
 }
 
 /// The hero: a fifth take of the capsule line being recorded, the line
-/// filling over the film's frame. It records into a copy of the project,
-/// so the take list after it stays at four takes.
+/// filled up to a word's end over the film's frame. It records into a
+/// copy of the project, so the take list after it stays at four takes.
 async fn recording(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
     let copy = demo.dir.with_file_name("recording.takewise");
     copy_dir(&demo.dir, &copy)?;
-    let shot = Shot::open(&copy, cx).await?;
+    let shot = Shot::open(&copy, HERO, false, cx).await?;
     shot.update(cx, |view| select_line(view, "capsule"));
     let start = shot.media.now();
     shot.run_until(cx, start + 0.5).await;
     shot.update(cx, RecordingWindow::start_take);
-    let line_start = 22.5;
-    let speech_at = line_start + LEAD_S;
-    let shoot_at = line_start + 1.45;
+    let (reading_start, reading_end, text) = cx.update(|cx| {
+        let view = shot.view.read(cx);
+        let line = &view.project.script.lines[view.line];
+        let end = view
+            .project
+            .script
+            .slot_end(view.line, view.project.film_duration());
+        (line.start, end, line.text.clone())
+    });
+    // The film time at which the pace guide has filled "…at its port,".
+    let reading = super::prompter::Reading {
+        text: &text,
+        start: reading_start,
+        end: reading_end,
+    };
+    let filled = text.find("port,").map_or(text.len() / 3, |at| at + 5);
+    let mut shoot_at = reading_start;
+    while super::prompter::filled_bytes(reading, shoot_at) < filled && shoot_at < reading_end {
+        shoot_at += 0.005;
+    }
     let mut speaking = false;
     for _ in 0..400 {
+        let film_s = shot.playhead(cx);
+        if let Some(film_s) = film_s {
+            if !speaking && film_s >= reading_start + LEAD_S {
+                shot.media.hear(demo.voice("capsule"));
+                speaking = true;
+            }
+            if film_s >= shoot_at - 1e-6 {
+                break;
+            }
+        }
+        // Land on `shoot_at` exactly.
+        let step = film_s.map_or(0.05, |film_s| (shoot_at - film_s).clamp(0.0, 0.05));
         let now = shot.media.now();
-        shot.run_until(cx, now + 0.05).await;
-        let film_s = cx.update(|cx| {
-            let view = shot.view.read(cx);
-            view.recorder.playhead_s(&*view.media)
-        });
-        let Some(film_s) = film_s else {
-            continue;
-        };
-        if !speaking && film_s >= speech_at {
-            shot.media.hear(demo.voice("capsule"));
-            speaking = true;
-        }
-        if film_s >= shoot_at {
-            break;
-        }
+        shot.run_until(cx, now + step).await;
     }
     let image = shot.render(cx).await?;
     shot.close(cx);
-    write_png(&out.join("recording.png"), &image)
+    let scale = scale_of(&image, HERO.0);
+    write_png(&out.join("recording.png"), &framed(&image, scale))
+}
+
+/// The loop's frames and how long each shows, in milliseconds.
+#[derive(Default)]
+struct Frames(Vec<(RgbaImage, u32)>);
+
+impl Frames {
+    /// Adds a render of the window, scaled to [`LOOP_WIDTH`] and framed.
+    fn add(&mut self, image: &RgbaImage, ms: u32) {
+        let height = image.height() * LOOP_WIDTH / image.width();
+        let small = image::imageops::resize(
+            image,
+            LOOP_WIDTH,
+            height,
+            image::imageops::FilterType::Lanczos3,
+        );
+        self.0.push((framed(&small, scale_of(&small, HERO.0)), ms));
+    }
+
+    /// Writes the frames into `dir` and puts them together as the
+    /// looping animated WebP `out` with `img2webp`.
+    fn write_webp(&self, dir: &Path, out: &Path) -> Result<(), String> {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+        }
+        std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+        let mut args: Vec<OsString> = vec!["-loop".into(), "0".into(), "-lossy".into()];
+        args.extend(["-q", "80", "-m", "6"].map(OsString::from));
+        for (n, (image, ms)) in self.0.iter().enumerate() {
+            let path = dir.join(format!("{n:03}.png"));
+            image
+                .save(&path)
+                .map_err(|err| format!("{}: {err}", path.display()))?;
+            args.extend(["-d".into(), ms.to_string().into(), path.into_os_string()]);
+        }
+        args.extend(["-o".into(), out.as_os_str().to_owned()]);
+        let status = Command::new("img2webp")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map_err(|err| format!("cannot run img2webp (brew install webp): {err}"))?;
+        if !status.success() {
+            return Err(format!("img2webp failed for {}", out.display()));
+        }
+        let bytes = std::fs::metadata(out).map_or(0, |m| m.len());
+        eprintln!(
+            "wrote {} ({} frames, {} KB)",
+            out.display(),
+            self.0.len(),
+            bytes / 1024
+        );
+        Ok(())
+    }
+}
+
+/// The loop: two takes of the capsule line recorded and checked in a
+/// window whose checks run as in Takewise; the first misses "home", the
+/// second is kept and chosen. The takes play at twice their speed.
+async fn take_loop(demo: &Demo, work: &Path, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
+    // The setup check ran on the demo project; the loop's has the same
+    // devices and settings, and its room tone.
+    let config = demo.dir.join("project.toml");
+    std::fs::copy(&config, demo.anim.join("project.toml"))
+        .map_err(|err| format!("{}: {err}", config.display()))?;
+    let room = Path::new("takes").join(".room");
+    copy_dir(&demo.dir.join(&room), &demo.anim.join(&room))?;
+    let shot = Shot::open(&demo.anim, HERO, true, cx).await?;
+    shot.update(cx, |view| select_line(view, "capsule"));
+    let start = shot.media.now();
+    shot.run_until(cx, start + 0.5).await;
+    let mut frames = Frames::default();
+    frames.add(&shot.render(cx).await?, 1000);
+    for (n, &spoken) in LOOP_TAKES.iter().enumerate() {
+        shot.update(cx, RecordingWindow::start_take);
+        record(&shot, &demo.spoken[spoken], &mut frames, cx).await?;
+        shot.update(cx, RecordingWindow::finish_take);
+        shot.wait_for(cx, "the take to be saved", |view| {
+            view.line_state().is_some_and(|line| line.takes.len() > n)
+        })
+        .await?;
+        frames.add(&shot.render(cx).await?, if n == 0 { 900 } else { 700 });
+        shot.wait_for(cx, "the take's check", |view| {
+            view.line_state()
+                .and_then(|line| line.takes.get(n))
+                .is_some_and(|take| take.effective.is_some())
+                && view.checks.pending_of("capsule").is_empty()
+        })
+        .await?;
+        frames.add(&shot.render(cx).await?, if n == 0 { 1800 } else { 1400 });
+    }
+    // Enter: the narrator chooses the kept take.
+    let chosen = u32::try_from(LOOP_TAKES.len()).unwrap_or(1);
+    shot.update(cx, |view| {
+        view.take = Some(chosen);
+        match tw::choose_take(&view.dir, "capsule", chosen, "narrator") {
+            Ok(()) => {
+                view.reload();
+                view.message = Some(format!("Chose capsule take {chosen}."));
+            }
+            Err(err) => view.message = Some(err.to_string()),
+        }
+    });
+    frames.add(&shot.render(cx).await?, 2400);
+    shot.close(cx);
+    frames.write_webp(&work.join("loop-frames"), &out.join("loop.webp"))
+}
+
+/// Runs a take in `shot` while the voice says `speech` from just after the
+/// line's start, adding a frame every 0.25 s of film; stops when the speech
+/// has ended.
+async fn record(
+    shot: &Shot,
+    speech: &[i32],
+    frames: &mut Frames,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    const STEP_S: f64 = 0.05;
+    const FRAME_EVERY: u32 = 5;
+    let line_start = cx.update(|cx| {
+        let view = shot.view.read(cx);
+        view.project.script.lines[view.line].start
+    });
+    #[allow(clippy::cast_precision_loss)]
+    let speech_s = speech.len() as f64 / f64::from(RECORD_RATE);
+    let mut speaking = false;
+    for step in 1..=600 {
+        let now = shot.media.now();
+        shot.run_until(cx, now + STEP_S).await;
+        if let Some(film_s) = shot.playhead(cx) {
+            if !speaking && film_s >= line_start + LEAD_S {
+                shot.media.hear(speech.to_vec());
+                speaking = true;
+            }
+            if film_s >= line_start + LEAD_S + speech_s + 0.4 {
+                return Ok(());
+            }
+        }
+        if step % FRAME_EVERY == 0 {
+            frames.add(&shot.render(cx).await?, 125);
+        }
+    }
+    Err("the take did not reach the end of its speech".to_owned())
 }
 
 /// The capsule line's takes after the narrator chose the proposed one.
 async fn take_list(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
     tw::choose_take(&demo.dir, "capsule", 4, "narrator").map_err(|err| err.to_string())?;
-    let shot = Shot::open(&demo.dir, cx).await?;
+    let shot = Shot::open(&demo.dir, WINDOW, false, cx).await?;
     shot.update(cx, |view| {
         select_line(view, "capsule");
         view.take = Some(1);
@@ -933,8 +1249,12 @@ async fn take_list(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), Str
     shot.run_until(cx, start + 0.5).await;
     let image = shot.render(cx).await?;
     shot.close(cx);
+    let scale = scale_of(&image, WINDOW.0);
     write_png(
         &out.join("takes.png"),
-        &crop(&image, (WINDOW.0 - 300.0, 392.0, 300.0, 230.0)),
+        &framed(
+            &crop(&image, WINDOW.0, (WINDOW.0 - 300.0, 392.0, 300.0, 230.0)),
+            scale,
+        ),
     )
 }

@@ -8,12 +8,19 @@
 # demo project with its own script, speaks the takes with macOS `say`,
 # checks them with whisper-cli, and renders the recording window's states
 # offscreen with fake media: nothing plays, no microphone opens, no window
-# appears. Needs ffmpeg, whisper-cli and the speech model
-# (`takewise models install`).
+# appears. It also records two takes in a window and puts the renders
+# together as the short loop docs/images/loop.webp with img2webp. The PNGs
+# are then compressed with pngquant and oxipng. Needs ffmpeg, whisper-cli,
+# the speech model (`takewise models install`), and
+# `brew install webp pngquant oxipng`.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 [[ $# -eq 0 ]] || { echo "Usage: scripts/screenshots" >&2; exit 64; }
+for tool in img2webp pngquant oxipng; do
+  command -v "$tool" >/dev/null \
+    || { echo "error: $tool is missing: brew install webp pngquant oxipng" >&2; exit 1; }
+done
 
 work="$root/build/screenshots"
 source_url="https://images-assets.nasa.gov/video/Earth%20Views%20from%20the%20International%20Space%20Station/Earth%20Views%20from%20the%20International%20Space%20Station~large.mp4"
@@ -41,3 +48,13 @@ fi
 
 cargo build -p takewise --features screenshots
 "$root/target/debug/takewise" screenshots "$work" "$root/docs/images"
+
+# Full color from the harness, then a palette chosen per image at high
+# quality (no visible banding in the film's gradients) and lossless
+# recompression.
+for png in "$root"/docs/images/*.png; do
+  pngquant --quality 85-98 --speed 1 --strip --force --output "$png" "$png" \
+    || { status=$?; [[ $status -eq 99 ]] || exit "$status"; echo "kept $png in full color"; }
+  oxipng -q -o 4 --strip safe "$png"
+done
+ls -l "$root"/docs/images
