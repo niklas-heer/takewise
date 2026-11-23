@@ -105,21 +105,7 @@ pub struct Cleaner {
 impl Cleaner {
     /// Measures `afftdn`'s delay with a click fixture.
     pub fn new(ffmpeg: Ffmpeg) -> Result<Cleaner, String> {
-        let tmp = tempfile::Builder::new()
-            .prefix("takewise-clean-")
-            .tempdir()
-            .map_err(|err| format!("could not create a temporary directory: {err}"))?;
-        let (probe, out) = (tmp.path().join("click.wav"), tmp.path().join("out.wav"));
-        write_float_wav(&probe, &click_fixture(), 48_000)?;
-        ffmpeg.filter_to_float(&probe, &nr_chain(-60.0, 0), &out)?;
-        let (heard, _) = read_float_wav(&out)?;
-        let at = peak_index(&heard).ok_or("the click fixture came back silent")?;
-        let nr_delay = at
-            .checked_sub(PROBE_CLICK)
-            .filter(|d| *d < PROBE_LEN / 2)
-            .ok_or_else(|| {
-                format!("afftdn moved a click from sample {PROBE_CLICK} to {at}; cannot place speech exactly")
-            })?;
+        let nr_delay = filter_delay(&ffmpeg, &nr_chain(-60.0, 0))?;
         Ok(Cleaner { ffmpeg, nr_delay })
     }
 
@@ -143,15 +129,38 @@ impl Cleaner {
     }
 }
 
-/// The high-pass and noise reduction, padded at the end and trimmed at the
-/// start by `delay` samples so the output keeps the input's timing and
-/// length.
+/// How many samples at 48 kHz the filter chain `filters` delays its output
+/// by, measured with a click fixture.
+pub fn filter_delay(ffmpeg: &Ffmpeg, filters: &str) -> Result<usize, String> {
+    let tmp = tempfile::Builder::new()
+        .prefix("takewise-clean-")
+        .tempdir()
+        .map_err(|err| format!("could not create a temporary directory: {err}"))?;
+    let (probe, out) = (tmp.path().join("click.wav"), tmp.path().join("out.wav"));
+    write_float_wav(&probe, &click_fixture(), 48_000)?;
+    ffmpeg.filter_to_float(&probe, filters, &out)?;
+    let (heard, _) = read_float_wav(&out)?;
+    let at = peak_index(&heard).ok_or("the click fixture came back silent")?;
+    at.checked_sub(PROBE_CLICK)
+        .filter(|d| *d < PROBE_LEN / 2)
+        .ok_or_else(|| {
+            format!("`{filters}` moved a click from sample {PROBE_CLICK} to {at}; cannot place speech exactly")
+        })
+}
+
+/// `filters` padded at the end and trimmed at the start by `delay` samples,
+/// so the output keeps the input's timing and length.
+pub fn compensated(filters: &str, delay: usize) -> String {
+    if delay == 0 {
+        return filters.to_owned();
+    }
+    format!("apad=pad_len={delay},{filters},atrim=start_sample={delay},asetpts=N/SR/TB")
+}
+
+/// The high-pass and noise reduction, compensated for `delay`.
 fn nr_chain(floor_db: f64, delay: usize) -> String {
     let nr = format!("afftdn=nr={NOISE_REDUCTION_DB}:nf={floor_db:.1}");
-    if delay == 0 {
-        return format!("{HIGHPASS},{nr}");
-    }
-    format!("apad=pad_len={delay},{HIGHPASS},{nr},atrim=start_sample={delay},asetpts=N/SR/TB")
+    compensated(&format!("{HIGHPASS},{nr}"), delay)
 }
 
 /// Low noise with a click at [`PROBE_CLICK`].

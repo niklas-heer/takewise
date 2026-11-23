@@ -20,7 +20,7 @@ use crate::ffmpeg::{Ffmpeg, read_float_wav};
 use crate::fsutil::{lock, rename_temp, write_temp};
 use crate::ledger::{Checked, EventKind, Ledger, Verdict, read};
 use crate::project::{ExportConfig, ExportFormat, Processing, Project};
-use crate::render::{self, Loudness, MAX_TRUE_PEAK_DBTP, SOURCE_RATE, Target, UNIT};
+use crate::render::{self, Loudness, MAX_TRUE_PEAK_DBTP, SOURCE_RATE, TARGET_LUFS, Target, UNIT};
 use crate::script::{Line, validate};
 use crate::speech::analyze;
 use crate::state::{State, fold};
@@ -36,6 +36,9 @@ const FADE_S: f64 = 0.010;
 /// Speech of two takes closer than this gets a `tight-gap` warning: there
 /// is no room for two full fades between them.
 const TIGHT_GAP_S: f64 = 0.020;
+/// `clean` reached its loudness target when the final file lies this close
+/// to [`TARGET_LUFS`].
+const LOUDNESS_TOLERANCE_LU: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExportOptions {
@@ -110,9 +113,16 @@ pub struct ExportSettings {
     pub loudness_lufs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub true_peak_dbtp: Option<f64>,
-    /// The static gain `clean` applied.
+    /// The static gain `clean` applied before its limiter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain_db: Option<f64>,
+    /// The most gain reduction `clean`'s peak limiter applied, in dB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limiter_max_reduction_db: Option<f64>,
+    /// Whether the final file's integrated loudness lies within 0.5 LU of
+    /// −16 LUFS (`clean`); false when the limiter's 6 dB cap stopped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loudness_target_reached: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -502,11 +512,12 @@ fn clean_takes(
     Ok(())
 }
 
-/// Renders the narration to a temp file beside `path`: `clean` measures
-/// the placed narration, applies one static gain, and measures the final
-/// file again; a true peak above −1 dBTP after resampling or dither lowers
-/// the gain by the excess and renders once more. Returns the temp file and
-/// the settings for the manifest.
+/// Renders the narration to a temp file beside `path`: `clean` levels the
+/// placed narration to −16 LUFS (one static gain through a true-peak
+/// limiter that reduces at most 6 dB; see [`render::level`]) and measures
+/// the final file again; a true peak above −1 dBTP after resampling or
+/// dither lowers the gain by the excess and renders once more. Returns the
+/// temp file and the settings for the manifest.
 fn render_narration(
     mixed: &[f64],
     settings: ExportConfig,
@@ -515,14 +526,15 @@ fn render_narration(
     path: &Path,
 ) -> Result<(PathBuf, ExportSettings)> {
     let clean = settings.processing == Processing::Clean;
-    let mut gain_db = 0.0;
-    if clean {
+    let leveled = if clean {
         let ffmpeg = ffmpeg.ok_or_else(|| missing_ffmpeg(settings))?;
-        let before = render::measure_samples(ffmpeg, mixed).map_err(Error::Ffmpeg)?;
-        gain_db = render::static_gain_db(before);
-    }
-    let encode = |gain_db: f64| -> Result<PathBuf> {
-        let pcm = render::prepare(mixed, gain_db, target, ffmpeg).map_err(Error::Ffmpeg)?;
+        Some(render::level(ffmpeg, mixed).map_err(Error::Ffmpeg)?)
+    } else {
+        None
+    };
+    let source = leveled.as_ref().map_or(mixed, |l| &l.samples);
+    let encode = |trim_db: f64| -> Result<PathBuf> {
+        let pcm = render::prepare(source, trim_db, target, ffmpeg).map_err(Error::Ffmpeg)?;
         let temp = write_temp(path, |_| Ok(()))?;
         if let Err(err) = render::write(&temp, &pcm, target, ffmpeg) {
             let _ = fs::remove_file(&temp);
@@ -530,18 +542,20 @@ fn render_narration(
         }
         Ok(temp)
     };
-    let mut temp = encode(gain_db)?;
+    let mut trim_db = 0.0;
+    let mut temp = encode(trim_db)?;
     let mut loudness: Option<Loudness> = None;
     if clean && let Some(ffmpeg) = ffmpeg {
         let mut after = measure_or_remove(ffmpeg, &temp)?;
         if after.true_peak_dbtp > MAX_TRUE_PEAK_DBTP {
             let _ = fs::remove_file(&temp);
-            gain_db -= after.true_peak_dbtp - MAX_TRUE_PEAK_DBTP;
-            temp = encode(gain_db)?;
+            trim_db = MAX_TRUE_PEAK_DBTP - after.true_peak_dbtp;
+            temp = encode(trim_db)?;
             after = measure_or_remove(ffmpeg, &temp)?;
         }
         loudness = Some(after);
     }
+    let round = |db: f64| (db * 100.0).round() / 100.0;
     Ok((
         temp,
         ExportSettings {
@@ -552,7 +566,10 @@ fn render_narration(
             bit_depth: settings.bit_depth,
             loudness_lufs: loudness.map(|l| l.integrated_lufs),
             true_peak_dbtp: loudness.map(|l| l.true_peak_dbtp),
-            gain_db: clean.then_some((gain_db * 100.0).round() / 100.0),
+            gain_db: leveled.as_ref().map(|l| round(l.gain_db + trim_db)),
+            limiter_max_reduction_db: leveled.as_ref().map(|l| round(l.max_reduction_db)),
+            loudness_target_reached: loudness
+                .map(|l| (l.integrated_lufs - TARGET_LUFS).abs() <= LOUDNESS_TOLERANCE_LU),
         },
     ))
 }
@@ -1615,6 +1632,100 @@ mod tests {
         commit_take(dir, partial).unwrap()
     }
 
+    /// A take whose speech, from 2 to 4 s of the take, is a 140 Hz voice
+    /// with syllables at 4 Hz at −26 dBFS RMS and four plosive-like bursts
+    /// whose peaks stand `crest_db` above that RMS.
+    fn peaky_take(dir: &Path, crest_db: f64) -> TakeRef {
+        let project = Project::open(dir).unwrap();
+        let input = RecordedInput {
+            sample_rate: RATE,
+            device: "Test Mic".to_owned(),
+            channel: 1,
+            line_offset_s: -2.0,
+            snapshot: project.snapshot("hook").unwrap(),
+            dropouts: None,
+            film_shift_ms: None,
+        };
+        let partial = begin_take(dir, "hook", &input).unwrap();
+        let tau = std::f64::consts::TAU;
+        let rate = f64::from(RATE);
+        let (from, len): (usize, usize) = (96_000, 96_000);
+        let mut voice: Vec<f64> = (0..len)
+            .map(|i| {
+                let t = i as f64 / rate;
+                let syllables = 0.5 - 0.5 * (t * 4.0 * tau).cos();
+                let tone: f64 = (1..=10)
+                    .map(|k| (t * 140.0 * f64::from(k) * tau).sin() / f64::from(k))
+                    .sum();
+                syllables * tone
+            })
+            .collect();
+        let rms = (voice.iter().map(|v| v * v).sum::<f64>() / len as f64).sqrt();
+        let level = 10f64.powf(-26.0 / 20.0);
+        for v in &mut voice {
+            *v *= level / rms;
+        }
+        let peak = level * 10f64.powf(crest_db / 20.0);
+        let burst = 192; // 4 ms
+        for at in [0.3, 0.8, 1.3, 1.7] {
+            let start = crate::testutil::samples(at);
+            for i in 0..burst {
+                let window = (std::f64::consts::PI * i as f64 / burst as f64).sin();
+                voice[start + i] = peak * window * (i as f64 / rate * 2_000.0 * tau).sin();
+            }
+        }
+        let mut audio = noise(5.0);
+        for (i, v) in voice.into_iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let s = (v * f64::from(crate::takes::FULL_SCALE)).round() as i32;
+            audio[from + i] = s;
+        }
+        write_take_wav(&partial.wav, &audio, RATE).unwrap();
+        commit_take(dir, partial).unwrap()
+    }
+
+    #[test]
+    fn clean_brings_peaky_speech_to_minus_16_lufs() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = peaky_take(&dir, 16.0);
+        choose(&dir, &t);
+        // Raw, the peaks stand about 16 dB above the loudness: one static
+        // gain capped by the true peak could not reach −16 LUFS.
+        export_with(&dir, ExportConfig::default());
+        let raw = render::measure(&ffmpeg, &dir.join("export/narration.wav")).unwrap();
+        assert!(raw.true_peak_dbtp - raw.integrated_lufs >= 15.5, "{raw:?}");
+        for (rate, bits) in [(48_000, 24), (44_100, 16)] {
+            let report = export_with(
+                &dir,
+                ExportConfig {
+                    processing: Processing::Clean,
+                    sample_rate: rate,
+                    bit_depth: bits,
+                    ..ExportConfig::default()
+                },
+            );
+            let measured = render::measure(&ffmpeg, &dir.join("export/narration.wav")).unwrap();
+            assert!(
+                (measured.integrated_lufs + 16.0).abs() <= 0.5,
+                "{rate}/{bits}: {measured:?}"
+            );
+            assert!(
+                measured.true_peak_dbtp <= -1.0,
+                "{rate}/{bits}: {measured:?}"
+            );
+            let settings = report.settings.unwrap();
+            assert_eq!(settings.loudness_target_reached, Some(true));
+            let reduction = settings.limiter_max_reduction_db.unwrap();
+            assert!(reduction > 0.5 && reduction <= 6.0, "{reduction}");
+            let m = manifest(&dir);
+            assert_eq!(m["loudness_target_reached"], true);
+            assert_eq!(m["limiter_max_reduction_db"], reduction);
+        }
+    }
+
     fn ffmpeg_or_skip() -> Option<Ffmpeg> {
         let found = Ffmpeg::find();
         if found.is_none() {
@@ -1746,8 +1857,9 @@ mod tests {
                 },
             );
             let measured = render::measure(&ffmpeg, &dir.join("export/narration.wav")).unwrap();
-            // The click limits the gain: true peak at −1 dBTP at most, and
-            // the speech stays below −16 LUFS.
+            // The click would need more than 6 dB of limiting: the limiter
+            // stops at 6 dB, true peak stays at −1 dBTP at most, and the
+            // speech stays below −16 LUFS, recorded as a shortfall.
             assert!(
                 measured.true_peak_dbtp <= -1.0,
                 "{rate}/{bits}: {measured:?}"
@@ -1756,10 +1868,12 @@ mod tests {
                 measured.integrated_lufs < -16.5,
                 "{rate}/{bits}: {measured:?}"
             );
-            assert_eq!(
-                report.settings.unwrap().true_peak_dbtp,
-                Some(measured.true_peak_dbtp)
-            );
+            let settings = report.settings.unwrap();
+            assert_eq!(settings.true_peak_dbtp, Some(measured.true_peak_dbtp));
+            assert_eq!(settings.loudness_target_reached, Some(false));
+            let reduction = settings.limiter_max_reduction_db.unwrap();
+            assert!(reduction > 5.0 && reduction <= 6.0, "{reduction}");
+            assert_eq!(manifest(&dir)["loudness_target_reached"], false);
         }
     }
 

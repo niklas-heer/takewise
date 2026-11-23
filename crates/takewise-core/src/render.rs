@@ -1,5 +1,6 @@
 //! The last steps of export: the placed narration (48 kHz, in 24-bit units)
-//! gets one static gain, is resampled once when the export rate is 44.1 kHz
+//! is leveled for `clean` (one static gain through a look-ahead true-peak
+//! limiter), is resampled once when the export rate is 44.1 kHz
 //! (with ffmpeg's swr),
 //! dithered when written at 16 bits, and encoded as WAV or FLAC; loudness
 //! and true peak are measured with `ffmpeg`'s `ebur128` (see
@@ -16,11 +17,23 @@ use crate::project::ExportFormat;
 pub const SOURCE_RATE: u32 = 48_000;
 /// `clean` aims the integrated loudness here…
 pub const TARGET_LUFS: f64 = -16.0;
-/// …unless that would put the true peak above this.
+/// …and keeps the final file's true peak at or below this.
 pub const MAX_TRUE_PEAK_DBTP: f64 = -1.0;
-/// The gain aims this far below [`MAX_TRUE_PEAK_DBTP`], since the meter
-/// reports tenths of a dB.
-const PEAK_MARGIN_DB: f64 = 0.1;
+/// The limiter's ceiling, as a peak of the 4× oversampled signal: 0.5 dB
+/// below [`MAX_TRUE_PEAK_DBTP`] leaves room for resampling and dither.
+pub const LIMITER_CEILING_DBFS: f64 = -1.5;
+/// The limiter never reduces the gain by more than this; narration that
+/// would need more stays below [`TARGET_LUFS`].
+pub const MAX_LIMITER_REDUCTION_DB: f64 = 6.0;
+/// The limiter's look-ahead (its attack) and release.
+const LIMITER_ATTACK_MS: f64 = 5.0;
+const LIMITER_RELEASE_MS: f64 = 80.0;
+/// Leveling stops once the loudness lies this close to [`TARGET_LUFS`]…
+const LEVEL_TOLERANCE_LU: f64 = 0.1;
+/// …or after this many limiter passes.
+const LEVEL_PASSES: usize = 5;
+/// The oversampling resampler around the limiter (and for 44.1 kHz).
+const SWR: &str = "resampler=swr:filter_size=128:cutoff=0.97";
 /// 24-bit full scale as ffmpeg converts it to float.
 pub const UNIT: f64 = 8_388_608.0;
 
@@ -39,12 +52,128 @@ pub struct Loudness {
     pub true_peak_dbtp: f64,
 }
 
-/// The one static gain of `clean`: to −16 LUFS, or less when the true peak
-/// would rise above −1 dBTP.
-pub fn static_gain_db(loudness: Loudness) -> f64 {
-    let to_target = TARGET_LUFS - loudness.integrated_lufs;
-    let to_peak = MAX_TRUE_PEAK_DBTP - PEAK_MARGIN_DB - loudness.true_peak_dbtp;
-    to_target.min(to_peak)
+/// A look-ahead peak limiter run by `ffmpeg` at 4× the source rate
+/// (`alimiter` between two swr resamplings), so it catches the peaks
+/// between samples that a true-peak meter sees. Its delay is measured with
+/// a click and compensated, so limited speech keeps its samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limiter {
+    pub ffmpeg: Ffmpeg,
+    /// Samples at 48 kHz the chain delays its output by.
+    pub delay: usize,
+}
+
+/// What [`Limiter::apply`] made.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Limited {
+    /// 48 kHz, 24-bit units, as long as the input.
+    pub samples: Vec<f64>,
+    /// The most the limiter reduced any sample near the ceiling, in dB.
+    pub max_reduction_db: f64,
+}
+
+impl Limiter {
+    /// Measures the chain's delay with a click fixture.
+    pub fn new(ffmpeg: Ffmpeg) -> Result<Limiter, String> {
+        let delay = crate::clean::filter_delay(&ffmpeg, &limiter_chain(0))?;
+        Ok(Limiter { ffmpeg, delay })
+    }
+
+    /// `samples` (48 kHz, 24-bit units) with `gain_db` applied, then
+    /// limited to [`LIMITER_CEILING_DBFS`].
+    pub fn apply(&self, samples: &[f64], gain_db: f64) -> Result<Limited, String> {
+        let gain = 10f64.powf(gain_db / 20.0);
+        let gained: Vec<f64> = samples.iter().map(|v| v * gain / UNIT).collect();
+        let tmp = work_dir()?;
+        let (src, out) = (tmp.path().join("in.wav"), tmp.path().join("out.wav"));
+        write_float_wav(&src, &gained, SOURCE_RATE)?;
+        self.ffmpeg
+            .filter_to_float(&src, &limiter_chain(self.delay), &out)?;
+        let (mut limited, rate) = read_float_wav(&out)?;
+        if rate != SOURCE_RATE {
+            return Err(format!(
+                "the limiter returned {rate} Hz, not {SOURCE_RATE} Hz"
+            ));
+        }
+        limited.resize(gained.len(), 0.0);
+        let max_reduction_db = max_reduction_db(&gained, &limited);
+        Ok(Limited {
+            samples: limited.into_iter().map(|v| v * UNIT).collect(),
+            max_reduction_db,
+        })
+    }
+}
+
+/// The limiter chain, compensated for `delay`.
+fn limiter_chain(delay: usize) -> String {
+    let ceiling = 10f64.powf(LIMITER_CEILING_DBFS / 20.0);
+    let oversampled = SOURCE_RATE * 4;
+    let chain = format!(
+        "aresample={oversampled}:{SWR},alimiter=limit={ceiling:.6}:attack={LIMITER_ATTACK_MS}:release={LIMITER_RELEASE_MS}:level=0:latency=1,aresample={SOURCE_RATE}:{SWR}"
+    );
+    crate::clean::compensated(&chain, delay)
+}
+
+/// The largest gain reduction from `before` to `after` (both −1..1) over
+/// the samples within 6 dB of the ceiling or above it, where the limiter
+/// acts and the ratio is not swamped by rounding; 0 when there are none.
+fn max_reduction_db(before: &[f64], after: &[f64]) -> f64 {
+    let near = 10f64.powf((LIMITER_CEILING_DBFS - 6.0) / 20.0);
+    before
+        .iter()
+        .zip(after)
+        .filter(|(b, _)| b.abs() >= near)
+        .map(|(b, a)| 20.0 * (b.abs() / a.abs().max(f64::MIN_POSITIVE)).log10())
+        .fold(0.0, f64::max)
+}
+
+/// The narration [`level`] made for `clean`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leveled {
+    /// 48 kHz, 24-bit units.
+    pub samples: Vec<f64>,
+    /// The static gain before the limiter.
+    pub gain_db: f64,
+    pub max_reduction_db: f64,
+    /// The limiter's 6 dB cap kept the narration below [`TARGET_LUFS`].
+    pub capped: bool,
+}
+
+/// Levels the placed narration (48 kHz, 24-bit units) to [`TARGET_LUFS`]:
+/// measures it, applies the static gain to the target through the
+/// [`Limiter`], measures again and corrects the gain for the loudness the
+/// limiter took, until within [`LEVEL_TOLERANCE_LU`]. The gain stops where
+/// the limiter would reduce more than [`MAX_LIMITER_REDUCTION_DB`].
+pub fn level(ffmpeg: &Ffmpeg, samples: &[f64]) -> Result<Leveled, String> {
+    let before = measure_samples(ffmpeg, samples)?;
+    let limiter = Limiter::new(ffmpeg.clone())?;
+    let mut max_gain = LIMITER_CEILING_DBFS + MAX_LIMITER_REDUCTION_DB - before.true_peak_dbtp;
+    let mut gain_db = (TARGET_LUFS - before.integrated_lufs).min(max_gain);
+    let mut pass = 0;
+    loop {
+        pass += 1;
+        let pass_out = limiter.apply(samples, gain_db)?;
+        let over = pass_out.max_reduction_db - MAX_LIMITER_REDUCTION_DB;
+        if over > 0.0 {
+            // The meter's tenths of a dB or the limiter's envelope asked for
+            // a little more than the cap: the gain may rise no further.
+            max_gain = gain_db - over;
+        }
+        let after = measure_samples(ffmpeg, &pass_out.samples)?;
+        let short = TARGET_LUFS - after.integrated_lufs;
+        let next = (gain_db + short).min(max_gain);
+        let settled =
+            over <= 0.0 && (short.abs() <= LEVEL_TOLERANCE_LU || (next - gain_db).abs() < 0.01);
+        if settled || pass >= LEVEL_PASSES {
+            return Ok(Leveled {
+                samples: pass_out.samples,
+                gain_db,
+                max_reduction_db: pass_out.max_reduction_db,
+                capped: short > LEVEL_TOLERANCE_LU && gain_db >= max_gain - 0.01,
+            });
+        }
+        gain_db = next;
+    }
 }
 
 /// A sample index at 48 kHz as an index at `rate`: `round(n × rate / 48000)`.
@@ -136,7 +265,7 @@ fn resample(ffmpeg: &Ffmpeg, x: &[f64], rate: u32) -> Result<Vec<f64>, String> {
     write_float_wav(&src, &scaled, SOURCE_RATE)?;
     // swr, not soxr: Homebrew's ffmpeg is built without libsoxr. A long
     // Kaiser filter keeps the passband flat to 20 kHz.
-    let filter = format!("aresample={rate}:resampler=swr:filter_size=128:cutoff=0.97");
+    let filter = format!("aresample={rate}:{SWR}");
     ffmpeg.run(&[
         std::ffi::OsStr::new("-loglevel"),
         std::ffi::OsStr::new("error"),
@@ -271,20 +400,84 @@ mod tests {
         assert_eq!(parse_ebur128("no summary"), None);
     }
 
+    fn ffmpeg_or_skip() -> Option<Ffmpeg> {
+        let found = Ffmpeg::find();
+        if found.is_none() {
+            eprintln!("skipped: ffmpeg not found");
+        }
+        found
+    }
+
+    /// Two seconds of low noise (24-bit units) with a click peaking at
+    /// sample 50 000, `over_db` above the limiter's ceiling. The click is a
+    /// Gaussian pulse a few samples wide, so, like speech, it has nothing
+    /// near 24 kHz for the resampler's filter to take away.
+    fn click_over_ceiling(over_db: f64) -> Vec<f64> {
+        let mut x: Vec<f64> = crate::testutil::noise_at(2.0, -60.0)
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let peak = UNIT * 10f64.powf((LIMITER_CEILING_DBFS + over_db) / 20.0);
+        for (n, v) in x.iter_mut().enumerate().skip(49_970).take(61) {
+            let d = n as f64 - 50_000.0;
+            *v += peak * (-d * d / 18.0).exp();
+        }
+        x
+    }
+
+    fn peak_index(x: &[f64]) -> usize {
+        x.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
     #[test]
-    fn gain_is_the_smaller_of_loudness_and_peak() {
-        // Quiet speech with modest peaks: loudness decides.
-        let gain = static_gain_db(Loudness {
-            integrated_lufs: -24.0,
-            true_peak_dbtp: -12.0,
-        });
-        assert!((gain - 8.0).abs() < 1e-9);
-        // Peaky speech: the peak decides.
-        let gain = static_gain_db(Loudness {
-            integrated_lufs: -24.0,
-            true_peak_dbtp: -4.0,
-        });
-        assert!((gain - 2.9).abs() < 1e-9);
+    fn limiter_keeps_a_click_on_its_sample() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        let limiter = Limiter::new(ffmpeg).unwrap();
+        let x = click_over_ceiling(3.0);
+        let out = limiter.apply(&x, 0.0).unwrap();
+        assert_eq!(out.samples.len(), x.len());
+        assert_eq!(
+            peak_index(&out.samples),
+            50_000,
+            "limiter delay {}",
+            limiter.delay
+        );
+        // The click was brought down to the ceiling, by about 3 dB.
+        let peak_db = 20.0 * (out.samples[50_000].abs() / UNIT).log10();
+        assert!(peak_db <= LIMITER_CEILING_DBFS + 0.05, "{peak_db}");
+        assert!(
+            (out.max_reduction_db - 3.0).abs() < 0.3,
+            "{}",
+            out.max_reduction_db
+        );
+        // Gain applies before the limiter.
+        let quiet = limiter.apply(&x, -6.0).unwrap();
+        assert!(quiet.max_reduction_db < 0.01, "{}", quiet.max_reduction_db);
+    }
+
+    #[test]
+    fn leveling_stops_at_six_db_of_limiting() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        // Quiet noise with a click near full scale: reaching −16 LUFS would
+        // need far more than 6 dB of limiting.
+        let x = click_over_ceiling(1.0);
+        let leveled = level(&ffmpeg, &x).unwrap();
+        assert!(leveled.capped);
+        assert!(
+            leveled.max_reduction_db <= MAX_LIMITER_REDUCTION_DB
+                && leveled.max_reduction_db > MAX_LIMITER_REDUCTION_DB - 0.5,
+            "{}",
+            leveled.max_reduction_db
+        );
+        assert!(leveled.gain_db < 6.0, "{}", leveled.gain_db);
     }
 
     #[test]
