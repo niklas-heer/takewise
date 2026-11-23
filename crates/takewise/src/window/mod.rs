@@ -315,6 +315,9 @@ pub struct RecordingWindow {
     /// The offer to install the speech model while it is missing; none in
     /// tests unless a test sets one.
     model: Option<model::ModelPrompt>,
+    /// The output the film was last set to play through; `None` is the
+    /// system default (none chosen, or the chosen one could not be used).
+    film_output: Option<String>,
 }
 
 impl RecordingWindow {
@@ -392,6 +395,7 @@ impl RecordingWindow {
             setup: None,
             setup_offer: None,
             model: None,
+            film_output: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -636,7 +640,8 @@ impl RecordingWindow {
             .or_else(|| check_input(configured.as_deref(), &inputs).err());
         self.note_issue(panel::input_issue(configured.as_deref(), &inputs));
         self.inputs = inputs;
-        self.panel.calibration = tw::calibration_stale(&self.project.config, &self.current_route());
+        self.panel.calibration =
+            panel::calibration_note(&self.project.config, &self.current_route());
         self.update_setup_offer();
         self.inputs_checked_at = Some(self.media.host_now_s());
     }
@@ -664,9 +669,10 @@ impl RecordingWindow {
         self.peak_meter.clear();
         self.scroll.reset();
         self.panel.picker = None;
-        if let Err(err) = self
-            .recorder
-            .start_take(&mut *self.media, &self.project, self.line)
+        let route = self.current_route();
+        if let Err(err) =
+            self.recorder
+                .start_take(&mut *self.media, &self.project, self.line, &route)
         {
             self.message = Some(err);
         }

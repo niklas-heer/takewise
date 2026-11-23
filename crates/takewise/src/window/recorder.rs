@@ -9,9 +9,10 @@ use std::sync::mpsc::{self, Receiver};
 use takewise_core::takes::FULL_SCALE;
 use takewise_core::timing::film_shift_s;
 use takewise_core::{
-    Dropout, PartialTake, Project, RECORD_RATE, RecordPlan, RecordedInput, Snapshot, TakeRef,
-    TakeState, Timebase, WavLock, begin_take, commit_take, finish_interrupted_commit,
-    line_offset_s, plan_take, sample_film_time, update_take_meta, write_take_wav,
+    Dropout, PartialTake, Project, ProjectConfig, RECORD_RATE, RecordPlan, RecordedInput, Route,
+    Snapshot, TakeRef, TakeState, Timebase, WavLock, begin_take, commit_take,
+    finish_interrupted_commit, line_offset_s, plan_take, sample_film_time, update_take_meta,
+    write_take_wav,
 };
 use takewise_media::CaptureBuffer;
 
@@ -38,6 +39,27 @@ const END_TOLERANCE_S: f64 = 0.25;
 const FILM_START_TIMEOUT_S: f64 = 1.0;
 /// A film shift larger than this after the take started is recorded.
 const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
+
+/// The latency offset in ms that places takes on `route`: the calibrated
+/// `latency_offset_ms` when `[calibration]` names exactly this input, this
+/// output (the one in use, after any fallback) and this buffer size; else 0,
+/// since an offset measured on other devices would misplace the takes.
+// TODO(r7): switch to `takewise_core::effective_latency_offset(config, route)`
+// once fix/r7-core is merged, and drop this helper.
+pub fn effective_latency_offset(config: &ProjectConfig, route: &Route) -> i32 {
+    let Some(cal) = &config.calibration else {
+        return 0;
+    };
+    let matches = route.input.as_deref() == Some(cal.input.as_str())
+        && route.output.as_deref() == Some(cal.output.as_str())
+        && cal.buffer_frames.is_some()
+        && route.buffer_frames == cal.buffer_frames;
+    if matches {
+        config.input.latency_offset_ms
+    } else {
+        0
+    }
+}
 
 /// What a tick or a stop produced, for the window to show.
 #[derive(Debug, Default)]
@@ -328,12 +350,14 @@ impl Recorder {
     /// Starts a take of line `idx`: capture starts now; once its first
     /// buffer arrives, the film is scheduled to play from the pre-roll
     /// (holding its first frame when the line starts within the pre-roll),
-    /// with the count-in.
+    /// with the count-in. The latency offset applies only when `route`, the
+    /// route in use, is the one `[calibration]` measured.
     pub fn start_take(
         &mut self,
         media: &mut dyn Media,
         project: &Project,
         idx: usize,
+        route: &Route,
     ) -> Result<(), String> {
         if !matches!(self.phase, Phase::Idle) {
             return Err("A take or playback is already running.".to_owned());
@@ -381,7 +405,7 @@ impl Recorder {
             device,
             channel: input.channel,
             latency_s,
-            offset_ms: f64::from(input.latency_offset_ms),
+            offset_ms: f64::from(effective_latency_offset(&project.config, route)),
             plan,
             capture_started_host_s: media.host_now_s(),
             clock: FilmClock::new(),

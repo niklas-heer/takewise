@@ -2403,6 +2403,76 @@ fn stale_calibration_shows_in_the_panel(cx: &mut TestAppContext) {
     );
 }
 
+/// Stores a 25 ms offset measured on `output` with the fake's buffer size.
+fn calibrate_on(dir: &Path, output: &str) {
+    let info = tw::CalibrationInfo {
+        input: DEVICE.to_owned(),
+        output: output.to_owned(),
+        buffer_frames: Some(512),
+        date: "2026-11-23".to_owned(),
+    };
+    tw::set_calibration(dir, 25, &info).expect("calibration");
+}
+
+/// Records a take of line d and returns where its first sample landed.
+fn line_offset_of_a_take(cx: &mut TestAppContext, f: &Fixture) -> f64 {
+    press(cx, f.window, &["down", "down", "down"]);
+    begin(cx, f, 100.0);
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    takes.last().expect("a take").2.line_offset_s
+}
+
+#[gpui_kit::test]
+fn offset_applies_only_on_the_calibrated_route(cx: &mut TestAppContext) {
+    // Calibrated on the devices in use: the 25 ms offset moves the take.
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        calibrate_on(dir, "MacBook Speakers");
+    });
+    let offset = line_offset_of_a_take(cx, &f);
+    assert!((offset - -2.375).abs() < 1e-6, "{offset}");
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.panel.calibration.clone()),
+        None
+    );
+
+    // Calibrated on other headphones: no offset, and the window says so.
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        calibrate_on(dir, "Test Phones");
+    });
+    let offset = line_offset_of_a_take(cx, &f);
+    assert!(close(offset, -2.4), "{offset}");
+    let note = f
+        .view
+        .read_with(cx, |view, _| view.panel.calibration.clone())
+        .expect("a note");
+    assert!(
+        note.contains("calibration does not match these devices"),
+        "{note}"
+    );
+    let offer = f
+        .view
+        .read_with(cx, |view, _| view.setup_offer.clone())
+        .expect("an offer");
+    assert!(offer.contains("does not match these devices"), "{offer}");
+
+    // Calibrated on the chosen output, which is gone: the film falls back
+    // to the speakers, so the offset is not applied.
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Gone Phones")).expect("route");
+        calibrate_on(dir, "Gone Phones");
+    });
+    let offset = line_offset_of_a_take(cx, &f);
+    assert!(close(offset, -2.4), "{offset}");
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.panel.calibration.clone())
+            .is_some_and(|note| note.contains("does not match these devices"))
+    );
+}
+
 #[gpui_kit::test]
 fn long_line_scrolls_forward_and_a_retake_starts_at_the_top(cx: &mut TestAppContext) {
     let words = "every answer becomes a page worth opening again ".repeat(9);

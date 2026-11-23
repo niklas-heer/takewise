@@ -207,13 +207,25 @@ impl RecordingWindow {
         }
     }
 
-    /// Why the setup check should run, if it should: none ran, or the
-    /// devices changed since. Never during a take.
+    /// Why the setup check should run, if it should: none ran, the devices
+    /// changed since, or the latency calibration does not match the devices
+    /// in use. Never during a take.
     pub(super) fn update_setup_offer(&mut self) {
         if self.recorder.is_recording() {
             return;
         }
-        self.setup_offer = tw::setup_warning(&self.project.config, &self.current_route());
+        let config = &self.project.config;
+        let route = self.current_route();
+        let mut reasons: Vec<String> = tw::setup_warning(config, &route).into_iter().collect();
+        if config.input.latency_offset_ms != 0
+            && super::recorder::effective_latency_offset(config, &route) == 0
+        {
+            reasons.push(
+                "the latency calibration does not match these devices, so takes are placed without it"
+                    .to_owned(),
+            );
+        }
+        self.setup_offer = (!reasons.is_empty()).then(|| reasons.join("; "));
     }
 
     /// A warning about the output for recording: speakers leak into the

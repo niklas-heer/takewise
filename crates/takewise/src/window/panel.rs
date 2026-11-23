@@ -71,6 +71,23 @@ pub fn input_issue(configured: Option<&str>, inputs: &[AvailableInput]) -> Optio
     }
 }
 
+/// What the window says about the latency calibration on `route`, if
+/// anything: that takes are placed without the offset because the
+/// calibration does not match these devices, or why it is stale.
+pub fn calibration_note(config: &tw::ProjectConfig, route: &Route) -> Option<String> {
+    let offset = config.input.latency_offset_ms;
+    let stale = tw::calibration_stale(config, route);
+    if offset != 0 && super::recorder::effective_latency_offset(config, route) == 0 {
+        let why = stale.unwrap_or_else(|| {
+            "the input's buffer size or the output in use is not known".to_owned()
+        });
+        return Some(format!(
+            "calibration does not match these devices, so takes are placed without its {offset} ms offset ({why})"
+        ));
+    }
+    stale
+}
+
 /// Which picker shows its options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Picker {
@@ -193,7 +210,11 @@ impl RecordingWindow {
             return;
         }
         self.message = Some(match self.media.film_set_output(name) {
-            Ok(()) => format!("The film plays through {name}."),
+            Ok(()) => {
+                self.film_output = Some(name.to_owned());
+                self.check_inputs();
+                format!("The film plays through {name}.")
+            }
             Err(err) => {
                 format!("Saved {name} as the output, but the film cannot play there: {err}")
             }
@@ -207,6 +228,7 @@ impl RecordingWindow {
             return;
         };
         if let Err(err) = self.media.film_set_output(&name) {
+            self.film_output = None;
             let fallback = self
                 .media
                 .default_output()
@@ -214,7 +236,10 @@ impl RecordingWindow {
             self.message = Some(format!(
                 "{name} is not connected ({err}); the film plays through {fallback}."
             ));
+        } else {
+            self.film_output = Some(name);
         }
+        self.check_inputs();
     }
 
     /// Switches the input device to 48 kHz; recording stays off when it
@@ -340,13 +365,18 @@ impl RecordingWindow {
         self.panel.issue = issue;
     }
 
-    /// The route as it plays now, for the calibration check: an unset
-    /// output is the system default; the buffer is the input's current one.
+    /// The route as it plays now, for the calibration check: the output the
+    /// film really plays through (the system default when none was set, or
+    /// when the chosen one could not be used or is gone); the buffer is the
+    /// input's current one.
     pub(super) fn current_route(&self) -> Route {
         let mut route = Route::of(&self.project.config);
-        if route.output.is_none() {
-            route.output = self.media.default_output();
-        }
+        let connected = self.media.outputs();
+        route.output = self
+            .film_output
+            .clone()
+            .filter(|name| connected.iter().any(|o| &o.name == name))
+            .or_else(|| self.media.default_output());
         route.buffer_frames = route
             .input
             .as_deref()
