@@ -20,7 +20,7 @@ Takewise records one line at a time against the picture, keeps every take, check
 
 Takewise is a recording window plus a `takewise` command for everything around it.
 
-1. **Script.** `takewise init` starts a project from the finished film. The script is a small text file, `script.toml`: one entry per line, each with its start in film time. You write it, or an agent drafts it. Rough starts are fine: M moves the line's start to the playhead while the film plays (during a take or P). A line's *slot* runs from its start to the next line's start (or to an end you set); it is the time the line has to fit in.
+1. **Script.** `takewise init` starts a project from the finished film. Its script, `script.toml`, has one entry per line with its start in film time; you write it, or an agent drafts it. Rough starts are fine; you can nudge them while the film plays. A line's *slot* runs from its start to the next line's start (or to an end you set): the time the line has to fit in.
 2. **Record to picture.** `takewise record` opens the window. Press Space: the film plays from 2 s before the line, counts in 3-2-1, and the words fill at an even pace across the slot. Space stops the take; otherwise it ends by itself 1.5 s after the slot.
 3. **Checks.** After each take, Takewise compares a local whisper.cpp transcript with the script and flags likely word, timing and sound problems: `keep`, `listen` or `retake`, with the reason. Listen back before choosing.
 4. **Choose.** The hollow star marks the best checked take that isn't a `retake`; Enter chooses a take. Takewise never chooses for you.
@@ -45,22 +45,23 @@ macOS asks for microphone access the first time Takewise listens to your input, 
 
 ## Try it on one line
 
-You need a finished film. To try Takewise without one, fetch the demo film the screenshots use: NASA's public-domain "Earth Views from the International Space Station" (120 MB), cut to 60 seconds:
+Start a project on your own film, an H.264 or HEVC `.mp4` or `.mov` that plays in QuickTime:
+
+```sh
+takewise init demo.takewise --film /path/to/your-cut.mp4
+```
+
+No footage at hand? Fetch the demo film the screenshots use, NASA's public-domain "Earth Views from the International Space Station" (120 MB), cut it to 60 seconds and start the project on that:
 
 ```sh
 nasa=https://images-assets.nasa.gov/video
 clip="Earth%20Views%20from%20the%20International%20Space%20Station"
 curl -fLo earth-views.mp4 "$nasa/$clip/$clip~large.mp4"
 ffmpeg -ss 16 -t 60 -i earth-views.mp4 -c:v libx264 -c:a aac film.mp4
-```
-
-Or use your own: an H.264 or HEVC `.mp4` or `.mov` that plays in QuickTime. Start a project for it:
-
-```sh
 takewise init demo.takewise --film film.mp4
 ```
 
-Add one line to `demo.takewise/script.toml`. `start` and `end` are seconds of film time, so this line's slot runs from 25.0 to 29.1 s, where the demo film shows a capsule docked at the station (on your own film, pick a slot inside it):
+Add one line to `demo.takewise/script.toml`. `start` and `end` are seconds of film time, so this line's slot runs from 25.0 to 29.1 s; on your own film, pick a slot inside it. On the demo film, those seconds show a capsule docked at the station:
 
 ```toml
 [[line]]
@@ -78,11 +79,11 @@ takewise record demo.takewise
 
 1. **Pick your devices.** On a new project the audio panel is already open, since no input is chosen yet. Pick your microphone's input (macOS asks for microphone access now), speak, and pick the channel whose meter moves. Then pick the output your headphones are on. If the panel offers **Switch to 48 kHz**, use it.
 2. **Press A** to close the panel. Left open, it and the setup check together squeeze the picture.
-3. **Press C** for the setup check. It shows your devices first; Enter goes on to the next step, and Space starts each measurement: read the sentence until the level fits, stay quiet for five seconds for the room, then hold your headphones to the microphone while beeps measure the latency, then press Enter to finish.
+3. **Press C** for the setup check. It shows your devices first; Enter goes on to the next step, and Space starts each measurement: read the sentence until the level fits, stay quiet for five seconds for the room, and hold your headphones to the microphone while beeps measure the latency. Then press Enter to finish.
 4. **Press Space** to record. The film starts 2 s before the line and counts in 3-2-1; read as the words fill. Space stops the take, or it ends by itself 1.5 s after the slot.
 5. **Wait for the verdict.** "checking…" turns into `keep`, `listen` or `retake`, with the reason.
 6. **Press P** to play the take back with the film.
-7. **Press Enter** to choose it, and close the window.
+7. **Press R or Enter.** If the check flags a problem you hear on playback, press R and try again; otherwise press Enter to choose it. Then close the window.
 
 Then export:
 
@@ -90,7 +91,14 @@ Then export:
 takewise export demo.takewise
 ```
 
-The narration is `demo.takewise/export/narration.wav`, with `export/manifest.json` beside it.
+The narration is `demo.takewise/export/narration.wav`, with `export/manifest.json` beside it. To watch the line on its shot, put the narration on the film (with your film's path in place of `film.mp4`):
+
+```sh
+ffmpeg -i film.mp4 -i demo.takewise/export/narration.wav \
+  -map 0:v -map 1:a -c:v copy check.mp4 && open check.mp4
+```
+
+`check.mp4` is the film with your narration as its only sound: silent until the slot, then your take over its shot.
 
 Opened from the Dock or Finder, `Takewise.app` shows a start window instead: **Open project…** (⌘O) and your recent projects ([details](docs/reference.md#the-start-window)). Lines are still added in `script.toml`, and export is still the `takewise export` command. [The script format](docs/design.md#project-folder) has the optional fields, such as a `note` for the narrator.
 
