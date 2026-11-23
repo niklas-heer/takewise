@@ -289,6 +289,18 @@ impl RecordingWindow {
         self.state.lines.iter().find(|line| line.id == id)
     }
 
+    /// The current line's text as the prompter shows it: while a take of
+    /// the line records, the text the take started with (a reload of the
+    /// script reaches the prompter once the take ends).
+    fn prompter_text(&self) -> Option<&str> {
+        let line = self.line_state()?;
+        let recording = self
+            .recorder
+            .recording_text()
+            .filter(|_| self.recorder.recording_line() == Some(line.id.as_str()));
+        Some(recording.unwrap_or(&line.text))
+    }
+
     fn blocked(&self) -> Option<&str> {
         self.script_problem
             .as_deref()
@@ -677,6 +689,7 @@ impl Render for RecordingWindow {
         let prompter = prompter::Prompter {
             film_s,
             line: self.line_state(),
+            text: self.prompter_text(),
             note: line.and_then(|line| line.note.as_deref()),
             next: script
                 .lines

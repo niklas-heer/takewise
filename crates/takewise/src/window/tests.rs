@@ -1178,6 +1178,29 @@ fn a_text_edit_during_a_take_keeps_the_text_it_was_read_from(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn the_prompter_keeps_the_takes_text_until_it_stops(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d
+    begin(cx, &f, 100.0);
+    tw::set_line_field(&f.dir, "d", Field::Text("Agent text.".to_owned()), None).expect("edit");
+    f.view.update(cx, |view, _| view.reload());
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    let shown = |cx: &mut TestAppContext| {
+        f.view
+            .read_with(cx, |view, _| view.prompter_text().map(str::to_owned))
+    };
+    assert_eq!(
+        shown(cx).as_deref(),
+        Some("Fourth line."),
+        "while recording"
+    );
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    assert_eq!(shown(cx).as_deref(), Some("Agent text."), "after the take");
+}
+
+#[gpui_kit::test]
 fn a_take_whose_finish_failed_stays_locked_until_saved(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     begin(cx, &f, 100.0); // begun on disk, streaming into the partial WAV

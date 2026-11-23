@@ -17,6 +17,9 @@ const METER_FLOOR_DB: f64 = -60.0;
 pub struct Prompter<'a> {
     pub film_s: f64,
     pub line: Option<&'a LineState>,
+    /// The line's text to read: the text a take started with while it
+    /// records, else the line's.
+    pub text: Option<&'a str>,
     pub note: Option<&'a str>,
     pub next: Option<&'a str>,
     pub level_dbfs: Option<f64>,
@@ -118,8 +121,9 @@ impl Prompter<'_> {
     pub fn render(self) -> AnyElement {
         let status = self.status();
         let (filled, text) = self.line.map_or((0, String::new()), |line| {
-            let chars = pace_fill(&line.text, line.start, line.end, self.film_s);
-            (byte_index(&line.text, chars), line.text.clone())
+            let text = self.text.unwrap_or(&line.text);
+            let chars = pace_fill(text, line.start, line.end, self.film_s);
+            (byte_index(text, chars), text.to_owned())
         });
 
         let current = match self.editor {

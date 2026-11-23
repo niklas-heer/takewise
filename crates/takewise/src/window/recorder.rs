@@ -179,6 +179,14 @@ impl Recorder {
         }
     }
 
+    /// The text the take being recorded started with.
+    pub fn recording_text(&self) -> Option<&str> {
+        match &self.phase {
+            Phase::Recording(take) => Some(&take.snapshot.text),
+            _ => None,
+        }
+    }
+
     /// The input level in dBFS, while buffers arrive.
     pub fn level_dbfs(&self, media: &dyn Media) -> Option<f64> {
         let (db, at) = match &self.phase {
