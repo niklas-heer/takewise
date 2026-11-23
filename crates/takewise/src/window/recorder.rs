@@ -44,25 +44,17 @@ const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
 /// `latency_offset_ms` when `[calibration]` names exactly this input, this
 /// output (the one in use, after any fallback) and this buffer size; else 0,
 /// since an offset measured on other devices would misplace the takes.
-// TODO(r7): switch to `takewise_core::effective_latency_offset(config, route)`
-// once fix/r7-core is merged, and drop this helper.
+/// The latency offset to apply on `route` in ms: the calibrated one only
+/// while `[calibration]` fits these devices and buffer (see
+/// [`takewise_core::effective_latency_offset`]).
 pub fn effective_latency_offset(config: &ProjectConfig, route: &Route) -> i32 {
-    if calibration_matches(config, route) {
-        config.input.latency_offset_ms
-    } else {
-        0
-    }
+    takewise_core::effective_latency_offset(config, route).0
 }
 
-/// Whether `[calibration]` names exactly `route`'s input, output and
-/// buffer size (both known).
+/// Whether a calibration was measured on exactly `route`. A project without
+/// `[calibration]` never matches, so the setup check offers to calibrate.
 pub fn calibration_matches(config: &ProjectConfig, route: &Route) -> bool {
-    config.calibration.as_ref().is_some_and(|cal| {
-        route.input.as_deref() == Some(cal.input.as_str())
-            && route.output.as_deref() == Some(cal.output.as_str())
-            && cal.buffer_frames.is_some()
-            && route.buffer_frames == cal.buffer_frames
-    })
+    config.calibration.is_some() && !takewise_core::effective_latency_offset(config, route).1
 }
 
 /// What a tick or a stop produced, for the window to show.
