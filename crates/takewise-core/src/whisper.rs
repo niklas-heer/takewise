@@ -384,7 +384,7 @@ fn is_executable(path: &Path) -> bool {
 
 /// A command running `tool` through `nice` (when the system has it), which
 /// execs the tool, so a timeout still stops the tool itself.
-fn tool_command(tool: &Path) -> Command {
+pub(crate) fn tool_command(tool: &Path) -> Command {
     if !Path::new(NICE).is_file() {
         return Command::new(tool);
     }
@@ -397,6 +397,15 @@ fn tool_command(tool: &Path) -> Command {
 /// running longer than `timeout` (the tool is then killed) is an error naming
 /// the tool and quoting the end of its stderr.
 fn run_tool(command: &mut Command, tool: &Path, timeout: Duration) -> Result<(), String> {
+    run_tool_stderr(command, tool, timeout).map(drop)
+}
+
+/// [`run_tool`], returning what the tool wrote to stderr when it succeeds.
+pub(crate) fn run_tool_stderr(
+    command: &mut Command,
+    tool: &Path,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     if !is_executable(tool) {
         return Err(format!(
             "could not run {}: not an executable file",
@@ -437,13 +446,13 @@ fn run_tool(command: &mut Command, tool: &Path, timeout: Duration) -> Result<(),
             }
         }
     };
-    if status.success() {
-        return Ok(());
-    }
     // A child the tool left behind may hold stderr open; do not wait for it.
     let stderr = receiver
         .recv_timeout(Duration::from_secs(1))
         .unwrap_or_default();
+    if status.success() {
+        return Ok(stderr);
+    }
     let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines

@@ -3,9 +3,11 @@
 //! session rules of the recording window.
 
 pub mod check;
+pub mod clean;
 pub mod edit;
 pub mod error;
 pub mod export;
+pub mod ffmpeg;
 pub mod fsutil;
 pub mod ledger;
 pub mod project;
