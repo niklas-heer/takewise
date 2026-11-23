@@ -160,24 +160,35 @@ impl RecordingWindow {
     }
 
     /// Saves a route change to `project.toml` and as the default for new
-    /// projects. Refused during a take. Returns whether it was saved.
-    fn change_route(&mut self, input: Option<(&str, u16)>, output: Option<&str>) -> bool {
+    /// projects. Refused during a take. Returns `None` when nothing was
+    /// saved, else what to add to the message: a latency calibration in
+    /// progress is cancelled, since its result would mix two routes.
+    fn change_route(
+        &mut self,
+        input: Option<(&str, u16)>,
+        output: Option<&str>,
+    ) -> Option<&'static str> {
         if !self.pickers_enabled() {
             self.message = Some(format!("{BETWEEN_TAKES} Stop the take first."));
-            return false;
+            return None;
         }
         if let Err(err) = tw::set_route(&self.dir, input, output) {
             self.message = Some(format!("Could not save the devices: {err}"));
-            return false;
+            return None;
         }
         self.reload();
+        let cancelled = self.cancel_calibration_if_rerouted();
         if let Some(path) = &self.defaults_path {
             // The defaults are a convenience; failing to save them is quiet.
             let _ = tw::route::save_defaults_to(path, &Route::of(&self.project.config));
         }
         self.panel.picker = None;
         self.check_inputs();
-        true
+        Some(if cancelled {
+            " Latency calibration cancelled: the devices changed."
+        } else {
+            ""
+        })
     }
 
     /// Records from the input device `name` (its first channel when the
@@ -189,8 +200,8 @@ impl RecordingWindow {
         } else {
             1
         };
-        if self.change_route(Some((name, channel)), None) {
-            self.message = Some(format!("Recording from {name}, channel {channel}."));
+        if let Some(note) = self.change_route(Some((name, channel)), None) {
+            self.message = Some(format!("Recording from {name}, channel {channel}.{note}"));
         }
     }
 
@@ -199,17 +210,17 @@ impl RecordingWindow {
         let Some(device) = self.project.config.input.device.clone() else {
             return;
         };
-        if self.change_route(Some((&device, channel)), None) {
-            self.message = Some(format!("Recording from {device}, channel {channel}."));
+        if let Some(note) = self.change_route(Some((&device, channel)), None) {
+            self.message = Some(format!("Recording from {device}, channel {channel}.{note}"));
         }
     }
 
     /// Plays the film (and later the monitor) through `name`.
     pub(super) fn choose_output(&mut self, name: &str) {
-        if !self.change_route(None, Some(name)) {
+        let Some(note) = self.change_route(None, Some(name)) else {
             return;
-        }
-        self.message = Some(match self.media.film_set_output(name) {
+        };
+        let said = match self.media.film_set_output(name) {
             Ok(()) => {
                 self.film_output = Some(name.to_owned());
                 self.check_inputs();
@@ -218,7 +229,8 @@ impl RecordingWindow {
             Err(err) => {
                 format!("Saved {name} as the output, but the film cannot play there: {err}")
             }
-        });
+        };
+        self.message = Some(format!("{said}{note}"));
     }
 
     /// Plays the film through the configured output, if there is one; says

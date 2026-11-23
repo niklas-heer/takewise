@@ -3138,6 +3138,62 @@ fn a_calibration_without_beeps_stores_nothing(cx: &mut TestAppContext) {
     assert_eq!(f.media.0.borrow().films.len(), 4);
 }
 
+/// Feeds the running calibration `n` buffers of what the input hears.
+fn some_calibration(cx: &mut TestAppContext, f: &Fixture, n: usize) {
+    let mut noise = 0x9e37_79b9_u32;
+    for _ in 0..n {
+        let (start, sink) = {
+            let fake = f.media.0.borrow();
+            (fake.now, fake.sink.clone().expect("the meter captures"))
+        };
+        let samples: Vec<i32> = {
+            let fake = f.media.0.borrow();
+            (0..960)
+                .map(|i| loopback_sample(&fake, start + f64::from(i) / 48_000.0, 0.03, &mut noise))
+                .collect()
+        };
+        let _ = sink.send(takewise_media::CaptureBuffer {
+            host_time_s: start,
+            samples,
+        });
+        f.media.set_now(start + 0.02);
+        frame(cx, f.window);
+    }
+}
+
+#[gpui_kit::test]
+fn changing_the_devices_cancels_a_calibration(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000), ("Other Mic", 48_000)]);
+    to_latency_step(cx, &f);
+    let changes: [fn(&mut RecordingWindow); 2] = [
+        |view| view.choose_output("Test Phones"),
+        |view| view.choose_input("Other Mic"),
+    ];
+    for change in changes {
+        press(cx, f.window, &["space"]);
+        assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+        some_calibration(cx, &f, 10);
+        f.view.update(cx, |view, _| change(view));
+        assert!(!f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+        let err = setup_of(cx, &f)
+            .latency
+            .expect("an outcome")
+            .expect_err("cancelled");
+        assert!(
+            err.contains("calibration cancelled: the devices changed"),
+            "{err}"
+        );
+        let said = message(cx, &f.view);
+        assert!(
+            said.contains("calibration cancelled: the devices changed"),
+            "{said}"
+        );
+        some_calibration(cx, &f, 5);
+        let config = Project::open(&f.dir).expect("project").config;
+        assert_eq!(config.calibration, None, "nothing measured on mixed routes");
+    }
+}
+
 /// The setup check's state, read from the window.
 fn setup_of(cx: &mut TestAppContext, f: &Fixture) -> super::setup::Setup {
     f.view

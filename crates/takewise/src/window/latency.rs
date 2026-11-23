@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::AnyElement;
-use takewise_core::{self as tw, CalibrationInfo};
+use takewise_core::{self as tw, CalibrationInfo, Route};
 
 use super::setup::{Setup, calibration_needed, line};
 use super::{RecordingWindow, colors};
@@ -18,11 +18,18 @@ use crate::calibrate::{self, Measurement, Run};
 /// stand-in in tests.
 pub type BeepFilm = fn(&Path) -> Result<PathBuf, String>;
 
+/// Why a calibration ended without a result when the input, its channel
+/// or the output changed while it measured.
+pub const REROUTED: &str = "calibration cancelled: the devices changed";
+
 /// A calibration while it runs.
 pub struct Calibrating {
     run: Run,
     /// Holds the beep film until the run ends.
     _work: tempfile::TempDir,
+    /// The route it measures: as configured, and as in use, when it began.
+    configured: Route,
+    route: Route,
 }
 
 impl RecordingWindow {
@@ -46,8 +53,8 @@ impl RecordingWindow {
             return Err(problem.clone());
         }
         let route = self.current_route();
-        let device = route.input.ok_or("No input device chosen.")?;
-        let output = route.output.unwrap_or_else(|| "unknown".to_owned());
+        let device = route.input.clone().ok_or("No input device chosen.")?;
+        let output = route.output.clone().unwrap_or_else(|| "unknown".to_owned());
         let work =
             tempfile::tempdir().map_err(|err| format!("No folder for the beep film: {err}"))?;
         let film = (self.beep_film)(work.path())?;
@@ -62,7 +69,12 @@ impl RecordingWindow {
             .and_then(|()| Run::new(&*self.media, &device, &output));
         match started {
             Ok(run) => {
-                self.calibrating = Some(Calibrating { run, _work: work });
+                self.calibrating = Some(Calibrating {
+                    run,
+                    _work: work,
+                    configured: Route::of(&self.project.config),
+                    route,
+                });
                 Ok(())
             }
             Err(err) => {
@@ -76,6 +88,10 @@ impl RecordingWindow {
     /// Once per frame while a calibration runs: hands it the meter's
     /// buffers; stores the result once it is done.
     pub(super) fn tick_calibration(&mut self) {
+        if self.cancel_calibration_if_rerouted() {
+            self.message = Some(format!("Latency {REROUTED}."));
+            return;
+        }
         let Some(calibrating) = &mut self.calibrating else {
             return;
         };
@@ -104,6 +120,25 @@ impl RecordingWindow {
         if self.calibrating.is_some() {
             self.end_calibration();
         }
+    }
+
+    /// Cancels a calibration whose route changed since it began (in the
+    /// panel, in `project.toml`, or the output in use), so no result
+    /// measured on two routes is stored; says so in the latency step.
+    /// Returns whether it cancelled one.
+    pub(super) fn cancel_calibration_if_rerouted(&mut self) -> bool {
+        let Some(calibrating) = &self.calibrating else {
+            return false;
+        };
+        let (configured, route) = (calibrating.configured.clone(), calibrating.route.clone());
+        if Route::of(&self.project.config) == configured && self.current_route() == route {
+            return false;
+        }
+        self.end_calibration();
+        if let Some(setup) = &mut self.setup {
+            setup.latency = Some(Err(REROUTED.to_owned()));
+        }
+        true
     }
 
     fn end_calibration(&mut self) {
