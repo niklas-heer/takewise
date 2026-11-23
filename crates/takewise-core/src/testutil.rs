@@ -6,9 +6,18 @@ pub const RATE: u32 = 48_000;
 
 /// Uniform noise at about -65 dBFS RMS, deterministic.
 pub fn noise(seconds: f64) -> Vec<i32> {
+    uniform(seconds, 0.001)
+}
+
+/// Uniform noise at `rms_dbfs`, deterministic.
+pub fn noise_at(seconds: f64, rms_dbfs: f64) -> Vec<i32> {
+    uniform(seconds, 10f64.powf(rms_dbfs / 20.0) * 3f64.sqrt())
+}
+
+fn uniform(seconds: f64, peak: f64) -> Vec<i32> {
     let n = samples(seconds);
     let mut state: u32 = 0x1234_5678;
-    let amplitude = f64::from(FULL_SCALE) * 0.001;
+    let amplitude = f64::from(FULL_SCALE) * peak;
     (0..n)
         .map(|_| {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);

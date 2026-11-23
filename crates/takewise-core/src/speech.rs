@@ -42,6 +42,31 @@ pub struct Analysis {
     pub frames: Frames,
 }
 
+impl Analysis {
+    /// The RMS level of the speech range in dBFS, from the frame levels;
+    /// `None` without speech.
+    pub fn speech_level_dbfs(&self) -> Option<f64> {
+        let (start, end) = self.speech?;
+        let frames = &self.frames;
+        if frames.frame_s <= 0.0 {
+            return None;
+        }
+        let first = to_index((start / frames.frame_s).floor());
+        let last = to_index((end / frames.frame_s).ceil()).min(frames.levels_dbfs.len());
+        let levels = frames.levels_dbfs.get(first..last)?;
+        if levels.is_empty() {
+            return None;
+        }
+        let power =
+            levels.iter().map(|db| 10f64.powf(db / 10.0)).sum::<f64>() / levels.len() as f64;
+        Some(if power > 0.0 {
+            (10.0 * power.log10()).max(SILENCE_DBFS)
+        } else {
+            SILENCE_DBFS
+        })
+    }
+}
+
 /// A take's frame levels and the level above which a frame is sound.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Frames {

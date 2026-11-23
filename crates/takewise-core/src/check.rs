@@ -13,12 +13,16 @@
 //! 6. only substitutions → `listen` (`possible-mishearing`)
 //! 7. a sound whisper annotates inside the speech, such as `(coughs)` or
 //!    `[Music]` → `listen` (`non-speech-sound`); outside it is dropped
-//! 8. otherwise `keep`, with no reasons.
+//! 8. speech less than 30 dB above the pre-roll's floor → `listen`
+//!    (`background-noise`); skipped when the pre-roll is digital silence
+//!    (a gated interface)
+//! 9. otherwise `keep`, with no reasons.
 //!
 //! Tolerances are absolute; a short line is held to the same word rules as a
 //! long one.
 
 use crate::ledger::{Checked, Reason, Snapshot, Verdict, Word, WordDiff, WordDiffKind};
+use crate::setup::{NOISY_SNR_DB, is_gated};
 use crate::speech::Analysis;
 use crate::words::{align, is_annotation, normalize};
 
@@ -139,6 +143,10 @@ pub fn build_checked(
             Verdict::Listen,
         );
     }
+    let speech_level_dbfs = analysis.speech_level_dbfs();
+    if let Some(noise) = background_noise(analysis, speech_level_dbfs) {
+        add(noise, Verdict::Listen);
+    }
 
     Checked {
         snapshot: snapshot.clone(),
@@ -146,6 +154,7 @@ pub fn build_checked(
         word_diffs,
         speech: analysis.speech,
         speech_onset_s: analysis.speech.and(onset),
+        speech_level_dbfs,
         overrun_s,
         peak_dbfs: analysis.peak_dbfs,
         clipped_samples: analysis.clipped_samples,
@@ -154,6 +163,18 @@ pub fn build_checked(
         reasons,
         checker: checker.to_owned(),
     }
+}
+
+/// The noise rule: speech at `speech_level_dbfs` less than 30 dB above the
+/// pre-roll's floor, unless the pre-roll is digital silence (gated).
+fn background_noise(analysis: &Analysis, speech_level_dbfs: Option<f64>) -> Option<Reason> {
+    let snr = speech_level_dbfs? - analysis.noise_floor_dbfs;
+    (!is_gated(analysis.noise_floor_dbfs) && snr < NOISY_SNR_DB).then(|| {
+        reason(
+            "background-noise",
+            format!("background noise only {snr:.0} dB below your voice"),
+        )
+    })
 }
 
 /// [`build_checked`] for a take whose words were transcribed by an earlier
@@ -593,6 +614,65 @@ mod tests {
         let checked = check(&analysis(), &transcript);
         assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
         assert_eq!(checked.transcript.map(|w| w.len()), Some(4));
+    }
+
+    #[test]
+    fn noise_rule_listens_below_30_db() {
+        // Speech at −20 dBFS over a pre-roll floor of −45 dBFS: 25 dB.
+        let noisy = Analysis {
+            noise_floor_dbfs: -45.0,
+            ..analysis()
+        };
+        let checked = check(&noisy, &words(LINE));
+        assert_eq!(checked.verdict, Verdict::Listen);
+        assert_eq!(codes(&checked), ["background-noise"]);
+        assert_eq!(
+            checked.reasons[0].message,
+            "background noise only 25 dB below your voice"
+        );
+        let level = checked.speech_level_dbfs.unwrap();
+        assert!((level + 20.0).abs() < 1e-9, "{level}");
+
+        // 35 dB is enough.
+        let quieter = Analysis {
+            noise_floor_dbfs: -55.0,
+            ..analysis()
+        };
+        assert_eq!(check(&quieter, &words(LINE)).verdict, Verdict::Keep);
+    }
+
+    #[test]
+    fn noise_rule_order_after_sound_rule() {
+        let noisy = Analysis {
+            noise_floor_dbfs: -45.0,
+            ..analysis()
+        };
+        let coughed = timed(&[
+            ("Nobody", 1.0, 1.5),
+            ("(coughs)", 1.5, 2.0),
+            ("misses", 2.0, 2.5),
+            ("a", 2.5, 2.8),
+            ("birthday.", 2.8, 3.5),
+        ]);
+        let checked = check(&noisy, &coughed);
+        assert_eq!(checked.verdict, Verdict::Listen);
+        assert_eq!(codes(&checked), ["non-speech-sound", "background-noise"]);
+
+        // A retake rule still wins; the noise is named after it.
+        let checked = check(&noisy, &words("Nobody misses birthday"));
+        assert_eq!(checked.verdict, Verdict::Retake);
+        assert_eq!(codes(&checked), ["missing-words", "background-noise"]);
+    }
+
+    #[test]
+    fn gated_preroll_skips_the_noise_rule() {
+        // Digital silence between words: no floor to compare against.
+        let gated = Analysis {
+            noise_floor_dbfs: crate::speech::SILENCE_DBFS,
+            ..voiced(&[(1.0, 3.5)])
+        };
+        let checked = check(&gated, &words(LINE));
+        assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
     }
 
     #[test]

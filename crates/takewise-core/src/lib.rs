@@ -13,6 +13,7 @@ pub mod route;
 pub mod run_check;
 pub mod script;
 pub mod session;
+pub mod setup;
 pub mod speech;
 pub mod state;
 pub mod takes;

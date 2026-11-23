@@ -104,6 +104,11 @@ pub struct Checked {
     /// was stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech_onset_s: Option<f64>,
+    /// The RMS level of the speech range in dBFS, which the noise rule
+    /// compares with `noise_floor_dbfs`. Absent without speech and on
+    /// checks from before it was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_level_dbfs: Option<f64>,
     pub overrun_s: Option<f64>,
     pub peak_dbfs: f64,
     pub clipped_samples: u64,
@@ -376,6 +381,7 @@ mod tests {
                 }],
                 speech: Some((2.0, 3.5)),
                 speech_onset_s: Some(2.25),
+                speech_level_dbfs: Some(-21.5),
                 overrun_s: None,
                 peak_dbfs: -6.0,
                 clipped_samples: 0,
