@@ -8,6 +8,8 @@
 	<string>Takewise</string>
 	<key>CFBundleExecutable</key>
 	<string>takewise</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.niklasheer.takewise</string>
 	<key>CFBundleInfoDictionaryVersion</key>
