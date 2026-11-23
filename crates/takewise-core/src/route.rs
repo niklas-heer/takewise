@@ -163,6 +163,13 @@ pub fn load_defaults_from(path: &Path) -> Result<Option<Route>> {
 }
 
 pub fn save_defaults_to(path: &Path, route: &Route) -> Result<()> {
+    #[cfg(test)]
+    assert!(
+        path.starts_with(std::env::temp_dir())
+            || fs::canonicalize(std::env::temp_dir()).is_ok_and(|tmp| path.starts_with(tmp)),
+        "a test wrote settings outside the temporary folder: {}",
+        path.display()
+    );
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(io(dir))?;
     }

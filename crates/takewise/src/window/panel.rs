@@ -180,6 +180,8 @@ impl RecordingWindow {
         let cancelled = self.cancel_calibration_if_rerouted();
         if let Some(path) = &self.defaults_path {
             // The defaults are a convenience; failing to save them is quiet.
+            #[cfg(test)]
+            super::start::isolated::assert_temporary(path);
             let _ = tw::route::save_defaults_to(path, &Route::of(&self.project.config));
         }
         self.panel.picker = None;

@@ -362,7 +362,7 @@ fn open_recording(dir: PathBuf, loaded: Loaded, cx: &mut App) -> Result<(), Stri
         cx.new(|cx| {
             let mut view =
                 RecordingWindow::new(dir, loaded, Box::new(media), watcher, checker, window, cx);
-            view.defaults_path = tw::settings_path();
+            view.defaults_path = start::settings_path();
             view.model = model::prompt_for(&view.project.config.check, &tw::whisper::models_dir());
             view
         })

@@ -70,11 +70,31 @@ pub fn start_target(folder: &Path, film: &Path) -> Picked {
     classify(&new_project_dir(folder, film))
 }
 
+/// The settings file the app reads and writes: [`tw::settings_path`]; in
+/// tests only the one [`isolate_settings`] made for the test's thread, so a
+/// test never touches the narrator's own settings or recent projects.
+pub fn settings_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        isolated::current()
+    }
+    #[cfg(not(test))]
+    {
+        tw::settings_path()
+    }
+}
+
 /// The recent projects file: `recent.json` beside the settings file.
 pub fn recent_path() -> Option<PathBuf> {
-    tw::settings_path()?
-        .parent()
-        .map(|dir| dir.join("recent.json"))
+    settings_path()?.parent().map(|dir| dir.join("recent.json"))
+}
+
+/// A project folder as stored in the recent projects: resolved (no `..`,
+/// no symlinks) when it exists, so one project is listed once.
+fn resolved(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf())
 }
 
 /// The recent projects in `path`, most recent first; folders that are no
@@ -86,19 +106,30 @@ pub fn load_recent(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The stored recent projects, resolved and each once.
 fn read_recent(path: &Path) -> Vec<PathBuf> {
-    std::fs::read(path)
+    let stored: Vec<PathBuf> = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let mut recent: Vec<PathBuf> = Vec::with_capacity(stored.len());
+    for dir in stored.iter().map(|dir| resolved(dir)) {
+        if !recent.contains(&dir) {
+            recent.push(dir);
+        }
+    }
+    recent
 }
 
 /// Puts `dir` first in the recent projects in `path`, keeping
 /// [`MAX_RECENT`].
 pub fn remember(path: &Path, dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    isolated::assert_temporary(path);
+    let dir = resolved(dir);
     let mut recent = read_recent(path);
-    recent.retain(|known| known != dir);
-    recent.insert(0, dir.to_owned());
+    recent.retain(|known| *known != dir);
+    recent.insert(0, dir);
     recent.truncate(MAX_RECENT);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -109,8 +140,54 @@ pub fn remember(path: &Path, dir: &Path) -> std::io::Result<()> {
 
 /// Remembers a project the app opened, quietly.
 pub fn remember_opened(dir: &Path) {
+    #[cfg(test)]
+    assert!(
+        isolated::current().is_some(),
+        "a test remembered a project without isolate_settings()"
+    );
     if let Some(path) = recent_path() {
         let _ = remember(&path, dir);
+    }
+}
+
+/// Makes this test thread's settings and recent projects live in a new
+/// temporary folder; returns the settings file there.
+#[cfg(test)]
+pub fn isolate_settings() -> PathBuf {
+    isolated::make()
+}
+
+/// The per-thread settings folder of tests.
+#[cfg(test)]
+pub(crate) mod isolated {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static DIR: RefCell<Option<tempfile::TempDir>> = const { RefCell::new(None) };
+    }
+
+    pub fn make() -> PathBuf {
+        DIR.with_borrow_mut(|dir| {
+            let dir = dir.get_or_insert_with(|| tempfile::tempdir().expect("settings dir"));
+            dir.path().join("settings.toml")
+        })
+    }
+
+    pub fn current() -> Option<PathBuf> {
+        DIR.with_borrow(|dir| dir.as_ref().map(|dir| dir.path().join("settings.toml")))
+    }
+
+    /// Panics unless `path` is in the temporary folder: tests never write
+    /// the narrator's own settings.
+    pub fn assert_temporary(path: &Path) {
+        let tmp = std::env::temp_dir();
+        let real = std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone());
+        assert!(
+            path.starts_with(&tmp) || path.starts_with(&real),
+            "a test wrote settings outside the temporary folder (use isolate_settings()): {}",
+            path.display()
+        );
     }
 }
 
@@ -456,8 +533,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("dir");
         let path = tmp.path().join("settings/recent.json");
         assert_eq!(load_recent(&path), Vec::<PathBuf>::new());
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical");
         let dirs: Vec<PathBuf> = (0..10)
-            .map(|n| tmp.path().join(format!("p{n}.takewise")))
+            .map(|n| root.join(format!("p{n}.takewise")))
             .collect();
         for dir in &dirs {
             project_at(dir);
@@ -475,7 +553,50 @@ mod tests {
         assert!(!load_recent(&path).contains(&dirs[9]));
     }
 
+    #[test]
+    #[should_panic(expected = "isolate_settings")]
+    fn a_test_that_remembers_without_isolated_settings_panics() {
+        let tmp = tempfile::tempdir().expect("dir");
+        remember_opened(tmp.path());
+    }
+
+    #[test]
+    fn recent_projects_are_stored_resolved_and_once() {
+        let tmp = tempfile::tempdir().expect("dir");
+        let path = tmp.path().join("settings/recent.json");
+        let dir = tmp.path().join("p.takewise");
+        project_at(&dir);
+        std::fs::create_dir_all(dir.join("takes")).expect("takes");
+        remember(&path, &dir.join("takes").join("..")).expect("remember");
+        remember(&path, &dir).expect("remember");
+        let resolved = std::fs::canonicalize(&dir).expect("canonical");
+        assert_eq!(read_recent(&path), vec![resolved.clone()]);
+        // Entries an older version stored unresolved are cleaned on read.
+        let raw = serde_json::to_vec(&vec![dir.join("takes/.."), dir.clone()]).expect("json");
+        std::fs::write(&path, raw).expect("write");
+        assert_eq!(load_recent(&path), vec![resolved]);
+    }
+
+    #[test]
+    fn isolated_settings_live_in_a_temporary_folder() {
+        let settings = isolate_settings();
+        assert!(
+            settings.starts_with(std::env::temp_dir()),
+            "{}",
+            settings.display()
+        );
+        assert_eq!(settings_path(), Some(settings.clone()));
+        let tmp = tempfile::tempdir().expect("dir");
+        project_at(tmp.path());
+        remember_opened(tmp.path());
+        assert_eq!(
+            load_recent(&settings.with_file_name("recent.json")),
+            vec![std::fs::canonicalize(tmp.path()).expect("canonical")]
+        );
+    }
+
     fn open_start(cx: &mut TestAppContext, recent: Vec<PathBuf>) -> Entity<StartWindow> {
+        isolate_settings();
         cx.update(|cx| {
             gpui_kit::init(cx);
             let options = WindowOptions {

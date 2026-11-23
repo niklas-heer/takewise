@@ -384,6 +384,7 @@ fn open_tooled(
     tools: Vec<PathBuf>,
     tag: String,
 ) -> Fixture {
+    super::start::isolate_settings();
     let (tmp, dir) = project(DEVICE);
     prepare(&dir);
     let media = FakeMedia::new(inputs);
@@ -3438,5 +3439,11 @@ fn opening_a_project_already_open_focuses_its_window(cx: &mut TestAppContext) {
         cx.windows(),
         vec![f.window],
         "no second window on the project"
+    );
+    let recent = super::start::recent_path().expect("isolated settings");
+    assert_eq!(
+        super::start::load_recent(&recent),
+        vec![fs::canonicalize(&f.dir).expect("canonical")],
+        "remembered resolved, in the test's own settings"
     );
 }
