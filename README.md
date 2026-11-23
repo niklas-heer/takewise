@@ -77,13 +77,12 @@ Open the recording window:
 takewise record demo.takewise
 ```
 
-1. **Pick your devices.** On a new project the audio panel is already open, since no input is chosen yet. Pick your microphone's input (macOS asks for microphone access now), speak, and pick the channel whose meter moves. Then pick the output your headphones are on. If the panel offers **Switch to 48 kHz**, use it.
-2. **Press A** to close the panel. Left open, it and the setup check together squeeze the picture.
-3. **Press C** for the setup check. It shows your devices first; Enter goes on to the next step, and Space starts each measurement: read the sentence until the level fits, stay quiet for five seconds for the room, and hold your headphones to the microphone while beeps measure the latency. Then press Enter to finish.
-4. **Press Space** to record. The film starts 3 s before the line and counts in 3-2-1; read as the words fill. Space stops the take, or it ends by itself 1.5 s after the slot.
-5. **Wait for the verdict.** "checking…" turns into `keep`, `listen` or `retake`, with the reason.
-6. **Press P** to play the take back with the film.
-7. **Press R or Enter.** If the check flags a problem you hear on playback, press R and try again; otherwise press Enter to choose it. Then close the window.
+1. **Pick your devices** in the audio panel. It opens by itself on a new project, since no input is chosen yet; A opens it otherwise. Pick your microphone's input (macOS asks for microphone access now), speak, and pick the channel whose meter moves. Then pick the output your headphones are on. If the panel offers **Switch to 48 kHz**, use it. Press A to close the panel.
+2. **Recommended: press C** for the setup check: your voice level, the room tone, and the latency, measured with your headphones held to the microphone. Enter goes on, Space starts each measurement, and Enter finishes. Without it, Space records all the same, but takes are placed without a latency correction and the export skips noise reduction.
+3. **Press Space** to record. The film starts 3 s before the line and counts in 3-2-1; read as the words fill. Space stops the take, or it ends by itself 1.5 s after the slot.
+4. **Wait for the verdict.** "checking…" turns into `keep`, `listen` or `retake`, with the reason.
+5. **Press P** to play the take back with the film.
+6. **Press R or Enter.** If the check flags a problem you hear on playback, press R and try again; otherwise press Enter to choose it. Then close the window.
 
 Then export:
 
