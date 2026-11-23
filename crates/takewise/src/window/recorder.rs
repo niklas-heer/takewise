@@ -34,6 +34,8 @@ const METER_RETRY_S: f64 = 2.0;
 const SAVE_RETRY_S: f64 = 2.0;
 /// A film halted this close to its end has reached it.
 const END_TOLERANCE_S: f64 = 0.25;
+/// A film not playing this long after its scheduled start stops the take.
+const FILM_START_TIMEOUT_S: f64 = 1.0;
 /// A film shift larger than this after the take started is recorded.
 const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
 
@@ -382,7 +384,13 @@ impl Recorder {
         });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
         let shift_note = film_shift_ms.map(|ms| {
-            format!("The film stalled during the take; placement may be off by {ms:.0} ms.")
+            if unplayed_s.is_some() {
+                format!(
+                    "The film did not play during the take; its placement may be off by {ms:.0} ms."
+                )
+            } else {
+                format!("The film stalled during the take; placement may be off by {ms:.0} ms.")
+            }
         });
         // The take keeps its film position: placed against the line's slot
         // as it is now, which M or an agent may have moved during the take.
@@ -551,28 +559,7 @@ impl Recorder {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
                 let progress = take.writer.progress();
-                let mut failure = None;
-                if !take.clock.started() {
-                    if progress.first_host_s.is_some() {
-                        let plan = take.plan;
-                        match take
-                            .clock
-                            .start(media, plan.film_from_s, plan.hold_first_frame_s)
-                        {
-                            Ok(tb) => {
-                                take.line_start_host_s =
-                                    Some(tb.host_anchor_s + (take.line_start - tb.film_anchor_s));
-                            }
-                            Err(err) => failure = Some(format!("the film cannot play: {err}")),
-                        }
-                    } else if now - take.capture_started_host_s > FIRST_BUFFER_TIMEOUT_S {
-                        failure = Some(format!(
-                            "No audio arrived from {:?}; check the input device.",
-                            take.device
-                        ));
-                    }
-                }
-                take.clock.track(media);
+                let failure = start_film(take, media, &progress, now);
                 let mut message = begin_on_disk(take, dir, &progress);
                 if let Some(err) = progress.error.as_ref().filter(|_| !take.write_error_shown) {
                     take.write_error_shown = true;
@@ -667,6 +654,45 @@ impl Recorder {
             media.stop_capture();
         }
     }
+}
+
+/// Schedules the film once the take's first buffer arrived and follows it;
+/// returns why the take must stop: no audio, or a film that cannot play or
+/// did not start.
+fn start_film(
+    take: &mut Take,
+    media: &mut dyn Media,
+    progress: &Progress,
+    now: f64,
+) -> Option<String> {
+    let mut failure = None;
+    if !take.clock.started() {
+        if progress.first_host_s.is_some() {
+            let plan = take.plan;
+            match take
+                .clock
+                .start(media, plan.film_from_s, plan.hold_first_frame_s)
+            {
+                Ok(tb) => {
+                    take.line_start_host_s =
+                        Some(tb.host_anchor_s + (take.line_start - tb.film_anchor_s));
+                }
+                Err(err) => failure = Some(format!("the film cannot play: {err}")),
+            }
+        } else if now - take.capture_started_host_s > FIRST_BUFFER_TIMEOUT_S {
+            failure = Some(format!(
+                "No audio arrived from {:?}; check the input device.",
+                take.device
+            ));
+        }
+    }
+    take.clock.track(media);
+    let overdue = take.clock.overdue_s(now);
+    failure.or_else(|| {
+        overdue
+            .is_some_and(|late| late >= FILM_START_TIMEOUT_S)
+            .then(|| "the film did not start; check the film file.".to_owned())
+    })
 }
 
 /// Whether the take reached its stop: `tail_s` after the slot's end, or,

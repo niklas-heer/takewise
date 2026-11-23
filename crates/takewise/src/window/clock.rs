@@ -122,6 +122,13 @@ impl FilmClock {
         Some((scheduled.film_at(host_s) - media.film_timebase().film_at(host_s)).abs())
     }
 
+    /// How long past the current start the player has not been read
+    /// playing; `None` once it played, or before the start.
+    pub fn overdue_s(&self, host_s: f64) -> Option<f64> {
+        let start = self.start_host_s?;
+        (!self.read_back && host_s >= start).then_some(host_s - start)
+    }
+
     /// Pauses the film and records the stop.
     pub fn stop(&mut self, media: &mut dyn Media) {
         media.film_pause();

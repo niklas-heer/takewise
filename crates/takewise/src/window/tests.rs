@@ -1143,6 +1143,38 @@ fn a_player_that_never_plays_flags_the_take(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_film_that_does_not_start_stops_the_take_and_keeps_it(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    begin(cx, &f, 100.0); // scheduled: film 6.0 at host 100.4
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.45,
+    });
+    f.media.set_now(101.3);
+    frame(cx, f.window);
+    assert!(
+        f.view.read_with(cx, |view, _| view.recorder.is_recording()),
+        "still waiting within a second of the scheduled start"
+    );
+    f.media.set_now(101.41);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "the audio is kept as a take");
+    let event = &takes[0].2;
+    assert_eq!(event.samples, 2400);
+    let shift = event.film_shift_ms.expect("flagged");
+    assert!((shift - 1010.0).abs() < 1e-6, "{shift}");
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("the film did not start; check the film file"),
+        "{shown}"
+    );
+}
+
+#[gpui_kit::test]
 fn a_stall_during_the_take_is_recorded(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down", "down", "down"]); // d
