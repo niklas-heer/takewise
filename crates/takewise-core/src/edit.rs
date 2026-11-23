@@ -12,7 +12,8 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
 use crate::project::{
-    FilmInfo, PROJECT_FILE, SCRIPT_FILE, parse_script, read_config, read_script_bytes,
+    CalibrationInfo, FilmInfo, PROJECT_FILE, SCRIPT_FILE, parse_script, read_config,
+    read_script_bytes,
 };
 use crate::script::validate;
 
@@ -159,6 +160,79 @@ pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
 /// Sets `[input] latency_offset_ms` in `project.toml` under the lock,
 /// keeping the rest of the file, its comments and layout as they are.
 pub fn set_latency_offset(dir: &Path, offset_ms: i32) -> Result<()> {
+    edit_project(dir, |doc| {
+        let input = table(doc, "input")?;
+        set_value(
+            input,
+            "latency_offset_ms",
+            Some(Value::from(i64::from(offset_ms))),
+        );
+        Ok(())
+    })
+}
+
+/// Sets `[input] latency_offset_ms` together with the `[calibration]` it
+/// was measured on, in one write under the lock.
+pub fn set_calibration(dir: &Path, offset_ms: i32, info: &CalibrationInfo) -> Result<()> {
+    edit_project(dir, |doc| {
+        let input = table(doc, "input")?;
+        set_value(
+            input,
+            "latency_offset_ms",
+            Some(Value::from(i64::from(offset_ms))),
+        );
+        let cal = table(doc, "calibration")?;
+        set_value(cal, "input", Some(Value::from(info.input.as_str())));
+        set_value(cal, "output", Some(Value::from(info.output.as_str())));
+        set_value(
+            cal,
+            "buffer_frames",
+            info.buffer_frames.map(|n| Value::from(i64::from(n))),
+        );
+        set_value(cal, "date", Some(Value::from(info.date.as_str())));
+        Ok(())
+    })
+}
+
+/// Sets the input device and channel and/or the output device in
+/// `project.toml` under the lock, keeping its comments and layout. `None`
+/// leaves that part as it is.
+pub fn set_route(dir: &Path, input: Option<(&str, u16)>, output: Option<&str>) -> Result<()> {
+    edit_project(dir, |doc| {
+        if let Some((device, channel)) = input {
+            let table = table(doc, "input")?;
+            set_value(table, "device", Some(Value::from(device)));
+            set_value(table, "channel", Some(Value::from(i64::from(channel))));
+        }
+        if let Some(device) = output {
+            let table = table(doc, "output")?;
+            set_value(table, "device", Some(Value::from(device)));
+        }
+        Ok(())
+    })
+}
+
+/// Sets `[record] film_gain_db` and/or `[monitor] volume_db` under the
+/// lock, keeping the file's comments and layout. `None` leaves that value
+/// as it is.
+pub fn set_volumes(dir: &Path, film_gain_db: Option<f64>, monitor_db: Option<f64>) -> Result<()> {
+    edit_project(dir, |doc| {
+        if let Some(db) = film_gain_db {
+            set_value(table(doc, "record")?, "film_gain_db", Some(Value::from(db)));
+        }
+        if let Some(db) = monitor_db {
+            set_value(table(doc, "monitor")?, "volume_db", Some(Value::from(db)));
+        }
+        Ok(())
+    })
+}
+
+/// Edits `project.toml` with `edit` under the lock and writes it back
+/// atomically; a file that no longer parses as a project is not written.
+fn edit_project(
+    dir: &Path,
+    edit: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
+) -> Result<()> {
     let path = dir.join(PROJECT_FILE);
     let _guard = lock(dir)?;
     let text = fs::read_to_string(&path).map_err(io(&path))?;
@@ -169,17 +243,18 @@ pub fn set_latency_offset(dir: &Path, offset_ms: i32) -> Result<()> {
     let mut doc: DocumentMut = text
         .parse()
         .map_err(|err: toml_edit::TomlError| parse_error(err.to_string()))?;
-    let table = doc
-        .entry("input")
+    edit(&mut doc).map_err(parse_error)?;
+    let text = doc.to_string();
+    toml::from_str::<crate::ProjectConfig>(&text).map_err(|err| parse_error(err.to_string()))?;
+    write_atomic(&path, text.as_bytes())
+}
+
+/// The table `name`, created when missing.
+fn table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, String> {
+    doc.entry(name)
         .or_insert_with(toml_edit::table)
         .as_table_mut()
-        .ok_or_else(|| parse_error("input is not a table".to_owned()))?;
-    set_value(
-        table,
-        "latency_offset_ms",
-        Some(Value::from(i64::from(offset_ms))),
-    );
-    write_atomic(&path, doc.to_string().as_bytes())
+        .ok_or_else(|| format!("{name} is not a table"))
 }
 
 /// Replaces, inserts or removes `key`, keeping the old value's surrounding
@@ -203,7 +278,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::{Error, FilmInfo, Project};
+    use crate::{CalibrationInfo, Error, FilmInfo, Project};
 
     const SCRIPT: &str = r#"# Kindred promo narration
 # drafted by an agent
@@ -358,6 +433,81 @@ text = "Third."
         let config = crate::project::read_config(&dir).unwrap();
         assert_eq!(config.input.latency_offset_ms, -32);
         assert_eq!(config.input.device.as_deref(), Some("Chat"));
+    }
+
+    #[test]
+    fn set_route_preserves_comments() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let commented = original.replacen(
+            "[input]\n",
+            "# the RODECaster's chat mix\n[input]\ndevice = \"Chat\"  # by name\n",
+            1,
+        );
+        let commented = commented.replacen("channel = 1", "channel = 1  # left", 1);
+        fs::write(&path, &commented).unwrap();
+
+        set_route(&dir, Some(("Main Stereo", 2)), Some("Main Stereo")).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# the RODECaster's chat mix\n[input]"),
+            "{written}"
+        );
+        assert!(
+            written.contains("device = \"Main Stereo\"  # by name"),
+            "{written}"
+        );
+        assert!(written.contains("channel = 2  # left"), "{written}");
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.input.device.as_deref(), Some("Main Stereo"));
+        assert_eq!(config.input.channel, 2);
+        assert_eq!(config.output.device.as_deref(), Some("Main Stereo"));
+
+        // Only the output: the input stays.
+        set_route(&dir, None, Some("Speakers")).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.input.device.as_deref(), Some("Main Stereo"));
+        assert_eq!(config.output.device.as_deref(), Some("Speakers"));
+    }
+
+    #[test]
+    fn set_calibration_writes_offset_and_record() {
+        let (_tmp, dir) = project();
+        let info = CalibrationInfo {
+            input: "Duo".to_owned(),
+            output: "Duo".to_owned(),
+            buffer_frames: Some(512),
+            date: "2026-11-23".to_owned(),
+        };
+        set_calibration(&dir, 14, &info).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.input.latency_offset_ms, 14);
+        assert_eq!(config.calibration, Some(info.clone()));
+
+        // A buffer size not known now removes the old one.
+        let unknown = CalibrationInfo {
+            buffer_frames: None,
+            ..info
+        };
+        set_calibration(&dir, 15, &unknown).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.calibration, Some(unknown));
+    }
+
+    #[test]
+    fn set_volumes_writes_film_and_monitor_levels() {
+        let (_tmp, dir) = project();
+        set_volumes(&dir, Some(-9.0), None).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert!((config.record.film_gain_db + 9.0).abs() < f64::EPSILON);
+        assert!((config.monitor.volume_db + 6.0).abs() < f64::EPSILON);
+        set_volumes(&dir, None, Some(3.0)).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert!((config.record.film_gain_db + 9.0).abs() < f64::EPSILON);
+        assert!((config.monitor.volume_db - 3.0).abs() < f64::EPSILON);
+        assert!(!config.monitor.enabled, "enabled keeps its default");
     }
 
     #[test]

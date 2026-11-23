@@ -14,8 +14,12 @@ use takewise_core::{Project, RecordedInput, TakeRef, begin_take, commit_take, wr
 
 const RATE: u32 = 48_000;
 
+/// The CLI, with the app's defaults read from a file that does not exist
+/// (tests never see the user's own device choices).
 fn takewise() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_takewise"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_takewise"));
+    cmd.env("TAKEWISE_SETTINGS", "/nonexistent/takewise-settings.toml");
+    cmd
 }
 
 /// A 51.5 s WAV that ffprobe reads as the film.
@@ -299,6 +303,76 @@ fn judge_rejects_bad_score_exit_2() {
     let take = &status(&dir)["lines"][0]["takes"][0];
     assert_eq!(take["effective"], "keep");
     assert_eq!(take["verdict_source"], "judge:claude");
+}
+
+#[test]
+fn status_warns_about_stale_calibration_and_missing_setup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    let data = status(&dir);
+    let codes: Vec<&str> = data["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["code"].as_str())
+        .collect();
+    assert_eq!(codes, ["no-setup"], "{data}");
+
+    // An offset measured before calibrations recorded their devices.
+    takewise_core::set_latency_offset(&dir, 20).unwrap();
+    let data = status(&dir);
+    let stale = data["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["code"] == "calibration-stale")
+        .expect("a stale calibration notice");
+    assert!(
+        stale["message"]
+            .as_str()
+            .unwrap()
+            .contains("calibrate --write"),
+        "{stale}"
+    );
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("calibration-stale"));
+    // Notices do not fail --strict.
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .arg("--strict")
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn init_starts_with_the_saved_devices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = tmp.path().join("settings.toml");
+    fs::write(
+        &settings,
+        "input = \"Duo Main\"\nchannel = 2\noutput = \"Duo Main\"\n",
+    )
+    .unwrap();
+    let film = film(tmp.path());
+    let dir = tmp.path().join("promo.takewise");
+    takewise()
+        .env("TAKEWISE_SETTINGS", &settings)
+        .arg("init")
+        .arg(&dir)
+        .arg("--film")
+        .arg(&film)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Duo Main"));
+    let config = Project::open(&dir).unwrap().config;
+    assert_eq!(config.input.device.as_deref(), Some("Duo Main"));
+    assert_eq!(config.input.channel, 2);
+    assert_eq!(config.output.device.as_deref(), Some("Duo Main"));
 }
 
 #[test]

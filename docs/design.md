@@ -245,6 +245,7 @@ volume_db = -6.0
 [calibration]                            # which device pair `input.latency_offset_ms` was measured on
 input = "RODECaster Duo Main Stereo"
 output = "RODECaster Duo Main Stereo"
+buffer_frames = 512                      # the capture buffer during the measurement
 date = "2026-11-23"
 
 [export]
@@ -262,7 +263,7 @@ room_floor_dbfs = -68.0
 speech_to_noise_db = 46.0
 ```
 
-`[calibration]` also records the capture buffer size; when the input, the output or the buffer size differs from it, or a project has an offset but no `[calibration]` (measured before this section), `status` and the window warn that the latency calibration is stale. `status` likewise warns when the devices differ from `[setup]` or no setup check has run. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`. Device and route changes take effect between takes, never during one.
+`[calibration]` also records the capture buffer size; when the input, the output or the buffer size differs from it, or a project has an offset but no `[calibration]` (measured before this section), `status` and the window warn that the latency calibration is stale. `status` likewise warns when the devices differ from `[setup]` or no setup check has run. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml` (`TAKEWISE_SETTINGS` names another file); `init` starts a project with them. Device and route changes take effect between takes, never during one.
 
 ### Recording screen additions (milestone 4a)
 

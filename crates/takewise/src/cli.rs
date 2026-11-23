@@ -8,8 +8,9 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use takewise_core::{
-    self as tw, AvailableInput, CheckConfig, ExportOptions, Field, FilmInfo, Judgment, LineState,
-    Problem, Project, RepairReport, ScriptVersion, State, Verdict, check_input,
+    self as tw, AvailableInput, CalibrationInfo, CheckConfig, ExportOptions, Field, FilmInfo,
+    Judgment, LineState, Problem, Project, RepairReport, Route, ScriptVersion, State, Verdict,
+    check_input,
 };
 use takewise_media::{DeviceInfo, Transport};
 
@@ -337,12 +338,28 @@ fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
     })?;
     let info = film::probe(&film_path)?;
     let project = Project::init(dir, &film_path, info)?;
-    let text = format!(
+    let mut text = format!(
         "Created {} for {} ({:.1} s). Write the lines into script.toml.",
         dir.display(),
         film_path.display(),
         project.config.film_info.duration_s
     );
+    // The devices chosen last, in the window, are where a new project starts.
+    if let Ok(Some(defaults)) = tw::load_defaults() {
+        let input = defaults
+            .input
+            .as_deref()
+            .map(|name| (name, defaults.channel));
+        if input.is_some() || defaults.output.is_some() {
+            tw::set_route(dir, input, defaults.output.as_deref())?;
+            if let Some((name, channel)) = input {
+                let _ = write!(
+                    text,
+                    " Input: {name:?} channel {channel} (your last choice)."
+                );
+            }
+        }
+    }
     Ok(Outcome::new(
         json!({ "dir": dir, "film": film_path, "film_info": project.config.film_info }),
         text,
@@ -396,6 +413,20 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
             "the film changed since it was measured; check the timings, then run `takewise status --refresh-film`",
         ));
     }
+    let route = current_route(&project);
+    if let Some(stale) = tw::calibration_stale(&project.config, &route) {
+        state
+            .notices
+            .push(Problem::new(None, "calibration-stale", stale));
+    }
+    if let Some(warning) = tw::setup_warning(&project.config, &route) {
+        let code = if project.config.setup.is_none() {
+            "no-setup"
+        } else {
+            "setup-changed"
+        };
+        state.notices.push(Problem::new(None, code, warning));
+    }
 
     let data = StatusData {
         script_version: script_version.to_string(),
@@ -436,6 +467,21 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
         outcome = outcome.with_finding("strict", message);
     }
     Ok(outcome)
+}
+
+/// The project's route as it would play now: an unset output is the
+/// system's default output, and the buffer size is the input's current one
+/// (both unknown when CoreAudio cannot tell).
+fn current_route(project: &Project) -> Route {
+    let mut route = Route::of(&project.config);
+    if route.output.is_none() {
+        route.output = takewise_media::default_output().ok().map(|d| d.name);
+    }
+    route.buffer_frames = route
+        .input
+        .as_deref()
+        .and_then(|device| takewise_media::buffer_frames(device).ok());
+    route
 }
 
 fn take_label(take: Option<u32>) -> String {
@@ -769,6 +815,14 @@ fn run_in_bundle(args: &[&std::ffi::OsStr]) -> Result<PathBuf, CliError> {
     Ok(bundle)
 }
 
+/// Today's date (UTC) as `YYYY-MM-DD`.
+fn today() -> String {
+    jiff::tz::Offset::UTC
+        .to_datetime(jiff::Timestamp::now())
+        .date()
+        .to_string()
+}
+
 /// Makes the beep film, measures inside Takewise.app, reports the placement
 /// error and with `--write` stores the offset that cancels it.
 fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, CliError> {
@@ -838,10 +892,16 @@ fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, C
         let _ = write!(text, "\nWarning: {why}");
     }
     if write {
-        tw::set_latency_offset(&dir, offset)?;
+        let info = CalibrationInfo {
+            input: measurement.input.clone(),
+            output: measurement.output.clone(),
+            buffer_frames: measurement.buffer_frames,
+            date: today(),
+        };
+        tw::set_calibration(&dir, offset, &info)?;
         let _ = write!(
             text,
-            "\nWrote latency_offset_ms = {offset} to project.toml."
+            "\nWrote latency_offset_ms = {offset} and the devices it was measured on to project.toml."
         );
     } else {
         let _ = write!(

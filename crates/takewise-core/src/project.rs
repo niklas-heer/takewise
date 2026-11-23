@@ -46,6 +46,80 @@ pub struct ProjectConfig {
     pub record: RecordConfig,
     #[serde(default)]
     pub check: CheckConfig,
+    #[serde(default, skip_serializing_if = "OutputConfig::is_unset")]
+    pub output: OutputConfig,
+    #[serde(default, skip_serializing_if = "MonitorConfig::is_default")]
+    pub monitor: MonitorConfig,
+    /// The device pair and buffer `input.latency_offset_ms` was measured on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<CalibrationInfo>,
+    /// The last setup check (written from milestone 4b on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupInfo>,
+}
+
+/// `[output]`: where film audio (and monitoring) plays.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputConfig {
+    /// The output device, matched by name; unset means the system default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+impl OutputConfig {
+    fn is_unset(&self) -> bool {
+        self.device.is_none()
+    }
+}
+
+/// `[monitor]`: whether the narrator hears their own voice, and how loud.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorConfig {
+    pub enabled: bool,
+    pub volume_db: f64,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            volume_db: -6.0,
+        }
+    }
+}
+
+impl MonitorConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[calibration]`: what the latency offset was measured on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationInfo {
+    pub input: String,
+    pub output: String,
+    /// The capture buffer in frames; missing in calibrations that did not
+    /// record it, which count as stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_frames: Option<u32>,
+    /// `YYYY-MM-DD`.
+    pub date: String,
+}
+
+/// `[setup]`: the result of the setup check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupInfo {
+    pub date: String,
+    pub input: String,
+    pub channel: u16,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_floor_dbfs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_to_noise_db: Option<f64>,
 }
 
 /// What the film looked like when the project last measured it.
@@ -128,6 +202,10 @@ impl Project {
             input: InputConfig::default(),
             record: RecordConfig::default(),
             check: CheckConfig::default(),
+            output: OutputConfig::default(),
+            monitor: MonitorConfig::default(),
+            calibration: None,
+            setup: None,
         };
         let text = toml::to_string(&config).map_err(|err| Error::Parse {
             path: project_file.clone(),
@@ -283,6 +361,31 @@ mod tests {
         assert_eq!(opened.config.check.whisper_model, "ggml-large-v3-turbo.bin");
         assert_eq!(opened.script.lines, []);
         assert_eq!(opened.film_path(), dir.join("../film.mp4"));
+    }
+
+    #[test]
+    fn old_project_without_new_tables_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = "format = 1\nfilm = \"film.mp4\"\nsample_rate = 48000\n\n\
+                    [film_info]\nduration_s = 51.5\nsize = 1\nmodified = \"2026-11-22T20:05:11Z\"\n\n\
+                    [input]\ndevice = \"Mic\"\nchannel = 2\nlatency_offset_ms = 12\n";
+        fs::write(tmp.path().join(PROJECT_FILE), text).unwrap();
+        let config = read_config(tmp.path()).unwrap();
+        assert_eq!(config.output, OutputConfig::default());
+        assert_eq!(config.monitor, MonitorConfig::default());
+        assert!(!config.monitor.enabled);
+        assert!((config.monitor.volume_db + 6.0).abs() < f64::EPSILON);
+        assert_eq!(config.calibration, None);
+        assert_eq!(config.setup, None);
+        assert_eq!(config.input.latency_offset_ms, 12);
+
+        // A new project's file has none of the new tables either.
+        let dir = tmp.path().join("new");
+        Project::init(&dir, Path::new("film.mp4"), info()).unwrap();
+        let written = fs::read_to_string(dir.join(PROJECT_FILE)).unwrap();
+        for table in ["[output]", "[monitor]", "[calibration]", "[setup]"] {
+            assert!(!written.contains(table), "{table} in {written}");
+        }
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct Measurement {
     pub input: String,
     pub output: String,
     pub input_latency_ms: f64,
+    /// The input's buffer size in frames while it captured, when CoreAudio
+    /// reported it.
+    #[serde(default)]
+    pub buffer_frames: Option<u32>,
     /// Beep plays expected across all segments.
     pub expected: usize,
     pub placed: Vec<Placement>,
@@ -267,6 +271,7 @@ pub fn measure(
     check_input(Some(&device), &available)?;
     let mut media = RealMedia::open(film)?;
     let latency_s = media.input_latency_s(&device)?;
+    let output = output.or(project.config.output.device.as_deref());
     let output = match output {
         Some(name) => {
             media.set_output_device(name)?;
@@ -293,6 +298,7 @@ pub fn measure(
 
     let (tx, rx) = mpsc::channel();
     media.start_capture(&device, config.channel, tx)?;
+    let buffer_frames = takewise_media::buffer_frames(&device).ok();
     let mut buffers: Vec<CaptureBuffer> = Vec::new();
     let waiting_until = host_time_now_s() + 5.0;
     while buffers.is_empty() {
@@ -344,6 +350,7 @@ pub fn measure(
         input: device,
         output,
         input_latency_ms: latency_s * 1000.0,
+        buffer_frames,
         expected: expected.len(),
         placed,
         mean_ms: stats.map(|(mean, _)| mean),
