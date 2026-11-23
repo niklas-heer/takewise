@@ -2744,6 +2744,32 @@ fn setup_of(cx: &mut TestAppContext, f: &Fixture) -> super::setup::Setup {
 }
 
 #[gpui_kit::test]
+fn a_silent_voice_step_does_not_go_on(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    press(cx, f.window, &["c", "enter"]);
+    let silence: Vec<Vec<i32>> = (0..50).map(|_| vec![0; 4_800]).collect();
+    listen(cx, &f, &silence);
+    let voice = setup_of(cx, &f).voice.expect("a report");
+    assert!(!super::setup::heard_voice(&voice), "{voice:?}");
+    press(cx, f.window, &["enter"]);
+    let setup = setup_of(cx, &f);
+    assert_eq!(setup.step, super::setup::Step::Voice, "it stays");
+    let error = setup.error.expect("says why");
+    assert!(
+        error.contains("No voice heard on channel 1 — check the channel in the audio panel"),
+        "{error}"
+    );
+    // A opens the audio panel from the setup check.
+    press(cx, f.window, &["a"]);
+    assert!(f.view.read_with(cx, |view, _| view.panel.open));
+    // A voice heard afterwards goes on.
+    listen(cx, &f, &voice_buffers(-10.0));
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Room));
+}
+
+#[gpui_kit::test]
 fn a_room_tone_that_cannot_be_kept_is_not_saved(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     // A file where the room tone directory goes.

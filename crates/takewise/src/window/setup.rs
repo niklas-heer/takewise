@@ -120,6 +120,9 @@ impl RecordingWindow {
         setup.error = None;
         match setup.step {
             Step::Devices => setup.step = Step::Voice,
+            Step::Voice if setup.voice.as_ref().is_some_and(|v| !heard_voice(v)) => {
+                setup.error = Some(silent_channel(self.project.config.input.channel));
+            }
             Step::Voice if setup.voice.is_some() => setup.step = Step::Room,
             Step::Voice => {
                 setup.error = Some("Read the sentence first: press Space.".to_owned());
@@ -291,7 +294,12 @@ impl RecordingWindow {
                 ));
                 body.push(div().text_size(px(18.)).child(SENTENCE).into_any_element());
                 if let Some(voice) = &setup.voice {
-                    body.extend(voice_lines(voice).into_iter().map(|(t, c)| line(t, c)));
+                    let channel = self.project.config.input.channel;
+                    body.extend(
+                        voice_lines(voice, channel)
+                            .into_iter()
+                            .map(|(t, c)| line(t, c)),
+                    );
                 }
             }
             Step::Room => {
@@ -333,7 +341,10 @@ impl RecordingWindow {
         let setup = self.setup.as_ref()?;
         let (title, keys) = match setup.step {
             Step::Devices => ("1 · Devices", "Enter next · A audio panel · Esc close"),
-            Step::Voice => ("2 · Voice", "Space listen · Enter next · Esc close"),
+            Step::Voice => (
+                "2 · Voice",
+                "Space listen · Enter next · A audio panel · Esc close",
+            ),
             Step::Room => ("3 · Room", "Space listen · Enter next · Esc close"),
             Step::Latency => ("4 · Latency", "Enter done · Esc close"),
         };
@@ -369,8 +380,25 @@ fn line(text: String, color: u32) -> AnyElement {
     div().text_color(rgb(color)).child(text).into_any_element()
 }
 
-/// The voice step's report in words, with a color each.
-fn voice_lines(voice: &VoiceReport) -> Vec<(String, u32)> {
+/// Whether the voice step heard a voice at all: nothing louder than the
+/// voiced threshold means the channel carries no voice.
+pub fn heard_voice(voice: &VoiceReport) -> bool {
+    voice.speech_rms_dbfs > tw::speech::SILENCE_DBFS
+}
+
+/// What the voice step says when it heard nothing on `channel`.
+fn silent_channel(channel: u16) -> String {
+    format!(
+        "No voice heard on channel {channel} — check the channel in the audio panel (A), then press Space to read again."
+    )
+}
+
+/// The voice step's report in words, with a color each. A silent channel
+/// gets no gain suggestion: it says to check the channel instead.
+fn voice_lines(voice: &VoiceReport, channel: u16) -> Vec<(String, u32)> {
+    if !heard_voice(voice) {
+        return vec![(silent_channel(channel), colors::WARN)];
+    }
     let mut lines = vec![(
         format!(
             "Peak {:.1} dBFS · speech {:.1} dBFS",
