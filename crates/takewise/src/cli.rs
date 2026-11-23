@@ -685,6 +685,16 @@ fn check(
 ) -> Result<Outcome, CliError> {
     let takes = takes_to_check(dir, line, take, stale_only)?;
     if takes.is_empty() {
+        // Takes left with their words unchecked are not checked again while
+        // checking would fail the same way: say why, as a setup error.
+        let project = Project::open(dir)?;
+        let ledger = tw::read(dir)?;
+        let failed = tw::words_not_checked_takes(&project, &ledger)
+            .into_iter()
+            .any(|t| line.is_none_or(|id| t.line == id) && take.is_none_or(|n| t.take == n));
+        if failed {
+            tw::WhisperCli::discover(&project.config.check).map_err(CliError::Whisper)?;
+        }
         return Ok(Outcome::new(
             json!({ "checks": [], "errors": [] }),
             "Nothing to check.",

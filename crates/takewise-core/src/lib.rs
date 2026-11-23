@@ -43,7 +43,7 @@ pub use project::{
 pub use route::{
     Route, calibration_stale, load_defaults, save_defaults, settings_path, setup_warning,
 };
-pub use run_check::{Unchecked, check_take, checker, unchecked_takes};
+pub use run_check::{Unchecked, check_take, checker, unchecked_takes, words_not_checked_takes};
 pub use script::{Line, Problem, Script, validate};
 pub use session::{AvailableInput, RECORD_RATE, SessionState, can_record, check_input};
 pub use speech::{Analysis, analyze};

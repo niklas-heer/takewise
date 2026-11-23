@@ -170,6 +170,47 @@ fn failure_could_change(failed: &Checked, setup: Option<&str>) -> bool {
     }
 }
 
+/// The takes of the script's lines (with their file on disk) whose check
+/// against the line as it is now failed to transcribe (`words-not-checked`),
+/// in script and take order. When [`unchecked_takes`] leaves them out,
+/// transcription cannot be set up, and that is what to report.
+pub fn words_not_checked_takes(project: &Project, ledger: &Ledger) -> Vec<TakeRef> {
+    let mut found = Vec::new();
+    for line in &project.script.lines {
+        let Some(current) = project.snapshot(&line.id) else {
+            continue;
+        };
+        let mut takes: Vec<TakeRef> = Vec::new();
+        for event in ledger.events.iter().filter(|e| e.line == line.id) {
+            let EventKind::Recorded(rec) = &event.kind else {
+                continue;
+            };
+            if !project.dir.join(&rec.file).is_file() {
+                continue;
+            }
+            let newest = ledger
+                .events
+                .iter()
+                .rev()
+                .filter(|e| e.line == line.id && e.take == event.take)
+                .find_map(|e| match &e.kind {
+                    EventKind::Checked(c) if c.snapshot.matches(&current) => Some(c),
+                    _ => None,
+                });
+            if newest.is_some_and(|c| c.transcript.is_none()) {
+                takes.push(TakeRef {
+                    line: line.id.clone(),
+                    take: event.take,
+                });
+            }
+        }
+        takes.sort();
+        takes.dedup();
+        found.extend(takes);
+    }
+    found
+}
+
 /// [`unchecked_takes`] with why transcription cannot be set up now, `None`
 /// when it can.
 fn select_unchecked(project: &Project, ledger: &Ledger, setup: Option<&str>) -> Vec<Unchecked> {

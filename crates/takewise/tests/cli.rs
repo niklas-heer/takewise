@@ -680,6 +680,44 @@ fn cli_check_setup_errors_exit_2() {
     assert_eq!(value["error"]["code"], "unknown-take", "{value}");
 }
 
+#[test]
+fn cli_check_explains_takes_left_unchecked_by_the_setup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    let take = record_take(&dir, "hook");
+    let (bin, _) = fake_whisper(tmp.path());
+    let no_models = tmp.path().join("no-models");
+    // The window checked the take without the model, as it does.
+    let missing =
+        takewise_core::SetupError::MissingModel(no_models.join("ggml-large-v3-turbo.bin"));
+    let unavailable = takewise_core::Unavailable {
+        reason: missing.to_string(),
+        model: "ggml-large-v3-turbo.bin".to_owned(),
+    };
+    takewise_core::check_take(&dir, &take, &unavailable, "test").unwrap();
+
+    // Checking again cannot change it: the model is still missing, which
+    // is a setup error, not "nothing to check".
+    let output = check_cmd(&dir, &bin, &no_models).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not found"), "{stderr}");
+    let (code, value) = json(&mut check_cmd(&dir, &bin, &no_models));
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "missing-model", "{value}");
+
+    // With the model in place, the take is checked again.
+    let (bin, models) = fake_whisper(tmp.path());
+    let (code, value) = json(&mut check_cmd(&dir, &bin, &models));
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(
+        value["data"]["checks"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+}
+
 /// Takewise.app started from Finder gets `PATH=/usr/bin:/bin`: the tools
 /// are still found where Homebrew installs them, as the checks find them.
 #[test]
