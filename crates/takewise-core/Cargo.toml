@@ -9,7 +9,7 @@ license.workspace = true
 
 [dependencies]
 hound = "3.5.1"
-jiff = { version = "1.0.2", default-features = false, features = ["std", "serde"] }
+jiff = { version = "1.0.2", default-features = false, features = ["std", "serde", "tz-system", "tzdb-zoneinfo"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.1"

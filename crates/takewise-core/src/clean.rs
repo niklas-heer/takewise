@@ -35,14 +35,16 @@ pub struct CleanInfo {
 
 /// The room tone for a take recorded as `recorded` at `at`, whose pre-roll
 /// floor is `take_floor_dbfs`: the newest one recorded on the take's input
-/// device and channel on the same (UTC) day, not digital silence, whose floor
-/// lies within [`ROOM_TONE_MATCH_DB`] of the take's. `Err` says why there is
-/// none, for the manifest.
+/// device and channel on the same calendar day in `tz` (the narrator's local
+/// day, not UTC), not digital silence, whose floor lies within
+/// [`ROOM_TONE_MATCH_DB`] of the take's. `Err` says why there is none, for
+/// the manifest.
 pub fn choose_room_tone(
     tones: &[RoomTone],
     recorded: &Recorded,
     at: jiff::Timestamp,
     take_floor_dbfs: f64,
+    tz: &jiff::tz::TimeZone,
 ) -> Result<RoomTone, String> {
     if is_gated(take_floor_dbfs) {
         return Err(
@@ -50,7 +52,7 @@ pub fn choose_room_tone(
                 .to_owned(),
         );
     }
-    let day = |t: jiff::Timestamp| t.strftime("%Y-%m-%d").to_string();
+    let day = |t: jiff::Timestamp| tz.to_datetime(t).date();
     let same_input: Vec<&RoomTone> = tones
         .iter()
         .filter(|t| t.input == recorded.device && t.channel == recorded.channel)
@@ -83,7 +85,8 @@ pub fn choose_room_tone(
         })
 }
 
-/// [`choose_room_tone`] among the project's room tones.
+/// [`choose_room_tone`] among the project's room tones, by the system's
+/// local calendar day.
 pub fn find_room_tone(
     dir: &Path,
     recorded: &Recorded,
@@ -91,7 +94,13 @@ pub fn find_room_tone(
     take_floor_dbfs: f64,
 ) -> Result<RoomTone, String> {
     let tones = room_tones(dir).map_err(|err| format!("could not read the room tones: {err}"))?;
-    choose_room_tone(&tones, recorded, at, take_floor_dbfs)
+    choose_room_tone(
+        &tones,
+        recorded,
+        at,
+        take_floor_dbfs,
+        &jiff::tz::TimeZone::system(),
+    )
 }
 
 /// Cleans takes through `ffmpeg`, knowing how much `afftdn` delays them.
@@ -224,6 +233,8 @@ mod tests {
         }
     }
 
+    const UTC: jiff::tz::TimeZone = jiff::tz::TimeZone::UTC;
+
     fn at(t: &str) -> jiff::Timestamp {
         t.parse().unwrap()
     }
@@ -232,21 +243,21 @@ mod tests {
     fn mismatched_room_tone_skips_nr() {
         let tones = [tone("2026-11-23T09:00:00Z", -70.0)];
         let take_at = at("2026-11-23T10:00:00Z");
-        assert!(choose_room_tone(&tones, &recorded(), take_at, -66.0).is_ok());
+        assert!(choose_room_tone(&tones, &recorded(), take_at, -66.0, &UTC).is_ok());
         // 8 dB louder: the gain changed.
-        let why = choose_room_tone(&tones, &recorded(), take_at, -62.0).unwrap_err();
+        let why = choose_room_tone(&tones, &recorded(), take_at, -62.0, &UTC).unwrap_err();
         assert!(why.contains("more than 6 dB"), "{why}");
         // Another device, channel or day has no room tone.
         let other = Recorded {
             channel: 2,
             ..recorded()
         };
-        let why = choose_room_tone(&tones, &other, take_at, -70.0).unwrap_err();
+        let why = choose_room_tone(&tones, &other, take_at, -70.0, &UTC).unwrap_err();
         assert!(why.contains("no room tone"), "{why}");
-        let why =
-            choose_room_tone(&tones, &recorded(), at("2026-11-24T10:00:00Z"), -70.0).unwrap_err();
+        let why = choose_room_tone(&tones, &recorded(), at("2026-11-24T10:00:00Z"), -70.0, &UTC)
+            .unwrap_err();
         assert!(why.contains("no room tone"), "{why}");
-        assert!(choose_room_tone(&[], &recorded(), take_at, -70.0).is_err());
+        assert!(choose_room_tone(&[], &recorded(), take_at, -70.0, &UTC).is_err());
     }
 
     #[test]
@@ -257,13 +268,38 @@ mod tests {
             ..tone("2026-11-23T09:00:00Z", -70.0)
         };
         let take_at = at("2026-11-23T10:00:00Z");
-        let why = choose_room_tone(&[gated], &recorded(), take_at, -70.0).unwrap_err();
+        let why = choose_room_tone(&[gated], &recorded(), take_at, -70.0, &UTC).unwrap_err();
         assert!(why.contains("gated"), "{why}");
         // A take whose own pre-roll is digital silence is not reduced.
         let tones = [tone("2026-11-23T09:00:00Z", -70.0)];
-        let why = choose_room_tone(&tones, &recorded(), take_at, crate::speech::SILENCE_DBFS)
-            .unwrap_err();
+        let why = choose_room_tone(
+            &tones,
+            &recorded(),
+            take_at,
+            crate::speech::SILENCE_DBFS,
+            &UTC,
+        )
+        .unwrap_err();
         assert!(why.contains("gated"), "{why}");
+    }
+
+    #[test]
+    fn room_tone_day_is_the_local_calendar_day() {
+        let tones = [tone("2026-11-23T21:30:00Z", -70.0)];
+        let utc = jiff::tz::TimeZone::UTC;
+        let berlin = jiff::tz::TimeZone::fixed(jiff::tz::offset(1));
+        // 22:15 and 23:15 UTC: the same UTC day, but 23:15 is already the
+        // 24th in UTC+1, while the room tone was recorded on the 23rd.
+        let take_at = at("2026-11-23T23:15:00Z");
+        assert!(choose_room_tone(&tones, &recorded(), take_at, -70.0, &utc).is_ok());
+        let why = choose_room_tone(&tones, &recorded(), take_at, -70.0, &berlin).unwrap_err();
+        assert!(why.contains("on 2026-11-24"), "{why}");
+        // Late evening in UTC-8 is the next UTC day but the same local day.
+        let tones = [tone("2026-11-23T20:00:00Z", -70.0)];
+        let la = jiff::tz::TimeZone::fixed(jiff::tz::offset(-8));
+        let take_at = at("2026-11-24T06:00:00Z");
+        assert!(choose_room_tone(&tones, &recorded(), take_at, -70.0, &utc).is_err());
+        assert!(choose_room_tone(&tones, &recorded(), take_at, -70.0, &la).is_ok());
     }
 
     #[test]
@@ -276,7 +312,7 @@ mod tests {
             tone("2026-11-23T12:00:00Z", -50.0),
         ];
         let chosen =
-            choose_room_tone(&tones, &recorded(), at("2026-11-23T13:00:00Z"), -70.0).unwrap();
+            choose_room_tone(&tones, &recorded(), at("2026-11-23T13:00:00Z"), -70.0, &UTC).unwrap();
         assert_eq!(chosen.recorded_at, at("2026-11-23T11:00:00Z"));
     }
 
