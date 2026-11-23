@@ -1461,6 +1461,29 @@ fn a_take_whose_renamed_files_both_vanished_is_saved_from_memory(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+fn a_take_whose_written_audio_vanished_is_rewritten_from_memory(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0); // streamed into the partial WAV, finished on stop
+    super::recorder::commits_fail(true);
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("could not be saved"), "{shown}");
+    let wav = partial_wav(&f.dir, "a").expect("the partial WAV");
+    fs::remove_file(&wav).expect("the audio vanishes");
+
+    super::recorder::commits_fail(false);
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "saved on retry");
+    assert_eq!((takes[0].1, takes[0].2.samples), (1, 2400));
+    let (samples, _) = tw::read_take_wav(&f.dir.join("takes/a/001.wav")).expect("audio");
+    assert_eq!(samples.len(), 2400);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
+}
+
+#[gpui_kit::test]
 fn a_take_begun_late_is_rewritten_under_its_lock(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     // A file where the line's take directory belongs: the take cannot be

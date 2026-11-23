@@ -837,6 +837,13 @@ fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<Saved, String> {
         unsaved.partial = Some(partial.clone());
         partial
     };
+    // The partial WAV vanished although its metadata is there: the lock
+    // held is on the removed file, so the audio is written again from
+    // memory under a new one.
+    if !partial.wav.exists() {
+        unsaved.lock = None;
+        unsaved.complete = false;
+    }
     if !unsaved.complete {
         // Rewritten only while holding the file's lock (kept from the
         // recording, else taken now), so a repair never adopts it meanwhile.
