@@ -358,9 +358,15 @@ fn write_wav(out: &Path, pcm: &[i32], target: Target) -> Result<(), String> {
         }
     }
     writer.finalize().map_err(error)?;
-    File::open(out)
-        .and_then(|f| f.sync_all())
-        .map_err(|err| format!("could not sync {}: {err}", out.display()))
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(out)
+        .and_then(|f| {
+            crate::wav::centre_mono_file(&f)?;
+            f.sync_all()
+        })
+        .map_err(|err| format!("could not finish {}: {err}", out.display()))
 }
 
 fn work_dir() -> Result<tempfile::TempDir, String> {

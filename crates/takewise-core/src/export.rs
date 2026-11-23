@@ -2059,6 +2059,12 @@ mod tests {
             (1, 24, RATE)
         );
         assert_eq!(reader.duration() as usize, FILM_SAMPLES);
+        // One front-centre channel: plain mono, not a left channel alone.
+        let header = fs::read(dir.join("export/narration.wav")).unwrap();
+        assert_eq!(
+            crate::wav::channel_mask(&header),
+            Some(crate::wav::FRONT_CENTER)
+        );
         // Outside the placed range the export is silent.
         let audio = narration(&dir);
         assert_eq!(audio[472_799], 0);
@@ -2306,6 +2312,9 @@ mod tests {
             .unwrap()
             .spec();
         assert_eq!((spec.bits_per_sample, spec.sample_rate), (16, 48_000));
+        // 16-bit uses the plain PCM header, which carries no channel mask.
+        let header = fs::read(dir.join("export/narration.wav")).unwrap();
+        assert_eq!(&header[20..22], &1_u16.to_le_bytes());
     }
 
     #[test]
@@ -2516,14 +2525,14 @@ mod tests {
                 "-v",
                 "error",
                 "-show_entries",
-                "stream=sample_fmt",
+                "stream=sample_fmt,channel_layout",
                 "-of",
                 "csv=p=0",
             ])
             .arg(&path)
             .output();
         if let Ok(probe) = probe {
-            assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "s16");
+            assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "s16,mono");
         }
     }
 

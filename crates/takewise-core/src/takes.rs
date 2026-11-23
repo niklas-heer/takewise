@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -322,27 +321,24 @@ pub fn write_take_wav(path: &Path, samples: &[i32], sample_rate: u32) -> Result<
 
 /// Encodes mono 24-bit PCM into `file` and returns it flushed.
 pub(crate) fn encode_wav(
-    file: fs::File,
+    mut file: fs::File,
     samples: &[i32],
     sample_rate: u32,
 ) -> std::result::Result<fs::File, hound::Error> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 24,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut buffer = BufWriter::new(file);
+    use std::io::Write as _;
+    let mut wav = std::io::Cursor::new(Vec::with_capacity(64 + samples.len() * 3));
     {
-        let mut writer = hound::WavWriter::new(&mut buffer, spec)?;
+        let mut writer = hound::WavWriter::new(&mut wav, take_spec(sample_rate))?;
         for &sample in samples {
             writer.write_sample(sample.clamp(MIN_SAMPLE, FULL_SCALE))?;
         }
         writer.finalize()?;
     }
-    buffer
-        .into_inner()
-        .map_err(|err| hound::Error::IoError(err.into_error()))
+    let mut wav = wav.into_inner();
+    crate::wav::centre_mono(&mut wav);
+    file.write_all(&wav)?;
+    file.flush()?;
+    Ok(file)
 }
 
 fn take_spec(sample_rate: u32) -> hound::WavSpec {
@@ -418,7 +414,8 @@ impl PartialWav {
         hound::WavWriter::new(&mut header, take_spec(sample_rate))
             .and_then(hound::WavWriter::finalize)
             .map_err(wav_error(path))?;
-        let header = header.into_inner();
+        let mut header = header.into_inner();
+        crate::wav::centre_mono(&mut header);
         let mut this = Self {
             data_len_at: header.len() as u64 - 4,
             file,
@@ -1298,6 +1295,25 @@ mod tests {
         let lock = wav.finish().unwrap();
         assert_eq!(read_take_wav(&path).unwrap(), (samples, 48_000));
         drop(lock);
+    }
+
+    #[test]
+    fn new_takes_are_tagged_plain_mono() {
+        let tmp = crate::testutil::project_tempdir();
+        let streamed = tmp.path().join("a.wav.partial");
+        let wav = PartialWav::create(&streamed, 48_000).unwrap();
+        drop(wav.finish().unwrap());
+        let written = tmp.path().join("b.wav");
+        write_take_wav(&written, &[1000; 480], 48_000).unwrap();
+        for path in [streamed, written] {
+            let header = fs::read(&path).unwrap();
+            assert_eq!(
+                crate::wav::channel_mask(&header),
+                Some(crate::wav::FRONT_CENTER),
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]

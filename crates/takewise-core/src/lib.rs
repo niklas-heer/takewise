@@ -26,6 +26,7 @@ pub mod takes;
 #[cfg(test)]
 mod testutil;
 pub mod timing;
+pub mod wav;
 pub mod whisper;
 pub mod words;
 
