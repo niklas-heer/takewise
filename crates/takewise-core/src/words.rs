@@ -14,7 +14,8 @@
 //! dollars twenty years ago" is `5 dollars 20 years ago`), and [`align`]
 //! joins them against the amount with cents ("five dollars twenty" and
 //! "$5.20"); a sign is kept, so "-5", "minus five" and
-//! "negative five" are `-5`, never `5`. A lone whole one stays the word `one`, since
+//! "negative five" are `-5`, never `5`, and "-$5" and "minus five dollars"
+//! are `-5 dollars`. A lone whole one stays the word `one`, since
 //! it is often not a number ("every one"), and "first" and "second" are
 //! ordinals only when attached ("twenty-first"), never in "a sixty second
 //! timer". A number said over
@@ -1003,10 +1004,18 @@ fn raw_tokens(text: &str) -> (Vec<(String, Sep)>, Sep) {
             current.push(c);
             continue;
         }
-        // A minus sign starts a number: "-5", but not "10-15".
-        let sign = c == '-' && !before.is_some_and(|b| b.is_alphanumeric());
-        if (sign || matches!(c, '$' | '€' | '£')) && after.is_some_and(char::is_ascii_digit) {
-            flush(&mut current, &mut sep);
+        // A minus sign starts a number: "-5" and "-$5", but not "10-15".
+        let is_currency = |c: &char| matches!(c, '$' | '€' | '£');
+        let sign = c == '-'
+            && !before.is_some_and(|b| b.is_alphanumeric())
+            && (after.is_some_and(char::is_ascii_digit)
+                || (after.is_some_and(is_currency)
+                    && chars.get(i + 2).is_some_and(char::is_ascii_digit)));
+        if sign || (is_currency(&c) && after.is_some_and(char::is_ascii_digit)) {
+            // A currency symbol after a sign stays in its number.
+            if current != "-" {
+                flush(&mut current, &mut sep);
+            }
             current.push(c);
             continue;
         }
@@ -1826,6 +1835,35 @@ mod tests {
             ),
             []
         );
+    }
+
+    #[test]
+    fn a_negative_amount_keeps_its_sign() {
+        assert_eq!(
+            shown("-$5 and -£3.50"),
+            tokens("-5 dollars and -3.5 pounds")
+        );
+        assert_eq!(shown("minus $5"), tokens("-5 dollars"));
+        for (script, said) in [
+            ("It lost -$5", "It lost minus five dollars"),
+            ("It lost -$5", "It lost minus $5"),
+            ("It costs -$5.20", "It costs minus five dollars twenty"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        let diffs = align(&normalize("It lost -$5"), &heard("It lost $5"));
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(diffs[0].expected.as_deref(), Some("-$5"));
+        assert_ne!(align(&normalize("It lost $5"), &heard("It lost -$5")), []);
     }
 
     #[test]
