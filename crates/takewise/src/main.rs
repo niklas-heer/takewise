@@ -35,6 +35,11 @@ fn opened_as_app(args: &[OsString], env: impl Fn(&str) -> Option<OsString>) -> b
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Development only: the README's screenshots (scripts/screenshots).
+    #[cfg(feature = "screenshots")]
+    if args.first().is_some_and(|arg| arg == "screenshots") {
+        return window::screenshots::main(&args[1..]);
+    }
     if opened_as_app(&args, |name| std::env::var_os(name)) {
         window::run_start();
         return ExitCode::SUCCESS;

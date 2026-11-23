@@ -19,6 +19,8 @@ mod model;
 mod panel;
 mod prompter;
 mod recorder;
+#[cfg(feature = "screenshots")]
+pub mod screenshots;
 mod setup;
 mod start;
 mod takes;

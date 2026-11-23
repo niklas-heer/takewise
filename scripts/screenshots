@@ -1,0 +1,43 @@
+#!/bin/bash
+# Regenerate the README's screenshots in docs/images (mise run screenshots).
+#
+# The demo film is cut from NASA's public-domain "Earth Views from the
+# International Space Station" (images.nasa.gov), downloaded once into
+# build/screenshots (ignored, never committed) and checked against its
+# SHA-256. `takewise screenshots` (cargo feature `screenshots`) then builds a
+# demo project with its own script, speaks the takes with macOS `say`,
+# checks them with whisper-cli, and renders the recording window's states
+# offscreen with fake media: nothing plays, no microphone opens, no window
+# appears. Needs ffmpeg, whisper-cli and the speech model
+# (`takewise models install`).
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+[[ $# -eq 0 ]] || { echo "Usage: scripts/screenshots" >&2; exit 64; }
+
+work="$root/build/screenshots"
+source_url="https://images-assets.nasa.gov/video/Earth%20Views%20from%20the%20International%20Space%20Station/Earth%20Views%20from%20the%20International%20Space%20Station~large.mp4"
+source_sha256="94e7a18cc6b6ceb1db167e895caf525b818e46a493f7154e60bcf9e8a284a443"
+source="$work/source/earth-views.mp4"
+film="$work/film.mp4"
+
+mkdir -p "$work/source"
+if [[ ! -f "$source" ]] || ! echo "$source_sha256  $source" | shasum -a 256 -c --status; then
+  echo "Downloading the demo footage from images.nasa.gov (120 MB)…"
+  curl -fL --retry 3 -o "$source.part" "$source_url"
+  echo "$source_sha256  $source.part" | shasum -a 256 -c --status \
+    || { echo "error: the downloaded footage does not match its SHA-256" >&2; exit 1; }
+  mv "$source.part" "$source"
+  rm -f "$film"
+fi
+
+# 60 s from 0:16 (after the opening titles), with a silent audio track in
+# place of the original's sound.
+if [[ ! -f "$film" ]]; then
+  ffmpeg -v error -y -ss 16 -t 60 -i "$source" -f lavfi -t 60 -i anullsrc=r=48000:cl=stereo \
+    -map 0:v -map 1:a -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -c:a aac -shortest \
+    -movflags +faststart "$film"
+fi
+
+cargo build -p takewise --features screenshots
+"$root/target/debug/takewise" screenshots "$work" "$root/docs/images"

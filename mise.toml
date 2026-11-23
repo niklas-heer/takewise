@@ -17,6 +17,10 @@ run = "scripts/bundle"
 description = "Prepare a signed release in build/release: TAKEWISE_BUILD=N mise run release [-- --notarize] (RELEASE.md)"
 run = "scripts/release"
 
+[tasks.screenshots]
+description = "Regenerate the README's screenshots in docs/images (downloads the NASA demo footage once)"
+run = "scripts/screenshots"
+
 [tasks.test]
 description = "Run all tests"
 run = "cargo test --workspace"
@@ -26,6 +30,7 @@ description = "Format check, Clippy and tests"
 run = [
   "cargo fmt --all -- --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy -p takewise --features screenshots -- -D warnings",
   "cargo test --workspace",
 ]
 

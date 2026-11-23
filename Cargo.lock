@@ -7294,9 +7294,12 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "color_quant",
  "gpui-kit",
+ "image",
  "jiff",
  "notify",
+ "png 0.18.1",
  "predicates",
  "serde",
  "serde_json",
