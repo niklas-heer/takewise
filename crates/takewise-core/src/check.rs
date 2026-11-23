@@ -24,6 +24,10 @@ use crate::words::{align, normalize};
 pub const OVERRUN_TOLERANCE_S: f64 = 0.25;
 /// Speech may start this long before the line before it is an early start.
 pub const EARLY_START_TOLERANCE_S: f64 = 0.3;
+/// An energy speech start at most this long before the first transcribed
+/// word is that word's onset (DTW places words 0.08 to 0.20 s late); an
+/// earlier one is a breath before the words.
+pub const ONSET_LEAD_S: f64 = 0.25;
 /// A reason names at most this many words, then says how many more.
 const NAMED_WORDS: usize = 6;
 
@@ -39,8 +43,9 @@ pub enum Transcript {
 /// Applies the verdict rules. `line_offset_s` is the film time of the take's
 /// first sample minus the line's start (from the `recorded` event), so a time
 /// `t` in the take is `line_offset_s + t` in line time. Early start is
-/// measured from the first transcribed word when there is one, otherwise from
-/// the energy speech start; overrun always from the energy speech end.
+/// measured from the energy speech start, unless it lies more than
+/// [`ONSET_LEAD_S`] before the first transcribed word (a breath before the
+/// words), then from that word; overrun always from the energy speech end.
 /// `speech` and the transcript's times stay in seconds from the take's first
 /// sample; `overrun_s` is signed (negative when speech ends inside the slot).
 pub fn build_checked(
@@ -62,9 +67,13 @@ pub fn build_checked(
     let first_word = heard
         .as_deref()
         .and_then(|words| words.iter().map(|w| w.start).min_by(f64::total_cmp));
-    let early_s = first_word
-        .or(analysis.speech.map(|(start, _)| start))
-        .map(|start| -(line_offset_s + start));
+    let energy_start = analysis.speech.map(|(start, _)| start);
+    let onset = match (energy_start, first_word) {
+        (Some(energy), Some(word)) if word - energy > ONSET_LEAD_S => Some(word),
+        (Some(energy), _) => Some(energy),
+        (None, word) => word,
+    };
+    let early_s = onset.map(|start| -(line_offset_s + start));
 
     let mut reasons = Vec::new();
     let mut verdict = None;
@@ -331,6 +340,21 @@ mod tests {
         let checked = check(&analysis, &words_from(LINE, 0.6));
         assert_eq!(checked.verdict, Verdict::Retake);
         assert_eq!(codes(&checked), ["early-start"]);
+    }
+
+    #[test]
+    fn rule_early_start_from_energy_just_before_first_word() {
+        // DTW puts a word 0.08 to 0.20 s after its real onset: the energy
+        // start 0.5 s early with the first word 0.22 s after it (0.28 s
+        // early, within the tolerance on its own) is the real start.
+        let analysis = Analysis {
+            speech: Some((0.5, 3.5)),
+            ..analysis()
+        };
+        let checked = check(&analysis, &words_from(LINE, 0.72));
+        assert_eq!(checked.verdict, Verdict::Retake, "{:?}", checked.reasons);
+        assert_eq!(codes(&checked), ["early-start"]);
+        assert!(checked.reasons[0].message.contains("0.50 s"));
     }
 
     #[test]
