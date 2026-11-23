@@ -25,6 +25,10 @@ const FIRST_BUFFER_TIMEOUT_S: f64 = 2.0;
 /// How long the film plays muted after opening, so a cold output device does
 /// not shift the first take.
 pub const WARMUP_S: f64 = 0.3;
+
+/// The count-in's first digit.
+const COUNT_IN: u32 = 3;
+
 /// How long a take may take to load before play in context gives up.
 const TAKE_LOAD_TIMEOUT_S: f64 = 3.0;
 /// The meter forgets a level this long after the last buffer.
@@ -328,14 +332,15 @@ impl Recorder {
         }
     }
 
-    /// Whole seconds left before the line starts, during the count-in.
+    /// Whole seconds left before the line starts, during the count-in: its
+    /// last three seconds, so a longer pre-roll still counts 3-2-1.
     pub fn count_in(&self, media: &dyn Media) -> Option<u32> {
         let Phase::Recording(take) = &self.phase else {
             return None;
         };
         let left = take.line_start_host_s? - media.host_now_s();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        (left > 0.0).then(|| left.ceil() as u32)
+        (left > 0.0 && left <= f64::from(COUNT_IN)).then(|| left.ceil() as u32)
     }
 
     /// Keeps the meter's capture running on `input` while idle; stops it

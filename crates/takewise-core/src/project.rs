@@ -227,7 +227,8 @@ pub struct RecordConfig {
 impl Default for RecordConfig {
     fn default() -> Self {
         Self {
-            preroll_s: 2.0,
+            // A second for each digit of the 3-2-1 count-in.
+            preroll_s: 3.0,
             tail_s: 1.5,
             film_gain_db: -12.0,
         }
@@ -419,7 +420,7 @@ mod tests {
         assert_eq!(opened.config.film_info, info());
         assert_eq!(opened.config.input.channel, 1);
         assert_eq!(opened.config.input.latency_offset_ms, 0);
-        assert!((opened.config.record.preroll_s - 2.0).abs() < f64::EPSILON);
+        assert!((opened.config.record.preroll_s - 3.0).abs() < f64::EPSILON);
         assert!((opened.config.record.tail_s - 1.5).abs() < f64::EPSILON);
         assert!((opened.config.record.film_gain_db + 12.0).abs() < f64::EPSILON);
         assert_eq!(opened.config.check.language, "en");

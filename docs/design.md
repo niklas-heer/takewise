@@ -81,7 +81,7 @@ channel = 1                                 # 1-based input channel, recorded as
 latency_offset_ms = 0                       # manual correction from the loopback test
 
 [record]
-preroll_s = 2.0
+preroll_s = 3.0                             # 3-2-1, a second for each digit
 tail_s = 1.5
 film_gain_db = -12.0                        # film audio level in the headphones while recording
 
@@ -151,7 +151,7 @@ The clock mapping is the spike's job to prove. The model: capture buffers carry 
 ```
 
 - The current line is large; the next line is dimmed below it. A bar shows the slot running out, and the words fill from left to right at an even pace across the slot (karaoke-style pace guide, by character count; Niklas's original idea, kept because it is small). A level meter shows the input.
-- **Record (Space):** the film starts `preroll_s` before the line's start; a 3-2-1 count-in shows on screen; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is monitored only when the narrator has turned monitoring on.
+- **Record (Space):** the film starts `preroll_s` (3 s by default, a second for each digit) before the line's start; a 3-2-1 count-in shows on screen over the pre-roll's last three seconds, each digit the whole seconds left before the line; recording runs until Space again or `tail_s` after the slot ends. Film audio plays at `film_gain_db` in the headphones; the mic is monitored only when the narrator has turned monitoring on.
 - **After the take:** the verdict shows next to the take as soon as the checks finish, until then "checking…", with the reason that explains it below. Checks run one at a time on a worker thread, after every commit and whenever a reload finds takes without a check against their line as it is now (an edited text or a moved slot). When whisper-cli cannot be set up, takes still get their sound and timing checks, with `listen` and the reason. The top-ranked take gets a hollow star (proposed) once its check is in and only when its verdict is `keep` or `listen`: a proposed `retake`, or a take still being checked, has none, while `status --json` still names it as `proposed`. A chosen take gets a filled star, whatever its verdict.
 - **Enter** chooses the selected take, **R** records another, **P** plays the line in context (pre-roll, take, tail) with the selected take locked to the film, **↑/↓** move between lines and **←/→** between takes.
 - **M** sets the current line's start to the playhead while the film plays, clamped between the previous line's start and the line's own slot end. **E** edits the line's text in place; the draft belongs to the line and the `script.toml` version it was begun on, so a script changed meanwhile refuses it, and a line removed meanwhile is never replaced by another. Both write `script.toml` as described above.

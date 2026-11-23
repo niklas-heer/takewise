@@ -350,8 +350,23 @@ fn project(device: &str) -> (tempfile::TempDir, PathBuf) {
     let config = dir.join("project.toml");
     let text = fs::read_to_string(&config).expect("project.toml");
     let text = text.replacen("[input]\n", &format!("[input]\ndevice = {device:?}\n"), 1);
+    // The take timings below were written for a 2 s pre-roll, which
+    // projects made before 0.1.2 keep.
+    let text = text.replacen("preroll_s = 3.0\n", "preroll_s = 2.0\n", 1);
     fs::write(&config, text).expect("project.toml");
     (tmp, dir)
+}
+
+/// Sets `[record] preroll_s` of the project in `dir`.
+fn set_preroll(dir: &Path, preroll_s: f64) {
+    let config = dir.join("project.toml");
+    let text = fs::read_to_string(&config).expect("project.toml");
+    let text = text.replacen(
+        "preroll_s = 2.0\n",
+        &format!("preroll_s = {preroll_s:?}\n"),
+        1,
+    );
+    fs::write(&config, text).expect("project.toml");
 }
 
 fn open(cx: &mut TestAppContext, inputs: &[(&str, u32)]) -> Fixture {
@@ -1123,6 +1138,59 @@ fn the_film_starts_once_capture_delivers(cx: &mut TestAppContext) {
         close(film_s, 6.0) && close(host_s, 100.6),
         "{film_s} {host_s}"
     );
+}
+
+#[gpui_kit::test]
+fn the_default_count_in_gives_each_digit_a_second(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| set_preroll(dir, 3.0));
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0, pre-roll from 5.0
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.25, 2400);
+    settle(cx, &f);
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 5.0) && close(host_s, 100.6),
+        "{film_s} {host_s}"
+    );
+    // The line starts at host 103.6; the digit counts the seconds left.
+    let count_at = |cx: &mut TestAppContext, now: f64| {
+        f.media.set_now(now);
+        f.view
+            .read_with(cx, |view, _| view.recorder.count_in(&*view.media))
+    };
+    assert_eq!(count_at(cx, 100.4), None, "before the film starts");
+    assert_eq!(count_at(cx, 100.65), Some(3));
+    assert_eq!(count_at(cx, 101.55), Some(3));
+    assert_eq!(count_at(cx, 101.65), Some(2));
+    assert_eq!(count_at(cx, 102.55), Some(2));
+    assert_eq!(count_at(cx, 102.65), Some(1));
+    assert_eq!(count_at(cx, 103.55), Some(1));
+    assert_eq!(count_at(cx, 103.65), None, "the line has started");
+}
+
+#[gpui_kit::test]
+fn a_longer_pre_roll_still_counts_from_three(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| set_preroll(dir, 5.0));
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0, pre-roll from 3.0
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.25, 2400);
+    settle(cx, &f);
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    // The line starts at host 105.6.
+    let count_at = |cx: &mut TestAppContext, now: f64| {
+        f.media.set_now(now);
+        f.view
+            .read_with(cx, |view, _| view.recorder.count_in(&*view.media))
+    };
+    assert_eq!(count_at(cx, 101.0), None);
+    assert_eq!(count_at(cx, 102.55), None);
+    assert_eq!(count_at(cx, 102.65), Some(3));
+    assert_eq!(count_at(cx, 104.65), Some(1));
 }
 
 #[gpui_kit::test]
