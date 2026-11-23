@@ -35,7 +35,7 @@ use takewise_core::{
     Unavailable, Unchecked, WhisperCli, check_input, clamp_mark, plan_take,
 };
 
-use checks::{Checks, SharedTranscriber};
+use checks::{Checker, Checks};
 pub use clock::FilmClock;
 pub use media::{Media, RealMedia};
 use recorder::Recorder;
@@ -120,16 +120,23 @@ fn load(dir: &Path) -> Result<Loaded, tw::Error> {
     })
 }
 
-/// whisper-cli with the project's model, or, when it cannot be set up, a
-/// stand-in that leaves every take's words unchecked with the reason.
-fn transcriber(project: &Project) -> SharedTranscriber {
+/// whisper-cli with the project's model and the tools it runs, or, when it
+/// cannot be set up, a stand-in that leaves every take's words unchecked
+/// with the reason.
+fn checker(project: &Project) -> Checker {
     let config = &project.config.check;
     match WhisperCli::discover(config) {
-        Ok(whisper) => Arc::new(whisper),
-        Err(err) => Arc::new(Unavailable {
-            reason: err.to_string(),
-            model: config.whisper_model.clone(),
-        }),
+        Ok(whisper) => Checker {
+            tools: vec![whisper.whisper.clone(), whisper.ffmpeg.clone()],
+            transcriber: Arc::new(whisper),
+        },
+        Err(err) => Checker {
+            transcriber: Arc::new(Unavailable {
+                reason: err.to_string(),
+                model: config.whisper_model.clone(),
+            }),
+            tools: Vec::new(),
+        },
     }
 }
 
@@ -163,7 +170,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
             }
         };
         let watcher = Watcher::new(&dir).ok();
-        let transcriber = transcriber(&loaded.project);
+        let checker = checker(&loaded.project);
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -175,15 +182,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         };
         let opened = gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                RecordingWindow::new(
-                    dir,
-                    loaded,
-                    Box::new(media),
-                    watcher,
-                    transcriber,
-                    window,
-                    cx,
-                )
+                RecordingWindow::new(dir, loaded, Box::new(media), watcher, checker, window, cx)
             })
         });
         if let Err(err) = opened {
@@ -234,7 +233,7 @@ impl RecordingWindow {
         loaded: Loaded,
         media: Box<dyn Media>,
         watcher: Option<Watcher>,
-        transcriber: SharedTranscriber,
+        checker: Checker,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -250,7 +249,7 @@ impl RecordingWindow {
             view.shutdown();
             async {}
         });
-        let checks = Checks::new(dir.clone(), transcriber);
+        let checks = Checks::new(dir.clone(), checker);
         let loaded_unchecked = loaded.unchecked;
         let mut view = Self {
             dir,
@@ -303,7 +302,8 @@ impl RecordingWindow {
     }
 
     /// Ends whatever runs: commits a take in progress (if it has audio),
-    /// stops playback and the meter.
+    /// stops playback and the meter, and cancels the checks (their tools are
+    /// killed; the takes are checked when the window opens again).
     fn shutdown(&mut self) {
         if self.recorder.is_recording() {
             self.finish_take();
@@ -314,6 +314,7 @@ impl RecordingWindow {
         }
         self.recorder.stop_playback(&mut *self.media);
         self.recorder.keep_meter(&mut *self.media, None);
+        self.checks.cancel();
     }
 
     fn line_id(&self) -> Option<&str> {

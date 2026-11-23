@@ -2,18 +2,42 @@
 //! (whisper-cli takes seconds per take) and reports back, and the window
 //! shows "checking…" for a take until its check is in the ledger.
 //!
-//! Checks never compete with recording: while a take records the worker is
-//! paused, so a check already running finishes but the next one waits until
-//! the take is committed.
+//! Checks never compete with recording: while a take records the worker
+//! holds its next check, and the tools of a check already running
+//! (whisper-cli, ffmpeg) are stopped (SIGSTOP) and continued once the take
+//! is committed. Quitting kills them, so none outlives the window and their
+//! temporary files are removed; the cancelled check records nothing.
+//!
+//! The tools are this process's direct children whose arguments name them
+//! (`pkill -P … -f`): the transcriber in `takewise-core` starts them, and
+//! nothing else in the recording window runs them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-use takewise_core::{self as tw, Project, Snapshot, TakeRef, Transcriber};
+use takewise_core::{self as tw, Project, Snapshot, TakeRef, Transcriber, Transcript};
+
+/// How often the tools are stopped again while a take records, so one
+/// started meanwhile (whisper-cli after ffmpeg) is stopped too.
+const STOP_POLL: Duration = Duration::from_millis(200);
+/// How often the tools are killed again while a cancelled check ends.
+const KILL_POLL: Duration = Duration::from_millis(20);
+/// How long quitting waits for a cancelled check to clean up.
+const CANCEL_WAIT: Duration = Duration::from_secs(2);
 
 /// A transcriber the worker thread can own.
 pub type SharedTranscriber = Arc<dyn Transcriber + Send + Sync>;
+
+/// What checks the takes: the transcriber, and the executables it runs as
+/// child processes of this one (stopped while a take records, killed on
+/// quit).
+pub struct Checker {
+    pub transcriber: SharedTranscriber,
+    pub tools: Vec<PathBuf>,
+}
 
 /// A finished check: its verdict, or why the take could not be checked.
 pub struct Done {
@@ -24,35 +48,174 @@ pub struct Done {
     pub result: Result<tw::Verdict, String>,
 }
 
-/// Holds the worker back from its next check while closed.
 #[derive(Default)]
-struct Gate {
-    paused: Mutex<bool>,
-    opened: Condvar,
+struct Flags {
+    /// A take records: no check starts, and running tools are stopped.
+    paused: bool,
+    /// The window quits: no check starts, and running tools are killed.
+    cancelled: bool,
+    /// While the transcriber runs (and with it maybe its tools): whether
+    /// the checks were paused meanwhile.
+    transcribing: Option<Paused>,
 }
 
-impl Gate {
-    fn set(&self, paused: bool) {
-        *self.paused.lock().unwrap_or_else(PoisonError::into_inner) = paused;
-        if !paused {
-            self.opened.notify_all();
+#[derive(Clone, Copy, Default)]
+struct Paused(bool);
+
+/// What the window, the worker and the tools' signaller share.
+#[derive(Default)]
+struct Control {
+    flags: Mutex<Flags>,
+    changed: Condvar,
+}
+
+impl Control {
+    fn lock(&self) -> MutexGuard<'_, Flags> {
+        self.flags.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn update(&self, f: impl FnOnce(&mut Flags)) {
+        f(&mut self.lock());
+        self.changed.notify_all();
+    }
+
+    /// Waits while paused; the flags once the checks may go on or were
+    /// cancelled.
+    fn wait_open(&self) -> MutexGuard<'_, Flags> {
+        self.changed
+            .wait_while(self.lock(), |f| f.paused && !f.cancelled)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The transcriber as the worker runs it: it starts only while the checks
+/// may go on, transcribes again when a transcription failed while paused (a
+/// stopped tool can outlast its timeout), and never returns once cancelled,
+/// so the check records nothing.
+struct Held {
+    inner: SharedTranscriber,
+    control: Arc<Control>,
+}
+
+impl Transcriber for Held {
+    fn transcribe(&self, wav: &Path) -> Transcript {
+        loop {
+            {
+                let mut flags = self.control.wait_open();
+                if flags.cancelled {
+                    drop(flags);
+                    abandon();
+                }
+                flags.transcribing = Some(Paused(false));
+            }
+            let transcript = self.inner.transcribe(wav);
+            let (cancelled, Paused(paused_during)) = {
+                let mut flags = self.control.lock();
+                let paused = flags.transcribing.take().unwrap_or_default();
+                (flags.cancelled, paused)
+            };
+            self.control.changed.notify_all();
+            if cancelled {
+                abandon();
+            }
+            match transcript {
+                Transcript::Failed(_) if paused_during => {}
+                transcript => return transcript,
+            }
         }
     }
 
-    fn wait_open(&self) {
-        let paused = self.paused.lock().unwrap_or_else(PoisonError::into_inner);
-        drop(
-            self.opened
-                .wait_while(paused, |paused| *paused)
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+    fn model(&self) -> String {
+        self.inner.model()
     }
+}
+
+/// Parks the worker for good: its check was cancelled, and returning would
+/// record it.
+fn abandon() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Stops the tools while paused, continues them after, and kills them once
+/// cancelled; returns when cancelled and no transcription runs.
+fn signal_tools(control: &Control, tools: &[PathBuf]) {
+    let mut stopped = false;
+    let mut flags = control.lock();
+    loop {
+        if flags.cancelled {
+            if flags.transcribing.is_none() {
+                return;
+            }
+            drop(flags);
+            signal(tools, "KILL");
+            flags = control.lock();
+            flags = control
+                .changed
+                .wait_timeout(flags, KILL_POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        } else if flags.paused && flags.transcribing.is_some() {
+            flags.transcribing = Some(Paused(true));
+            drop(flags);
+            signal(tools, "STOP");
+            stopped = true;
+            flags = control.lock();
+            flags = control
+                .changed
+                .wait_timeout(flags, STOP_POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        } else if stopped && !flags.paused {
+            drop(flags);
+            signal(tools, "CONT");
+            stopped = false;
+            flags = control.lock();
+        } else {
+            flags = control
+                .changed
+                .wait(flags)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Sends `signal` (such as `STOP`) to this process's direct children whose
+/// arguments name one of `tools` (also while `nice` still starts one).
+fn signal(tools: &[PathBuf], signal: &str) {
+    let pattern: Vec<String> = tools
+        .iter()
+        .map(|tool| escape_regex(&tool.to_string_lossy()))
+        .collect();
+    let _ = Command::new("/usr/bin/pkill")
+        .arg(format!("-{signal}"))
+        .args(["-P", &std::process::id().to_string(), "-f"])
+        .arg(pattern.join("|"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// `text` as an extended regular expression matching it literally.
+fn escape_regex(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\.^$|?*+()[]{}".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 pub struct Checks {
     /// `None` when the worker could not be started.
     jobs: Option<Sender<TakeRef>>,
-    gate: Arc<Gate>,
+    control: Arc<Control>,
+    /// Whether a signaller stops and kills the tools.
+    signalled: bool,
     done: Receiver<Done>,
     /// Queued or running, each take once.
     pending: Vec<TakeRef>,
@@ -62,25 +225,31 @@ pub struct Checks {
 }
 
 impl Checks {
-    /// Starts the worker; it ends once the `Checks` is dropped and its
-    /// current check is done.
-    pub fn new(dir: PathBuf, transcriber: SharedTranscriber) -> Self {
+    /// Starts the worker; it ends once the `Checks` is dropped, abandoning
+    /// a check in progress.
+    pub fn new(dir: PathBuf, checker: Checker) -> Self {
+        let Checker { transcriber, tools } = checker;
         let (jobs_tx, jobs_rx) = channel::<TakeRef>();
         let (done_tx, done_rx) = channel();
-        let gate = Arc::new(Gate::default());
-        let worker_gate = Arc::clone(&gate);
+        let control = Arc::new(Control::default());
+        let held = Held {
+            inner: transcriber,
+            control: Arc::clone(&control),
+        };
+        let worker_control = Arc::clone(&control);
         let worker = std::thread::Builder::new()
             .name("takewise-checks".to_owned())
             .spawn(move || {
                 for take in jobs_rx {
-                    worker_gate.wait_open();
+                    if worker_control.wait_open().cancelled {
+                        break;
+                    }
                     let dequeued = Project::open(&dir)
                         .ok()
                         .and_then(|project| project.snapshot(&take.line));
-                    let checked =
-                        tw::check_take(&dir, &take, &*transcriber, env!("CARGO_PKG_VERSION"));
-                    let (snapshot, result) = match checked {
-                        Ok(checked) => (Some(checked.snapshot), Ok(checked.verdict)),
+                    let outcome = tw::check_take(&dir, &take, &held, env!("CARGO_PKG_VERSION"));
+                    let (snapshot, result) = match outcome {
+                        Ok(done) => (Some(done.snapshot), Ok(done.verdict)),
                         Err(err) => (dequeued, Err(err.to_string())),
                     };
                     let done = Done {
@@ -93,19 +262,48 @@ impl Checks {
                     }
                 }
             });
+        let signaller_control = Arc::clone(&control);
+        let signalled = !tools.is_empty()
+            && std::thread::Builder::new()
+                .name("takewise-check-tools".to_owned())
+                .spawn(move || signal_tools(&signaller_control, &tools))
+                .is_ok();
         Self {
             jobs: worker.is_ok().then_some(jobs_tx),
-            gate,
+            control,
+            signalled,
             done: done_rx,
             pending: Vec::new(),
             tried: Vec::new(),
         }
     }
 
-    /// Pauses the worker before its next check (a running one finishes),
-    /// or lets it go on.
+    /// Pauses the checks (the next one waits, a running one's tools are
+    /// stopped), or lets them go on.
     pub fn set_paused(&self, paused: bool) {
-        self.gate.set(paused);
+        self.control.update(|flags| {
+            if let Some(during) = flags.transcribing.as_mut().filter(|_| paused) {
+                *during = Paused(true);
+            }
+            flags.paused = paused;
+        });
+    }
+
+    /// Cancels the checks as the window quits: none starts, a running one
+    /// records nothing and its tools are killed; waits briefly until they
+    /// are gone and have removed their temporary files.
+    pub fn cancel(&self) {
+        self.control.update(|flags| flags.cancelled = true);
+        if self.signalled {
+            drop(
+                self.control
+                    .changed
+                    .wait_timeout_while(self.control.lock(), CANCEL_WAIT, |f| {
+                        f.transcribing.is_some()
+                    })
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
     }
 
     /// Queues a check of `take`, whose line `snapshot` has now, unless it
@@ -157,8 +355,9 @@ impl Checks {
 }
 
 impl Drop for Checks {
-    /// Lets a paused worker go on, so it ends with the window.
+    /// Cancels the checks, so the worker and the signaller end with the
+    /// window.
     fn drop(&mut self) {
-        self.gate.set(false);
+        self.control.update(|flags| flags.cancelled = true);
     }
 }
