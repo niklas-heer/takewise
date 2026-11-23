@@ -214,7 +214,7 @@ H and the monitor volume keys (`,` and `.`) belong to monitoring, which isn't av
 
 ## Status
 
-0.1.2 is an early release. The check thresholds were tuned on eight lines of real narration recorded, outside Takewise, for an earlier film, and the clean export was measured on them (−16.0 LUFS, −1.5 dBTP). Automated tests use synthetic speech and simulated devices; a full session recorded in Takewise on a real interface is still to come. Not yet:
+0.1.3 is an early release. The check thresholds were tuned on eight lines of real narration recorded, outside Takewise, for an earlier film, and the clean export was measured on them (−16.0 LUFS, −1.5 dBTP). Since then, two full sessions were recorded in Takewise on a RØDECaster Duo, the voiceovers of two promo films: Focal's (7 lines, 15 takes, on 0.1.1) and Takewise's own (8 lines, 21 takes, on 0.1.2). Both projects name a Bluetooth headset as the output, the setup this README advises against, so a session with wired headphones is still to come. Both clean exports came out slightly short of −16 LUFS (−16.6 and −16.7, at −1.5 dBTP), as the export warned. The Focal session also showed that the count-in couldn't be read over a light film; 0.1.3 puts its digit on a dark plate. Automated tests use synthetic speech and simulated devices. Not yet:
 
 - **Hearing your own voice through Takewise.** Use your interface's direct (hardware) monitoring.
 - **Writing the script inside the app.** In the window, E edits a line's text and M its start; new lines go into `script.toml`.
