@@ -136,6 +136,22 @@ enum Command {
     /// Check whisper-cli (with a 1 s transcription), the whisper model,
     /// ffmpeg, ffprobe, the film and the audio devices.
     Doctor { dir: Option<PathBuf> },
+    /// The speech model the word checks need (not bundled, 1.5 GB).
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// Whether the model is in `$TAKEWISE_MODELS` or
+    /// `~/.local/share/takewise/models`.
+    Status,
+    /// Download the model from Hugging Face, resuming an interrupted
+    /// download, and install it once its SHA-256 matches. Progress goes to
+    /// stderr.
+    Install,
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,6 +214,8 @@ pub enum CliError {
     Setup(String),
     /// Transcription cannot be set up: whisper-cli, ffmpeg or the model.
     Whisper(tw::SetupError),
+    /// The model could not be installed.
+    Model(tw::models::InstallError),
 }
 
 impl CliError {
@@ -206,6 +224,7 @@ impl CliError {
             CliError::Core(err) => err.code(),
             CliError::Setup(_) => "setup",
             CliError::Whisper(err) => err.code(),
+            CliError::Model(err) => err.code(),
         }
     }
 }
@@ -216,6 +235,7 @@ impl fmt::Display for CliError {
             CliError::Core(err) => err.fmt(f),
             CliError::Setup(message) => f.write_str(message),
             CliError::Whisper(err) => err.fmt(f),
+            CliError::Model(err) => err.fmt(f),
         }
     }
 }
@@ -321,7 +341,95 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
         }
         Command::Export(args) => export(&args),
         Command::Doctor { dir } => Ok(doctor(dir.as_deref())),
+        Command::Models { command } => match command {
+            ModelsCommand::Status => Ok(models_status()),
+            ModelsCommand::Install => models_install(),
+        },
     }
+}
+
+/// The model Takewise downloads: `[check] whisper_model`'s default.
+fn pinned_model() -> tw::models::ModelSpec {
+    tw::models::PINNED.spec()
+}
+
+/// "1.5 GB".
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+fn models_status() -> Outcome {
+    use tw::models::ModelState;
+    let status = tw::models::status(&tw::whisper::models_dir(), &pinned_model());
+    let path = status.path.display();
+    let size = gigabytes(status.model.size);
+    let text = match status.state {
+        ModelState::Installed => format!("Installed: {path}"),
+        ModelState::Missing => {
+            format!("Missing: {path}\nInstall it with `takewise models install` ({size}).")
+        }
+        ModelState::Partial { bytes } => format!(
+            "Partly downloaded ({} of {size}): {path}\nResume with `takewise models install`.",
+            gigabytes(bytes)
+        ),
+        ModelState::WrongSize { bytes } => format!(
+            "{path} is {bytes} bytes, not the {} of {}; move it away and run `takewise models install`.",
+            status.model.size, status.model.file
+        ),
+    };
+    Outcome::new(&status, text)
+}
+
+fn models_install() -> Result<Outcome, CliError> {
+    use std::io::{IsTerminal as _, Write as _};
+    use tw::models::Installed;
+    let dir = tw::whisper::models_dir();
+    let spec = pinned_model();
+    let tty = std::io::stderr().is_terminal();
+    let mut shown = None;
+    let result = tw::models::install(&dir, &spec, &tw::models::Download::default(), |p| {
+        // Whole percents on a terminal, every 5 % otherwise (agents, logs).
+        let step = if tty { 1 } else { 5 };
+        let mark = (
+            p.bytes.saturating_mul(100) / p.total.max(1) / step,
+            p.verifying,
+        );
+        if shown != Some(mark) {
+            shown = Some(mark);
+            let line = if p.verifying {
+                format!("Verifying {}…", spec.file)
+            } else {
+                format!(
+                    "Downloading {}: {} of {} ({:.0} %)",
+                    spec.file,
+                    gigabytes(p.bytes),
+                    gigabytes(p.total),
+                    p.percent()
+                )
+            };
+            let mut err = std::io::stderr().lock();
+            let _ = if tty {
+                write!(err, "\r\x1b[2K{line}")
+            } else {
+                writeln!(err, "{line}")
+            };
+            let _ = err.flush();
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    if tty && shown.is_some() {
+        eprintln!();
+    }
+    let installed = result.map_err(CliError::Model)?;
+    let path = tw::models::model_path(&dir, &spec);
+    let text = match installed {
+        Installed::Downloaded => format!("Installed {}", path.display()),
+        Installed::AlreadyInstalled => format!("Already installed: {}", path.display()),
+    };
+    Ok(Outcome::new(
+        json!({ "result": installed, "path": path, "model": spec }),
+        text,
+    ))
 }
 
 fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
@@ -1207,6 +1315,61 @@ fn audio_devices(project: Option<&Project>) -> AudioReport {
     report
 }
 
+/// Whether the configured model is there, and how to install it if not.
+fn model_check(model: &str) -> Check {
+    use tw::models::ModelState;
+    let dir = tw::whisper::models_dir();
+    let model_path = dir.join(model);
+    let Some(spec) = tw::models::pinned(model) else {
+        return Check {
+            name: "whisper-model",
+            ok: model_path.is_file(),
+            detail: if model_path.is_file() {
+                model_path.display().to_string()
+            } else {
+                format!(
+                    "{} is missing; download {model} there",
+                    model_path.display()
+                )
+            },
+        };
+    };
+    let size = gigabytes(spec.size);
+    let (ok, detail) = match tw::models::status(&dir, &spec).state {
+        ModelState::Installed => (true, model_path.display().to_string()),
+        ModelState::Missing => (
+            false,
+            format!(
+                "{} is missing; install it with `takewise models install` ({size})",
+                model_path.display()
+            ),
+        ),
+        ModelState::Partial { bytes } => (
+            false,
+            format!(
+                "{} is partly downloaded ({} of {size}); resume with `takewise models install`",
+                model_path.display(),
+                gigabytes(bytes)
+            ),
+        ),
+        // Another file of that name may still be a model whisper-cli
+        // reads; the transcription check below tells.
+        ModelState::WrongSize { bytes } => (
+            true,
+            format!(
+                "{} ({bytes} bytes, not the {} Takewise installs)",
+                model_path.display(),
+                spec.size
+            ),
+        ),
+    };
+    Check {
+        name: "whisper-model",
+        ok,
+        detail,
+    }
+}
+
 /// Transcribes one second of silence, to prove whisper-cli, ffmpeg and
 /// the model work together.
 fn transcription_check(config: &CheckConfig) -> Check {
@@ -1252,20 +1415,7 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         Some(Ok(project)) => project.config.check.clone(),
         _ => CheckConfig::default(),
     };
-    let model = config.whisper_model.clone();
-    let model_path = tw::whisper::models_dir().join(&model);
-    checks.push(Check {
-        name: "whisper-model",
-        ok: model_path.is_file(),
-        detail: if model_path.is_file() {
-            model_path.display().to_string()
-        } else {
-            format!(
-                "{} is missing; download {model} there",
-                model_path.display()
-            )
-        },
-    });
+    checks.push(model_check(&config.whisper_model));
     checks.push(tool_check("ffmpeg", "brew install ffmpeg"));
     checks.push(tool_check("ffprobe", "brew install ffmpeg"));
     if checks.iter().all(|check| check.ok) {

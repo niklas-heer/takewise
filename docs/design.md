@@ -193,6 +193,7 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | `takewise choose <dir> <line> <take> [--by …]` | Choose a take; refuses one whose file is missing (exit 1, `missing-file`). |
 | `takewise export <dir> [--use-proposed] [--format …] [--bit-depth …] [--sample-rate …] [--processing raw\|clean]` | Write `export/narration.wav` or `.flac` and `export/manifest.json`. |
 | `takewise calibrate <dir> [--write] [--output <device>]` | Run the loopback latency test; `--write` stores the offset and the device pair. |
+| `takewise models status` / `takewise models install` | Report the speech model's state (`missing`, `partial`, `installed`, `wrong-size`); download it from Hugging Face with progress on stderr, resuming a `.part` file, and install it once its pinned size and SHA-256 match (a mismatch deletes the download). |
 | `takewise doctor [<dir>]` | Check whisper-cli, the model and `ffmpeg` (transcribing 1 s of silence to prove they work together), microphone access, input devices and their sample rates, the output device. |
 
 ## Export and Resolve handoff

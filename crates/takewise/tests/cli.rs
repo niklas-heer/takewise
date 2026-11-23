@@ -838,6 +838,17 @@ fn doctor_reports_checks() {
         names.contains(&"ffprobe") && names.contains(&"whisper-model") && names.contains(&"film"),
         "{names:?}"
     );
+    let model = checks
+        .iter()
+        .find(|c| c["name"] == "whisper-model")
+        .unwrap();
+    assert!(
+        model["detail"]
+            .as_str()
+            .unwrap()
+            .contains("takewise models install"),
+        "{model}"
+    );
     let film = checks.iter().find(|c| c["name"] == "film").unwrap();
     assert_eq!(film["ok"], true, "{film}");
     // A new project has no input device chosen, so it cannot record yet.
@@ -928,4 +939,58 @@ fn missing_take_file_fails_choose_and_strict_status() {
         "{problems:?}"
     );
     assert_eq!(value["data"]["lines"][0]["takes"][0]["missing"], true);
+}
+
+#[test]
+fn models_status_and_install_find_the_model_by_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let models = tmp.path().join("models");
+    let (code, value) = json(
+        takewise()
+            .args(["models", "status"])
+            .env("TAKEWISE_MODELS", &models),
+    );
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["state"], "missing", "{value}");
+    assert_eq!(value["data"]["model"]["file"], "ggml-large-v3-turbo.bin");
+    assert_eq!(value["data"]["model"]["size"], 1_624_555_275_u64);
+
+    // A sparse file of the pinned size stands in for the model, so nothing
+    // is downloaded.
+    fs::create_dir_all(&models).unwrap();
+    fs::File::create(models.join("ggml-large-v3-turbo.bin"))
+        .unwrap()
+        .set_len(1_624_555_275)
+        .unwrap();
+    let (code, value) = json(
+        takewise()
+            .args(["models", "status"])
+            .env("TAKEWISE_MODELS", &models),
+    );
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["state"], "installed", "{value}");
+    let (code, value) = json(
+        takewise()
+            .args(["models", "install"])
+            .env("TAKEWISE_MODELS", &models),
+    );
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["result"], "already-installed", "{value}");
+}
+
+#[test]
+fn models_install_refuses_a_foreign_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("ggml-large-v3-turbo.bin"), "not a model").unwrap();
+    let (code, value) = json(
+        takewise()
+            .args(["models", "install"])
+            .env("TAKEWISE_MODELS", tmp.path()),
+    );
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "wrong-file", "{value}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("ggml-large-v3-turbo.bin")).unwrap(),
+        "not a model"
+    );
 }

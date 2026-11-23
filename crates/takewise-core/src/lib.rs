@@ -10,6 +10,7 @@ pub mod export;
 pub mod ffmpeg;
 pub mod fsutil;
 pub mod ledger;
+pub mod models;
 pub mod project;
 pub mod render;
 pub mod room;

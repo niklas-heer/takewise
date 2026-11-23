@@ -19,6 +19,7 @@ toml_edit = { version = "0.25.20", default-features = false, features = ["parse"
 toml = { version = "1.2.2", default-features = false, features = ["std", "serde", "parse", "display"] }
 
 uuid = { version = "1.29.3", features = ["v4"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 
 [features]
 # Lets tests make commits fail midway (takes::fail_commits_after_renames).
