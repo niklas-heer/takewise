@@ -38,8 +38,19 @@ pub struct Capture {
 
 impl Capture {
     /// Starts capturing `channel` (1-based) of the input device named
-    /// `device` at 48 kHz.
+    /// `device` at 48 kHz with the device's buffer size.
     pub fn start(device: &str, channel: u16, sink: Sender<CaptureBuffer>) -> Result<Self> {
+        Self::start_with(device, channel, None, sink)
+    }
+
+    /// [`Capture::start`] with a fixed buffer of `buffer_frames` frames, or
+    /// the device's buffer size for `None`.
+    pub fn start_with(
+        device: &str,
+        channel: u16,
+        buffer_frames: Option<u32>,
+        sink: Sender<CaptureBuffer>,
+    ) -> Result<Self> {
         let input = find_input(device)?;
         let supported = input
             .supported_input_configs()?
@@ -60,8 +71,12 @@ impl Capture {
         let stride = usize::from(channels);
         let error = Arc::new(Mutex::new(None));
         let error_sink = Arc::clone(&error);
+        let mut config = supported.config();
+        if let Some(frames) = buffer_frames {
+            config.buffer_size = cpal::BufferSize::Fixed(frames);
+        }
         let stream = input.build_input_stream(
-            supported.config(),
+            config,
             move |data: &[f32], info: &cpal::InputCallbackInfo| {
                 // The callback instant is the AUHAL input timestamp
                 // (mHostTime) of the first frame. cpal's `capture` instant

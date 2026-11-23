@@ -2,17 +2,21 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectPropertyScope, AudioObjectPropertySelector, kAudioDevicePropertyLatency,
+    AudioObjectPropertyScope, AudioObjectPropertySelector, AudioObjectSetPropertyData,
+    kAudioDevicePermissionsError, kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyLatency,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
     kAudioDevicePropertyStreams, kAudioDevicePropertyTransportType,
     kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
     kAudioDeviceTransportTypeBuiltIn, kAudioDeviceTransportTypeUSB,
-    kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
-    kAudioStreamPropertyLatency,
+    kAudioDeviceUnsupportedFormatError, kAudioHardwareBadDeviceError,
+    kAudioHardwareIllegalOperationError, kAudioHardwareNotRunningError,
+    kAudioHardwarePropertyTranslateUIDToDevice, kAudioHardwareUnsupportedOperationError,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioStreamPropertyLatency,
 };
 use objc2_core_foundation::CFString;
 
@@ -45,6 +49,105 @@ pub fn input_latency_s(device: &str) -> Result<f64> {
         .filter(|rate| *rate > 0.0)
         .ok_or_else(|| missing("a sample rate"))?;
     Ok(f64::from(frames) / rate)
+}
+
+/// The input buffer size of the named device in frames, as CoreAudio runs
+/// it now (the device default unless a stream asked for another).
+pub fn buffer_frames(device: &str) -> Result<u32> {
+    let missing = |what| Error::CoreAudio {
+        device: device.to_owned(),
+        what,
+    };
+    let id = device_id(&uid(&find_input(device)?)?).ok_or_else(|| missing("a device id"))?;
+    get_u32(
+        id,
+        kAudioDevicePropertyBufferFrameSize,
+        kAudioObjectPropertyScopeInput,
+    )
+    .ok_or_else(|| missing("a buffer size"))
+}
+
+/// How long [`set_nominal_sample_rate`] waits for the device to switch.
+const RATE_SWITCH_WAIT: Duration = Duration::from_secs(1);
+
+/// Sets the nominal sample rate of the input device named `device`
+/// (`kAudioDevicePropertyNominalSampleRate`), as Audio MIDI Setup does, and
+/// waits up to a second for the device to run at it. The error says in
+/// words why the device did not switch.
+pub fn set_nominal_sample_rate(device: &str, rate: u32) -> Result<()> {
+    let id = device_id(&uid(&find_input(device)?)?).ok_or_else(|| Error::CoreAudio {
+        device: device.to_owned(),
+        what: "a device id",
+    })?;
+    if nominal_rate(id) == Some(f64::from(rate)) {
+        return Ok(());
+    }
+    let addr = address(
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+    );
+    let value = f64::from(rate);
+    // SAFETY: the nominal sample rate is a Float64; `value` is one and the
+    // size says so. CoreAudio copies it during the call.
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            id,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            u32_size::<f64>(),
+            NonNull::from(&value).cast::<c_void>(),
+        )
+    };
+    if status != 0 {
+        return Err(rate_error(device, rate, status));
+    }
+    // The switch completes asynchronously.
+    let until = Instant::now() + RATE_SWITCH_WAIT;
+    while Instant::now() < until {
+        if nominal_rate(id) == Some(value) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(Error::SetRate {
+        device: device.to_owned(),
+        rate,
+        reason: "the device accepted the request but kept its rate; set it in Audio MIDI Setup"
+            .to_owned(),
+    })
+}
+
+/// The error for a CoreAudio status that refused a sample rate switch, in
+/// words, with the status code for searching.
+fn rate_error(device: &str, rate: u32, status: i32) -> Error {
+    #[allow(non_upper_case_globals)]
+    let why = match status {
+        kAudioDeviceUnsupportedFormatError => "the device does not support that rate",
+        kAudioDevicePermissionsError => "another app holds the device exclusively",
+        kAudioHardwareNotRunningError => "the audio system is not running",
+        kAudioHardwareBadDeviceError => "the device is gone",
+        kAudioHardwareIllegalOperationError | kAudioHardwareUnsupportedOperationError => {
+            "the device does not let apps change its rate"
+        }
+        _ => "CoreAudio refused the change",
+    };
+    Error::SetRate {
+        device: device.to_owned(),
+        rate,
+        reason: format!("{why} (CoreAudio status {})", four_cc(status)),
+    }
+}
+
+/// A CoreAudio status as its four-character code (`'!dat'`) when it is
+/// one, else as a number.
+fn four_cc(status: i32) -> String {
+    let bytes = status.to_be_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic()) {
+        format!("'{}'", String::from_utf8_lossy(&bytes))
+    } else {
+        status.to_string()
+    }
 }
 
 /// How a device is connected, from its CoreAudio transport type.
@@ -169,4 +272,25 @@ fn first_stream(id: AudioObjectID, scope: AudioObjectPropertyScope) -> Option<Au
 #[allow(clippy::cast_possible_truncation)]
 const fn u32_size<T>() -> u32 {
     size_of::<T>() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nominal_rate_error_is_reported() {
+        let err = rate_error("Duo", 48_000, kAudioDeviceUnsupportedFormatError).to_string();
+        assert_eq!(
+            err,
+            "\"Duo\" could not switch to 48000 Hz: the device does not support that rate (CoreAudio status '!dat')"
+        );
+        let err = rate_error("Duo", 48_000, kAudioDevicePermissionsError).to_string();
+        assert!(err.contains("another app holds the device"), "{err}");
+        let err = rate_error("Duo", 48_000, -50).to_string();
+        assert!(
+            err.ends_with("CoreAudio refused the change (CoreAudio status -50)"),
+            "{err}"
+        );
+    }
 }

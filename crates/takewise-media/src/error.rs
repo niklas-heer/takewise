@@ -23,6 +23,14 @@ pub enum Error {
     Audio(String),
     #[error("{} does not exist", .0.display())]
     MissingFile(PathBuf),
+    #[error("{device:?} could not switch to {rate} Hz: {reason}")]
+    SetRate {
+        device: String,
+        rate: u32,
+        reason: String,
+    },
+    #[error("not available yet: monitoring needs a test on your setup")]
+    MonitorUnavailable,
     #[error("players run on the main thread only")]
     NotMainThread,
     #[error("the player has not loaded its media yet")]

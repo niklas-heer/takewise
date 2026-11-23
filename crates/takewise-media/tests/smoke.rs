@@ -13,17 +13,20 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use takewise_media::{
-    Capture, DeviceInfo, FilmPlayer, Transport, default_input, default_output, host_time_now_s,
-    input_devices, input_latency_s, pump_run_loop,
+    Capture, ChannelMeter, DeviceInfo, FilmPlayer, Transport, default_input, default_output,
+    host_time_now_s, input_devices, input_latency_s, output_devices, pump_run_loop,
+    set_nominal_sample_rate,
 };
 
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 3] = [
+const TESTS: [Test; 5] = [
     ("lists_input_devices", lists_input_devices),
     ("plays_film_frames", plays_film_frames),
     ("captures_one_channel", captures_one_channel),
+    ("meters_every_channel", meters_every_channel),
+    ("switches_nominal_rate", switches_nominal_rate),
 ];
 
 fn main() -> ExitCode {
@@ -236,5 +239,45 @@ fn captures_one_channel() -> Outcome {
     );
     ensure(worst < 0.002, || {
         format!("buffers not contiguous: {worst} s")
+    })
+}
+
+/// Meters every channel of the smoke input for a second: one level per
+/// channel, and at least one channel hears something.
+fn meters_every_channel() -> Outcome {
+    let input = smoke_input()?;
+    let meter = ChannelMeter::start(&input.name).map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_secs(1));
+    let levels = meter.levels();
+    println!(
+        "    {:?}: {} channel(s), levels {levels:?} dBFS",
+        input.name,
+        meter.channels()
+    );
+    for output in output_devices().map_err(|e| e.to_string())? {
+        println!("    output {:<32} {:?}", output.name, output.transport);
+    }
+    ensure(levels.len() == usize::from(meter.channels()), || {
+        format!("{} levels for {} channels", levels.len(), meter.channels())
+    })?;
+    ensure(levels.iter().any(|l| l.is_finite()), || {
+        "every channel is silent (microphone access denied?)".to_owned()
+    })
+}
+
+/// Switches the smoke input to 48 kHz when it runs at another rate, then
+/// back. Skips when it already runs at 48 kHz.
+fn switches_nominal_rate() -> Outcome {
+    let input = smoke_input()?;
+    if input.sample_rate == 48_000 {
+        println!("    {:?} already runs at 48 kHz; skipped", input.name);
+        return Ok(());
+    }
+    let before = input.sample_rate;
+    set_nominal_sample_rate(&input.name, 48_000).map_err(|e| e.to_string())?;
+    let now = smoke_input()?.sample_rate;
+    set_nominal_sample_rate(&input.name, before).map_err(|e| e.to_string())?;
+    ensure(now == 48_000, || {
+        format!("still at {now} Hz after the switch")
     })
 }

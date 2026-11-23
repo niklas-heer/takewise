@@ -50,6 +50,19 @@ pub fn input_devices() -> Result<Vec<DeviceInfo>> {
     Ok(out)
 }
 
+/// The output devices, where the film (and later the monitor) can play.
+/// Devices that report no output configuration are left out.
+pub fn output_devices() -> Result<Vec<DeviceInfo>> {
+    let host = cpal::default_host();
+    let mut out = Vec::new();
+    for device in host.output_devices()? {
+        if let Ok(info) = info(&device, false) {
+            out.push(info);
+        }
+    }
+    Ok(out)
+}
+
 /// The system's default input device.
 pub fn default_input() -> Result<DeviceInfo> {
     let device = cpal::default_host()

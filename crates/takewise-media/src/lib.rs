@@ -7,7 +7,9 @@
 //! [`Capture`] delivers [`CaptureBuffer`]s from CoreAudio's thread through
 //! the `Sender` it is given. Everything else may run on any thread.
 //!
-//! The microphone is never monitored: capture opens an input stream only.
+//! The microphone is never monitored: capture and the channel meter open
+//! input streams only, and [`Monitor`] is a seam that refuses until
+//! software monitoring has been proven on real hardware.
 
 // The one crate allowed `unsafe`: it bridges to AVFoundation, CoreMedia,
 // CoreVideo and CoreAudio. Every `unsafe` block carries a SAFETY comment.
@@ -18,13 +20,19 @@ mod capture;
 mod devices;
 mod error;
 mod latency;
+mod meter;
+mod monitor;
 mod player;
 mod video;
 
 pub use capture::{CAPTURE_RATE, Capture, CaptureBuffer};
-pub use devices::{DeviceInfo, Transport, default_input, default_output, input_devices};
+pub use devices::{
+    DeviceInfo, Transport, default_input, default_output, input_devices, output_devices,
+};
 pub use error::{Error, Result};
-pub use latency::input_latency_s;
+pub use latency::{buffer_frames, input_latency_s, set_nominal_sample_rate};
+pub use meter::{ChannelMeter, METER_WINDOW};
+pub use monitor::Monitor;
 pub use player::{FilmPlayer, TakePlayer, host_time_now_s, pump_run_loop};
 pub use takewise_core::Timebase;
 
