@@ -140,21 +140,31 @@ fn moved_slot_check<'a>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Unchecked {
     pub take: TakeRef,
-    /// It was checked before, against another text or slot only.
+    /// It was checked before, but against another text or slot, or its
+    /// words were transcribed by another model or preprocessing.
     pub stale: bool,
 }
 
 /// The takes of the script's lines without a current check, in script and
 /// take order. A take's check is the newest `checked` event matching the
 /// line as it is now, as the fold shows it; it is current when its words
-/// were checked. One whose transcription failed (`words-not-checked`) is
+/// were checked by the configured model with the current preprocessing
+/// ([`PREPROCESSING`]). One checked by another model or preprocessing is
+/// listed (as stale) only while transcription can be set up, so a missing
+/// model never turns its words into a failure. One whose transcription
+/// failed (`words-not-checked`) is
 /// listed only when checking again could end differently: transcription
 /// can be set up now, it failed for another reason than the setup fails
 /// for now, or it timed out. Takes whose file is missing are left out:
 /// there is nothing to check.
 pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
     let setup = WhisperCli::discover(&project.config.check).err();
-    select_unchecked(project, ledger, setup.map(|err| err.to_string()).as_deref())
+    select_unchecked(
+        project,
+        ledger,
+        setup.map(|err| err.to_string()).as_deref(),
+        (&project.config.check.whisper_model, PREPROCESSING),
+    )
 }
 
 /// Whether checking a take again could change its failed check: `setup` is
@@ -212,8 +222,13 @@ pub fn words_not_checked_takes(project: &Project, ledger: &Ledger) -> Vec<TakeRe
 }
 
 /// [`unchecked_takes`] with why transcription cannot be set up now, `None`
-/// when it can.
-fn select_unchecked(project: &Project, ledger: &Ledger, setup: Option<&str>) -> Vec<Unchecked> {
+/// when it can, and the current transcription key (model, preprocessing).
+fn select_unchecked(
+    project: &Project,
+    ledger: &Ledger,
+    setup: Option<&str>,
+    current_key: (&str, &str),
+) -> Vec<Unchecked> {
     let mut found = Vec::new();
     for line in &project.script.lines {
         let Some(current) = project.snapshot(&line.id) else {
@@ -244,8 +259,15 @@ fn select_unchecked(project: &Project, ledger: &Ledger, setup: Option<&str>) -> 
                 })
                 .collect();
             let newest = checks.iter().rev().find(|c| c.snapshot.matches(&current));
+            let outdated = newest.is_some_and(|c| {
+                c.transcript.is_some()
+                    && setup.is_none()
+                    && transcription_key(&c.checker) != Some(current_key)
+            });
             // A failed transcription leaves `transcript` empty.
-            if newest.is_some_and(|c| c.transcript.is_some() || !failure_could_change(c, setup)) {
+            let current_enough =
+                newest.is_some_and(|c| c.transcript.is_some() || !failure_could_change(c, setup));
+            if current_enough && !outdated {
                 continue;
             }
             found.push(Unchecked {
@@ -253,7 +275,7 @@ fn select_unchecked(project: &Project, ledger: &Ledger, setup: Option<&str>) -> 
                     line: line.id.clone(),
                     take,
                 },
-                stale: !checks.is_empty() && newest.is_none(),
+                stale: outdated || (!checks.is_empty() && newest.is_none()),
             });
         }
     }
@@ -273,6 +295,9 @@ mod tests {
     use crate::state::fold;
     use crate::takes::{RecordedInput, begin_take, commit_take, write_take_wav};
     use crate::testutil::{RATE, burst, noise};
+
+    /// The transcription key of [`Fake`] and [`Counting`]'s default model.
+    const FAKE: (&str, &str) = ("ggml-fake.bin", PREPROCESSING);
 
     const SCRIPT: &str =
         "[[line]]\nid = \"hook\"\nstart = 10.0\nend = 13.0\ntext = \"Nobody misses a birthday.\"\n";
@@ -405,7 +430,10 @@ mod tests {
         let take = &state.lines[0].takes[0];
         assert_eq!(take.effective, Some(Verdict::Keep));
         assert!(!take.stale_check);
-        assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);
+        assert_eq!(
+            select_unchecked(&project, &read(&dir).unwrap(), None, FAKE),
+            []
+        );
     }
 
     #[test]
@@ -430,14 +458,17 @@ mod tests {
         // is checked again.
         let project = Project::open(&dir).unwrap();
         assert_eq!(
-            select_unchecked(&project, &read(&dir).unwrap(), None),
+            select_unchecked(&project, &read(&dir).unwrap(), None, FAKE),
             vec![Unchecked {
                 take: t.clone(),
                 stale: false
             }]
         );
         check_take(&dir, &t, &Fake::new(), "0.1.0").unwrap();
-        assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);
+        assert_eq!(
+            select_unchecked(&project, &read(&dir).unwrap(), None, FAKE),
+            []
+        );
     }
 
     /// Fails every transcription with `reason`.
@@ -465,11 +496,11 @@ mod tests {
             stale: false,
         }];
         // The tools are still missing: checking again would fail the same way.
-        assert_eq!(select_unchecked(&project, &ledger, Some(missing)), []);
+        assert_eq!(select_unchecked(&project, &ledger, Some(missing), FAKE), []);
         // Now set up, or failing for another reason: checked again.
-        assert_eq!(select_unchecked(&project, &ledger, None), listed);
+        assert_eq!(select_unchecked(&project, &ledger, None, FAKE), listed);
         assert_eq!(
-            select_unchecked(&project, &ledger, Some("whisper model x not found")),
+            select_unchecked(&project, &ledger, Some("whisper model x not found"), FAKE),
             listed
         );
 
@@ -480,7 +511,7 @@ mod tests {
         check_take(&dir, &t, &Failing(timeout.to_owned()), "0.1.0").unwrap();
         let project = Project::open(&dir).unwrap();
         assert_eq!(
-            select_unchecked(&project, &read(&dir).unwrap(), Some(missing)),
+            select_unchecked(&project, &read(&dir).unwrap(), Some(missing), FAKE),
             vec![Unchecked {
                 take: t,
                 stale: false
@@ -513,7 +544,7 @@ mod tests {
         let take = &fold(&project, &ledger).lines[0].takes[0];
         assert_eq!(take.effective, Some(Verdict::Listen), "the newest check");
         assert_eq!(
-            select_unchecked(&project, &ledger, None),
+            select_unchecked(&project, &ledger, None, FAKE),
             vec![Unchecked {
                 take: t,
                 stale: false
@@ -608,7 +639,10 @@ mod tests {
             "takewise 0.1.1 whisper ggml-fake.bin pre=hp60+norm"
         );
         let project = Project::open(&dir).unwrap();
-        assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);
+        assert_eq!(
+            select_unchecked(&project, &read(&dir).unwrap(), None, FAKE),
+            []
+        );
 
         // A changed text, or another model, transcribes again.
         set_line_field(&dir, "hook", Field::Start(9.0), None).unwrap();
@@ -678,6 +712,36 @@ mod tests {
     }
 
     #[test]
+    fn a_check_by_another_model_or_preprocessing_is_not_current() {
+        let (_tmp, dir) = setup();
+        let t = take(&dir);
+        check_take(&dir, &t, &Fake::new(), "0.1.0").unwrap();
+        let project = Project::open(&dir).unwrap();
+        let ledger = read(&dir).unwrap();
+        let fake = ("ggml-fake.bin", PREPROCESSING);
+        assert_eq!(select_unchecked(&project, &ledger, None, fake), []);
+        let stale = vec![Unchecked {
+            take: t,
+            stale: true,
+        }];
+        // Another model, or another preprocessing, checks it again.
+        let other_model = ("ggml-other.bin", PREPROCESSING);
+        assert_eq!(
+            select_unchecked(&project, &ledger, None, other_model),
+            stale
+        );
+        let other_pre = ("ggml-fake.bin", "hp80+norm");
+        assert_eq!(select_unchecked(&project, &ledger, None, other_pre), stale);
+        // Not while transcription cannot be set up: checking again would
+        // only replace the words with a failure.
+        let missing = Some("whisper model x not found");
+        assert_eq!(
+            select_unchecked(&project, &ledger, missing, other_model),
+            []
+        );
+    }
+
+    #[test]
     fn check_of_an_unknown_take_fails() {
         let (_tmp, dir) = setup();
         let missing = TakeRef {
@@ -698,7 +762,7 @@ mod tests {
         check_take(&dir, &second, &Fake::new(), "0.1.0").unwrap();
         fs::remove_file(dir.join("takes/hook/003.wav")).unwrap();
         let project = Project::open(&dir).unwrap();
-        let unchecked = unchecked_takes(&project, &read(&dir).unwrap());
+        let unchecked = select_unchecked(&project, &read(&dir).unwrap(), None, FAKE);
         assert_eq!(
             unchecked,
             vec![Unchecked {
