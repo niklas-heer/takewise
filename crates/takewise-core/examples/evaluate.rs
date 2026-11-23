@@ -186,6 +186,22 @@ const SPELLINGS: &[(&str, &str, Verdict)] = &[
         "It costs three dollars and fifty cents.",
         Verdict::Keep,
     ),
+    // A number after an amount is its own unless the line has the cents.
+    (
+        "It cost five dollars twenty years ago.",
+        "It cost $5 20 years ago.",
+        Verdict::Keep,
+    ),
+    (
+        "It weighed seven pounds eight ounces.",
+        "It weighed 7 pounds 8 ounces.",
+        Verdict::Keep,
+    ),
+    (
+        "It costs $5.20.",
+        "It costs five dollars twenty.",
+        Verdict::Keep,
+    ),
     // "Three fifty" may be 350: listen.
     ("It costs $3.50.", "It costs three fifty.", Verdict::Listen),
     // Hyphens.

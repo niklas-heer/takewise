@@ -10,7 +10,10 @@
 //! "nineteen nineties" are `1990s`, "21st" and "twenty-first" `21st`, "3.5"
 //! and "three point five zero" `3.5` (a decimal is its value), "$5" and
 //! "five dollars" `5 dollars`, "$3.50" and "three dollars (and) fifty
-//! (cents)" `3.5 dollars`; a sign is kept, so "-5", "minus five" and
+//! cents" `3.5 dollars`; cents not named stay a number of their own ("five
+//! dollars twenty years ago" is `5 dollars 20 years ago`), and [`align`]
+//! joins them against the amount with cents ("five dollars twenty" and
+//! "$5.20"); a sign is kept, so "-5", "minus five" and
 //! "negative five" are `-5`, never `5`. A lone whole one stays the word `one`, since
 //! it is often not a number ("every one"), and "first" and "second" are
 //! ordinals only when attached ("twenty-first"), never in "a sixty second
@@ -295,6 +298,61 @@ fn pair_is_one(first: &Token, second: &Token, one: &Token) -> Option<Join> {
         && b_form != Form::Plural
         && whole_number(one) == Some((a + b, b_form));
     split.then_some(Join::Same)
+}
+
+/// Whether an amount, its currency and unnamed cents (`5 dollars 20`) are
+/// the amount with the cents on the other side (`5.2 dollars`): "five
+/// dollars twenty" and "$5.20".
+fn amount_is_one(
+    amount: &Token,
+    unit: &Token,
+    cents: &Token,
+    one: &Token,
+    one_unit: &Token,
+) -> bool {
+    let currency = |token: &Token| {
+        (token.apostrophe == Apostrophe::None)
+            .then(|| currency_word(&token.text))
+            .flatten()
+    };
+    let Some(named) = currency(unit) else {
+        return false;
+    };
+    if currency(one_unit) != Some(named) || cents.after_break || unit.after_break {
+        return false;
+    }
+    let Some((c, Form::Cardinal)) = whole_number(cents) else {
+        return false;
+    };
+    let (Some((negative, int)), Some((int_text, frac))) =
+        (signed_whole(amount), one.text.split_once('.'))
+    else {
+        return false;
+    };
+    let one_negative = int_text.starts_with('-');
+    let one_int = int_text.trim_start_matches('-');
+    one.apostrophe == Apostrophe::None
+        && (1..=99).contains(&c)
+        && one_negative == negative
+        && one_int.parse() == Ok(int)
+        && (1..=2).contains(&frac.len())
+        && frac.chars().all(|ch| ch.is_ascii_digit())
+        && format!("{frac:0<2}").parse() == Ok(c)
+}
+
+/// A whole cardinal with its sign: `-5` is (true, 5), `one` (false, 1).
+fn signed_whole(token: &Token) -> Option<(bool, u64)> {
+    match token.text.strip_prefix('-') {
+        Some(digits) if token.apostrophe == Apostrophe::None => {
+            let all = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+            all.then(|| digits.parse().ok().map(|int| (true, int)))
+                .flatten()
+        }
+        _ => match whole_number(token)? {
+            (int, Form::Cardinal) => Some((false, int)),
+            _ => None,
+        },
+    }
 }
 
 /// Lowercase words with punctuation removed, contractions expanded and
@@ -746,7 +804,7 @@ fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(V
                 && let Some(unit) = word_at(words, next).and_then(currency_word)
                 && let Some((cents, after)) = cents_at(words, next + 1)
             {
-                // "three dollars fifty" is `3.5 dollars`, as "$3.50" is.
+                // "three dollars fifty cents" is `3.5 dollars`, as "$3.50" is.
                 value.frac = format!("{cents:02}");
                 currency = Some(unit);
                 next = after;
@@ -792,21 +850,20 @@ fn currency_word(word: &str) -> Option<(&'static str, &'static str)> {
     .find(|(one, many)| word == *one || word == *many)
 }
 
-/// The cents said after a currency word, from 1 to 99, and the index after
-/// them: "fifty", "fifty cents", "and fifty cents"; an "and" needs the cents
-/// named, so "three dollars and two apples" has none.
+/// The cents named after a currency word, from 1 to 99, and the index after
+/// them: "fifty cents", "and fifty pence". Unnamed cents ("five dollars
+/// twenty") stay a number of their own, since the number may count
+/// something else ("five dollars twenty years ago"); [`align`] joins them
+/// with the amount against "$5.20".
 fn cents_at(words: &[Option<&str>], i: usize) -> Option<(u64, usize)> {
-    let and = word_at(words, i) == Some("and");
-    let at = if and { i + 1 } else { i };
+    let at = if word_at(words, i) == Some("and") {
+        i + 1
+    } else {
+        i
+    };
     let (cents, form, after) = small(words, at)?;
-    if form != Form::Cardinal || !(1..=99).contains(&cents) {
-        return None;
-    }
     let named = matches!(word_at(words, after), Some("cent" | "cents" | "pence"));
-    if and && !named {
-        return None;
-    }
-    Some((cents, if named { after + 1 } else { after }))
+    (form == Form::Cardinal && (1..=99).contains(&cents) && named).then_some((cents, after + 1))
 }
 
 /// A cardinal token with a minus sign: `5` is `-5`, `one` `-1`; `None` for
@@ -1188,6 +1245,34 @@ impl Alignment<'_> {
         pair_is_one(&h[j].token, &h[j + 1].token, &self.expected[i])
     }
 
+    /// An amount with unnamed cents (three expected tokens) heard as one
+    /// with a decimal (two heard tokens), ending at expected[i - 1] and
+    /// heard[j - 1].
+    fn three_heard_as_two(&self, i: usize, j: usize) -> bool {
+        let (Some(i), Some(j)) = (i.checked_sub(3), j.checked_sub(2)) else {
+            return false;
+        };
+        let (e, h) = (self.expected, self.heard);
+        amount_is_one(&e[i], &e[i + 1], &e[i + 2], &h[j].token, &h[j + 1].token)
+    }
+
+    /// An amount with a decimal (two expected tokens) heard with unnamed
+    /// cents (three heard tokens), ending at expected[i - 1] and
+    /// heard[j - 1].
+    fn two_heard_as_three(&self, i: usize, j: usize) -> bool {
+        let (Some(i), Some(j)) = (i.checked_sub(2), j.checked_sub(3)) else {
+            return false;
+        };
+        let (e, h) = (self.expected, self.heard);
+        amount_is_one(
+            &h[j].token,
+            &h[j + 1].token,
+            &h[j + 2].token,
+            &e[i],
+            &e[i + 1],
+        )
+    }
+
     fn matches(&self, i: usize, j: usize) -> bool {
         same(&self.expected[i - 1], &self.heard[j - 1].token)
     }
@@ -1214,6 +1299,12 @@ impl Alignment<'_> {
                 if let Some(join) = self.one_heard_as_two(i, j) {
                     best = best.min(cost[i - 1][j - 2] + join_cost(join));
                 }
+                if self.three_heard_as_two(i, j) {
+                    best = best.min(cost[i - 3][j - 2]);
+                }
+                if self.two_heard_as_three(i, j) {
+                    best = best.min(cost[i - 2][j - 3]);
+                }
                 cost[i][j] = best;
             }
         }
@@ -1226,6 +1317,16 @@ impl Alignment<'_> {
         let mut diffs = Vec::new();
         let (mut i, mut j) = (expected.len(), heard.len());
         while i > 0 || j > 0 {
+            if self.three_heard_as_two(i, j) && cost[i][j] == cost[i - 3][j - 2] {
+                i -= 3;
+                j -= 2;
+                continue;
+            }
+            if self.two_heard_as_three(i, j) && cost[i][j] == cost[i - 2][j - 3] {
+                i -= 2;
+                j -= 3;
+                continue;
+            }
             if let Some(join) = self.two_heard_as_one(i, j)
                 && cost[i][j] == cost[i - 2][j - 1] + join_cost(join)
             {
@@ -1671,6 +1772,60 @@ mod tests {
         assert_eq!(diffs[0].expected.as_deref(), Some("-5"));
         let diffs = align(&normalize("minus five"), &heard("five"));
         assert_ne!(diffs, []);
+    }
+
+    #[test]
+    fn an_amount_never_swallows_the_number_after_it() {
+        // Unnamed cents are joined only while aligning, against "$5.20".
+        assert_eq!(
+            shown("five dollars twenty years ago"),
+            tokens("5 dollars 20 years ago")
+        );
+        assert_eq!(
+            shown("three dollars and fifty cents"),
+            tokens("3.5 dollars")
+        );
+        for (script, said) in [
+            (
+                "It cost five dollars twenty years ago",
+                "It cost $5 20 years ago",
+            ),
+            ("seven pounds eight ounces", "7 pounds 8 ounces"),
+            ("It costs $5.20", "It costs five dollars twenty"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        assert_ne!(
+            align(
+                &normalize("It costs $5.20"),
+                &heard("It costs five dollars thirty")
+            ),
+            []
+        );
+        assert_ne!(
+            align(
+                &normalize("It costs $5.20"),
+                &heard("It costs five pounds twenty")
+            ),
+            []
+        );
+        // Punctuation ends an amount.
+        assert_ne!(
+            align(
+                &normalize("It costs $5.20"),
+                &heard("It costs five dollars, twenty")
+            ),
+            []
+        );
     }
 
     #[test]
