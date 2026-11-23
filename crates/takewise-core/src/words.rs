@@ -7,11 +7,17 @@
 //! hundred" and "one thousand five hundred" are all `1500`; "one hundred and
 //! five" is `105`, "two thousand and five" `2005`; a year said in two parts
 //! ("eighteen sixty seven", "nineteen oh five") is its value; "1990s" and
-//! "nineteen nineties" are `1990s`, "21st" and "twenty first" `21st`, "3.5"
+//! "nineteen nineties" are `1990s`, "21st" and "twenty-first" `21st`, "3.5"
 //! and "three point five" `3.5`, "$5" and "five dollars" `5 dollars`. A lone
 //! whole one stays the word `one`, since it is often not a number ("every
-//! one"). A number said over several heard words is one token, timed from
-//! its first word to its last.
+//! one"), and "first" and "second" are ordinals only when attached
+//! ("twenty-first"), never in "a sixty second timer". A number said over
+//! several heard words is one token, timed from its first word to its last,
+//! but never across punctuation: "pick twenty, one at a time" is `20 one`.
+//! [`align`] still matches a number split in two on one side against the
+//! joined form on the other (`60 second` and `62nd`, `20 first` and `21st`),
+//! and a script clock time such as `11:30` against "eleven thirty" or `11
+//! 30`; without a colon in the script, two numbers are never a time.
 //!
 //! An `'s` or a trailing apostrophe is kept as a mark on its [`Token`], since
 //! it changes what the token may be heard as. [`align`] accepts a heard
@@ -68,13 +74,21 @@ pub enum Apostrophe {
 pub struct Token {
     pub text: String,
     pub apostrophe: Apostrophe,
+    /// Punctuation such as a comma stands between this token and the one
+    /// before it, so the two are never one number.
+    after_break: bool,
 }
 
 impl Token {
     fn plain(text: impl Into<String>) -> Token {
+        Token::new(text, Apostrophe::None)
+    }
+
+    fn new(text: impl Into<String>, apostrophe: Apostrophe) -> Token {
         Token {
             text: text.into(),
-            apostrophe: Apostrophe::None,
+            apostrophe,
+            after_break: false,
         }
     }
 
@@ -112,6 +126,17 @@ fn ies_plural(stem: &str) -> Option<String> {
 /// for a separate "is".
 fn same(expected: &Token, heard: &Token) -> bool {
     use Apostrophe::{None, S, Trailing};
+    if let Some((hours, minutes)) = clock(&expected.text)
+        && heard.apostrophe == None
+        && heard.text == format!("{hours}{minutes:02}")
+    {
+        return true;
+    }
+    if let (Some(a), Some(b)) = (whole_number(expected), whole_number(heard))
+        && a == b
+    {
+        return true;
+    }
     let stem = expected.text.as_str();
     match (expected.apostrophe, heard.apostrophe) {
         (a, b) if a == b => expected.text == heard.text,
@@ -126,26 +151,99 @@ fn same(expected: &Token, heard: &Token) -> bool {
     }
 }
 
-/// Two adjacent tokens heard or written as one: a compound (`every day` and
-/// `everyday`), a contracted "is" (`link is` and `link's`), or a time read
-/// like a year (`11:30` and "eleven thirty", which is `1130`).
-fn pair_is_one(first: &Token, second: &Token, one: &Token) -> bool {
+/// A clock time with a colon, such as `11:30`: its hours and minutes.
+fn clock(text: &str) -> Option<(u64, u64)> {
+    let (hours, minutes) = text.split_once(':')?;
+    let digits = |s: &str, lengths: std::ops::RangeInclusive<usize>| {
+        lengths.contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit())
+    };
+    if !digits(hours, 1..=2) || !digits(minutes, 2..=2) {
+        return None;
+    }
+    let (hours, minutes) = (hours.parse().ok()?, minutes.parse().ok()?);
+    (hours <= 23 && minutes <= 59).then_some((hours, minutes))
+}
+
+/// A whole number token's value and form: `21` and `one` are cardinals,
+/// `21st`, `first` and `second` ordinals, `1990s` a plural.
+fn whole_number(token: &Token) -> Option<(u64, Form)> {
+    if token.apostrophe != Apostrophe::None {
+        return None;
+    }
+    let text = token.text.as_str();
+    let parse = |digits: &str| -> Option<u64> {
+        let all = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+        all.then(|| digits.parse().ok()).flatten()
+    };
+    match text {
+        "one" => return Some((1, Form::Cardinal)),
+        "first" => return Some((1, Form::Ordinal)),
+        "second" => return Some((2, Form::Ordinal)),
+        _ => {}
+    }
+    if let Some(value) = parse(text) {
+        return Some((value, Form::Cardinal));
+    }
+    if let Some(value) = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| text.strip_suffix(suffix).and_then(parse))
+    {
+        return Some((value, Form::Ordinal));
+    }
+    text.strip_suffix('s')
+        .and_then(parse)
+        .map(|value| (value, Form::Plural))
+}
+
+/// How two adjacent tokens on one side match one token on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Join {
+    /// The same words, written differently: a contracted "is" (`link is`
+    /// and `link's`), a number in two parts (`sixty second` and `62nd`, `20
+    /// first` and `21st`), or a script clock time (`11:30` heard as `11 30`
+    /// or "nine thirty" for `9:30`).
+    Same,
+    /// Two words heard or written as one (`every day` and `everyday`): a
+    /// possible mishearing.
+    Compound,
+}
+
+/// Whether `first` and `second` are `one` on the other side; `one_is_script`
+/// says that `one` is the script's token, which a clock time must be.
+fn pair_is_one(first: &Token, second: &Token, one: &Token, one_is_script: bool) -> Option<Join> {
     let contracted =
         one.apostrophe == Apostrophe::S && first.is_plain(&one.text) && second.is_plain("is");
-    let joined = || {
-        one.text.len() == first.text.len() + second.text.len()
-            && one.text.starts_with(&first.text)
-            && one.text.ends_with(&second.text)
+    if contracted {
+        return Some(Join::Same);
+    }
+    let joined = one.text.len() == first.text.len() + second.text.len()
+        && one.text.starts_with(&first.text)
+        && one.text.ends_with(&second.text);
+    if first.is_plain_word() && second.is_plain_word() && one.is_plain_word() && joined {
+        return Some(Join::Compound);
+    }
+    if second.after_break {
+        return None;
+    }
+    let (Some((a, a_form)), Some((b, b_form))) = (whole_number(first), whole_number(second)) else {
+        return None;
     };
-    let compound =
-        first.is_plain_word() && second.is_plain_word() && one.is_plain_word() && joined();
-    let digits = |token: &Token, lengths: std::ops::RangeInclusive<usize>| {
-        token.apostrophe == Apostrophe::None
-            && lengths.contains(&token.text.len())
-            && token.text.chars().all(|c| c.is_ascii_digit())
-    };
-    let time = digits(first, 1..=2) && digits(second, 2..=2) && digits(one, 3..=4) && joined();
-    contracted || compound || time
+    if one_is_script
+        && let Some((hours, minutes)) = clock(&one.text)
+        && a_form == Form::Cardinal
+        && b_form == Form::Cardinal
+        && (a, b) == (hours, minutes)
+        && minutes >= 10
+    {
+        return Some(Join::Same);
+    }
+    let split = a_form == Form::Cardinal
+        && a >= 20
+        && a % 10 == 0
+        && (1..=9).contains(&b)
+        && b_form != Form::Plural
+        && whole_number(one) == Some((a + b, b_form));
+    split.then_some(Join::Same)
 }
 
 /// Lowercase words with punctuation removed, contractions expanded and
@@ -161,36 +259,95 @@ pub fn normalize(text: &str) -> Vec<Token> {
 /// each token with the first and last part it came from: a number said in
 /// several heard words is one token.
 fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
-    let mut items: Vec<(Item, usize)> = Vec::new();
+    let mut items: Vec<Lexed> = Vec::new();
+    let mut pending = Sep::Space;
     for (index, part) in parts.iter().enumerate() {
-        for raw in raw_tokens(part) {
-            lex(&raw, index, &mut items);
+        let (raws, trailing) = raw_tokens(part);
+        for (raw, sep) in raws {
+            lex(&raw, index, pending.max(sep), &mut items);
+            pending = Sep::Space;
         }
+        pending = pending.max(trailing);
     }
-    let words: Vec<Option<&str>> = items
-        .iter()
-        .map(|(item, _)| match item {
-            Item::Word(token) if token.apostrophe == Apostrophe::None => Some(token.text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let words = number_words(&items);
     let mut out = Vec::new();
     let mut k = 0;
-    while let Some((item, part)) = items.get(k) {
-        if let Some((tokens, next)) = number_phrase(&items, &words, k) {
+    while let Some(lexed) = items.get(k) {
+        // A number ends at punctuation.
+        let end = (k + 1..items.len())
+            .find(|&i| items[i].sep == Sep::Break)
+            .unwrap_or(items.len());
+        let after_break = lexed.sep == Sep::Break;
+        if let Some((tokens, next)) = number_phrase(&items[..end], &words[..end], k) {
             let last = items
                 .get(next.saturating_sub(1))
-                .map_or(*part, |(_, last)| *last);
-            out.extend(tokens.into_iter().map(|token| (token, *part, last)));
+                .map_or(lexed.part, |l| l.part);
+            out.extend(tokens.into_iter().map(|token| {
+                let token = Token {
+                    after_break,
+                    ..token
+                };
+                (token, lexed.part, last)
+            }));
             k = next.max(k + 1);
             continue;
         }
-        if let Item::Word(token) | Item::Other(token) = item {
-            out.push((token.clone(), *part, *part));
+        if let Item::Word(token) | Item::Other(token) = &lexed.item {
+            let token = Token {
+                after_break,
+                ..token.clone()
+            };
+            out.push((token, lexed.part, lexed.part));
         }
         k += 1;
     }
     out
+}
+
+/// The plain words that may be part of a number, by item. "first" and
+/// "second" are only ordinals when attached to a number word before them
+/// ("twenty-first"); alone they are words ("a sixty second timer", "first
+/// we go").
+fn number_words(items: &[Lexed]) -> Vec<Option<&str>> {
+    fn plain(lexed: &Lexed) -> Option<&str> {
+        match &lexed.item {
+            Item::Word(token) if token.apostrophe == Apostrophe::None => Some(token.text.as_str()),
+            _ => None,
+        }
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(k, lexed)| {
+            let word = plain(lexed)?;
+            let attached = lexed.sep == Sep::Hyphen
+                && k.checked_sub(1)
+                    .and_then(|before| items.get(before))
+                    .and_then(plain)
+                    .is_some_and(|before| number_word(before).is_some());
+            let loose = matches!(word, "first" | "second") && !attached;
+            (!loose).then_some(word)
+        })
+        .collect()
+}
+
+/// What stands between a raw token and the one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Sep {
+    /// Space, or nothing.
+    Space,
+    /// A hyphen right between two words: "twenty-first".
+    Hyphen,
+    /// Punctuation such as a comma, a full stop or a dash.
+    Break,
+}
+
+/// A raw token read: what it is, the heard word it came from and what
+/// stands before it.
+struct Lexed {
+    item: Item,
+    part: usize,
+    sep: Sep,
 }
 
 /// A raw token before numbers are read.
@@ -484,12 +641,8 @@ fn cardinal(words: &[Option<&str>], i: usize) -> Option<(u64, Form, usize)> {
 
 /// The canonical tokens of a number starting at item `k` and the index after
 /// it, or `None` when no number starts there.
-fn number_phrase(
-    items: &[(Item, usize)],
-    words: &[Option<&str>],
-    k: usize,
-) -> Option<(Vec<Token>, usize)> {
-    let (value, form, mut next, currency) = match &items.get(k)?.0 {
+fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(Vec<Token>, usize)> {
+    let (value, form, mut next, currency) = match &items.get(k)?.item {
         Item::Number(number) => (number.value.clone(), number.form, k + 1, number.currency),
         Item::Word(_) => {
             let (int, form, mut next) = cardinal(words, k)?;
@@ -507,7 +660,7 @@ fn number_phrase(
     };
     let mut value = value;
     if form == Form::Cardinal
-        && (matches!(items.get(k).map(|(item, _)| item), Some(Item::Number(_)))
+        && (matches!(items.get(k).map(|l| &l.item), Some(Item::Number(_)))
             || !value.frac.is_empty())
         && let Some(scale) = number_at(words, next).filter(|w| w.form == Form::Cardinal)
         && matches!(scale.kind, Kind::Hundred | Kind::Scale)
@@ -528,26 +681,31 @@ fn number_phrase(
     Some((tokens, next))
 }
 
-/// One raw token as items: words, contractions, or a number in digits.
-fn lex(raw: &str, part: usize, items: &mut Vec<(Item, usize)>) {
+/// One raw token as items: words, contractions, or a number in digits. A
+/// clock time such as `11:30` stays one token; other digits around a colon
+/// are separate numbers.
+fn lex(raw: &str, part: usize, sep: Sep, items: &mut Vec<Lexed>) {
     let token = raw.trim_start_matches('\'');
     let bare = token.trim_end_matches('\'');
     if bare.is_empty() {
         return;
     }
-    if bare.chars().any(|c| c.is_ascii_digit()) {
+    let mut push = |item: Item, sep: Sep| items.push(Lexed { item, part, sep });
+    if bare.contains(':') && clock(bare).is_none() {
+        for (n, piece) in bare.split(':').enumerate() {
+            lex(piece, part, if n == 0 { sep } else { Sep::Break }, items);
+        }
+    } else if bare.chars().any(|c| c.is_ascii_digit()) {
         let item = lex_number(bare).map_or_else(|| Item::Other(Token::plain(bare)), Item::Number);
-        items.push((item, part));
+        push(item, sep);
     } else if bare.len() < token.len() {
-        let token = Token {
-            text: bare.to_owned(),
-            apostrophe: Apostrophe::Trailing,
-        };
-        items.push((Item::Word(token), part));
+        push(Item::Word(Token::new(bare, Apostrophe::Trailing)), sep);
     } else {
         let mut tokens = Vec::new();
         expand_contraction(bare, &mut tokens);
-        items.extend(tokens.into_iter().map(|token| (Item::Word(token), part)));
+        for (n, token) in tokens.into_iter().enumerate() {
+            push(Item::Word(token), if n == 0 { sep } else { Sep::Space });
+        }
     }
 }
 
@@ -598,10 +756,11 @@ fn lex_number(token: &str) -> Option<Number> {
     })
 }
 
-/// Splits lowercased text into runs of letters, digits and apostrophes;
-/// `.` and `,` stay inside a run between two digits, a currency symbol
-/// starts a run before a digit; `%` and `&` become words of their own.
-fn raw_tokens(text: &str) -> Vec<String> {
+/// Splits lowercased text into runs of letters, digits and apostrophes,
+/// each with what stands before it, and what follows the last run; `.`, `,`
+/// and `:` stay inside a run between two digits, a currency symbol starts a
+/// run before a digit; `%` and `&` become words of their own.
+fn raw_tokens(text: &str) -> (Vec<(String, Sep)>, Sep) {
     let chars: Vec<char> = text
         .chars()
         .map(|c| match c {
@@ -612,36 +771,43 @@ fn raw_tokens(text: &str) -> Vec<String> {
         .collect();
     let mut tokens = Vec::new();
     let mut current = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        let between_digits = || {
-            i > 0
-                && chars.get(i - 1).is_some_and(char::is_ascii_digit)
-                && chars.get(i + 1).is_some_and(char::is_ascii_digit)
-        };
-        if c.is_alphanumeric() || c == '\'' || ((c == '.' || c == ',') && between_digits()) {
-            current.push(c);
-            continue;
-        }
-        if matches!(c, '$' | '€' | '£') && chars.get(i + 1).is_some_and(char::is_ascii_digit) {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            current.push(c);
-            continue;
-        }
+    let mut sep = Sep::Space;
+    let mut flush = |current: &mut String, sep: &mut Sep| {
         if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
+            tokens.push((std::mem::take(current), *sep));
+            *sep = Sep::Space;
         }
+    };
+    for (i, &c) in chars.iter().enumerate() {
+        let before = i.checked_sub(1).and_then(|before| chars.get(before));
+        let after = chars.get(i + 1);
+        let between_digits =
+            || before.is_some_and(char::is_ascii_digit) && after.is_some_and(char::is_ascii_digit);
+        if c.is_alphanumeric() || c == '\'' || (matches!(c, '.' | ',' | ':') && between_digits()) {
+            current.push(c);
+            continue;
+        }
+        if matches!(c, '$' | '€' | '£') && after.is_some_and(char::is_ascii_digit) {
+            flush(&mut current, &mut sep);
+            current.push(c);
+            continue;
+        }
+        flush(&mut current, &mut sep);
         match c {
-            '%' => tokens.push("percent".to_owned()),
-            '&' => tokens.push("and".to_owned()),
-            _ => {}
+            '%' => current.push_str("percent"),
+            '&' => current.push_str("and"),
+            '-' if before.is_some_and(|b| b.is_alphanumeric())
+                && after.is_some_and(|a| a.is_alphanumeric()) =>
+            {
+                sep = sep.max(Sep::Hyphen);
+            }
+            c if c.is_whitespace() || c == '-' => {}
+            _ => sep = Sep::Break,
         }
+        flush(&mut current, &mut sep);
     }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+    flush(&mut current, &mut sep);
+    (tokens, sep)
 }
 
 /// Contraction endings and the word each stands for. An `'s` is kept as a
@@ -679,10 +845,7 @@ fn expand_contraction(token: &str, out: &mut Vec<Token>) {
     if let Some(stem) = token.strip_suffix("'s")
         && !stem.is_empty()
     {
-        out.push(Token {
-            text: stem.to_owned(),
-            apostrophe: Apostrophe::S,
-        });
+        out.push(Token::new(stem, Apostrophe::S));
         return;
     }
     out.push(Token::plain(token));
@@ -770,92 +933,140 @@ pub fn align(expected: &[Token], heard: &[Word]) -> Vec<WordDiff> {
             })
         })
         .collect();
-    let (n, m) = (expected.len(), heard.len());
-    // Two expected tokens heard as one, ending at expected[i - 1] and
-    // heard[j - 1].
-    let two_heard_as_one = |i: usize, j: usize| {
-        i >= 2 && j >= 1 && pair_is_one(&expected[i - 2], &expected[i - 1], &heard[j - 1].token)
-    };
-    let one_heard_as_two = |i: usize, j: usize| {
-        i >= 1 && j >= 2 && pair_is_one(&heard[j - 2].token, &heard[j - 1].token, &expected[i - 1])
-    };
-    // cost[i][j]: distance between expected[..i] and heard[..j].
-    let mut cost = vec![vec![0_usize; m + 1]; n + 1];
-    for (i, row) in cost.iter_mut().enumerate() {
-        row[0] = i;
+    Alignment {
+        expected,
+        heard: &heard,
     }
-    for (j, cell) in cost[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=n {
-        for j in 1..=m {
-            let differs = usize::from(!same(&expected[i - 1], &heard[j - 1].token));
-            let mut best = (cost[i - 1][j - 1] + differs)
-                .min(cost[i - 1][j] + 1)
-                .min(cost[i][j - 1] + 1);
-            if two_heard_as_one(i, j) {
-                best = best.min(cost[i - 2][j - 1]);
-            }
-            if one_heard_as_two(i, j) {
-                best = best.min(cost[i - 1][j - 2]);
-            }
-            cost[i][j] = best;
-        }
+    .diffs()
+}
+
+/// The edit-distance alignment of expected tokens with heard ones.
+struct Alignment<'a> {
+    expected: &'a [Token],
+    heard: &'a [Heard],
+}
+
+impl Alignment<'_> {
+    /// Two expected tokens heard as one, ending at expected[i - 1] and
+    /// heard[j - 1].
+    fn two_heard_as_one(&self, i: usize, j: usize) -> Option<Join> {
+        let (Some(i), Some(j)) = (i.checked_sub(2), j.checked_sub(1)) else {
+            return None;
+        };
+        let e = self.expected;
+        pair_is_one(&e[i], &e[i + 1], &self.heard[j].token, false)
     }
 
-    let mut diffs = Vec::new();
-    let (mut i, mut j) = (n, m);
-    while i > 0 || j > 0 {
-        if two_heard_as_one(i, j) && cost[i][j] == cost[i - 2][j - 1] {
-            i -= 2;
-            j -= 1;
-            continue;
+    /// One expected token heard as two, ending at expected[i - 1] and
+    /// heard[j - 1].
+    fn one_heard_as_two(&self, i: usize, j: usize) -> Option<Join> {
+        let (Some(i), Some(j)) = (i.checked_sub(1), j.checked_sub(2)) else {
+            return None;
+        };
+        let h = self.heard;
+        pair_is_one(&h[j].token, &h[j + 1].token, &self.expected[i], true)
+    }
+
+    fn matches(&self, i: usize, j: usize) -> bool {
+        same(&self.expected[i - 1], &self.heard[j - 1].token)
+    }
+
+    /// cost[i][j]: the distance between expected[..i] and heard[..j].
+    fn costs(&self) -> Vec<Vec<usize>> {
+        let (n, m) = (self.expected.len(), self.heard.len());
+        let mut cost = vec![vec![0_usize; m + 1]; n + 1];
+        for (i, row) in cost.iter_mut().enumerate() {
+            row[0] = i;
         }
-        if one_heard_as_two(i, j) && cost[i][j] == cost[i - 1][j - 2] {
-            i -= 1;
-            j -= 2;
-            continue;
+        for (j, cell) in cost[0].iter_mut().enumerate() {
+            *cell = j;
         }
-        if i > 0 && j > 0 {
-            let matches = same(&expected[i - 1], &heard[j - 1].token);
-            if cost[i][j] == cost[i - 1][j - 1] + usize::from(!matches) {
-                if !matches {
-                    diffs.push(WordDiff {
-                        kind: WordDiffKind::Substituted,
-                        expected: Some(expected[i - 1].display()),
-                        heard: Some(heard[j - 1].token.display()),
-                        at: Some(heard[j - 1].start),
-                    });
+        for i in 1..=n {
+            for j in 1..=m {
+                let differs = usize::from(!self.matches(i, j));
+                let mut best = (cost[i - 1][j - 1] + differs)
+                    .min(cost[i - 1][j] + 1)
+                    .min(cost[i][j - 1] + 1);
+                if let Some(join) = self.two_heard_as_one(i, j) {
+                    best = best.min(cost[i - 2][j - 1] + join_cost(join));
                 }
-                i -= 1;
+                if let Some(join) = self.one_heard_as_two(i, j) {
+                    best = best.min(cost[i - 1][j - 2] + join_cost(join));
+                }
+                cost[i][j] = best;
+            }
+        }
+        cost
+    }
+
+    fn diffs(&self) -> Vec<WordDiff> {
+        let (expected, heard) = (self.expected, self.heard);
+        let cost = self.costs();
+        let mut diffs = Vec::new();
+        let (mut i, mut j) = (expected.len(), heard.len());
+        while i > 0 || j > 0 {
+            if let Some(join) = self.two_heard_as_one(i, j)
+                && cost[i][j] == cost[i - 2][j - 1] + join_cost(join)
+            {
+                i -= 2;
                 j -= 1;
                 continue;
             }
+            if let Some(join) = self.one_heard_as_two(i, j)
+                && cost[i][j] == cost[i - 1][j - 2] + join_cost(join)
+            {
+                i -= 1;
+                j -= 2;
+                continue;
+            }
+            if i > 0 && j > 0 {
+                let matches = self.matches(i, j);
+                if cost[i][j] == cost[i - 1][j - 1] + usize::from(!matches) {
+                    if !matches {
+                        diffs.push(WordDiff {
+                            kind: WordDiffKind::Substituted,
+                            expected: Some(expected[i - 1].display()),
+                            heard: Some(heard[j - 1].token.display()),
+                            at: Some(heard[j - 1].start),
+                        });
+                    }
+                    i -= 1;
+                    j -= 1;
+                    continue;
+                }
+            }
+            if i > 0 && cost[i][j] == cost[i - 1][j] + 1 {
+                let at = match j.checked_sub(1) {
+                    Some(before) => Some(heard[before].end),
+                    None => heard.first().map(|h| h.start),
+                };
+                diffs.push(WordDiff {
+                    kind: WordDiffKind::Missing,
+                    expected: Some(expected[i - 1].display()),
+                    heard: None,
+                    at,
+                });
+                i -= 1;
+            } else {
+                diffs.push(WordDiff {
+                    kind: WordDiffKind::Extra,
+                    expected: None,
+                    heard: Some(heard[j - 1].token.display()),
+                    at: Some(heard[j - 1].start),
+                });
+                j -= 1;
+            }
         }
-        if i > 0 && cost[i][j] == cost[i - 1][j] + 1 {
-            let at = match j.checked_sub(1) {
-                Some(before) => Some(heard[before].end),
-                None => heard.first().map(|h| h.start),
-            };
-            diffs.push(WordDiff {
-                kind: WordDiffKind::Missing,
-                expected: Some(expected[i - 1].display()),
-                heard: None,
-                at,
-            });
-            i -= 1;
-        } else {
-            diffs.push(WordDiff {
-                kind: WordDiffKind::Extra,
-                expected: None,
-                heard: Some(heard[j - 1].token.display()),
-                at: Some(heard[j - 1].start),
-            });
-            j -= 1;
-        }
+        diffs.reverse();
+        diffs
     }
-    diffs.reverse();
-    diffs
+}
+
+/// What a join of two tokens with one costs in the alignment.
+fn join_cost(join: Join) -> usize {
+    match join {
+        Join::Same | Join::Compound => 0,
+    }
 }
 
 #[cfg(test)]
@@ -922,8 +1133,8 @@ mod tests {
         );
         assert_eq!(shown("three point five"), tokens("3.5"));
         assert_eq!(
-            shown("first second third twenty first"),
-            tokens("1st 2nd 3rd 21st")
+            shown("first second third twenty-first"),
+            tokens("first second 3rd 21st")
         );
         assert_eq!(
             shown("1st 2nd 3rd 21st 11th"),
@@ -978,7 +1189,6 @@ mod tests {
             ("21st", "twenty first"),
             ("3.5", "three point five"),
             ("50%", "fifty percent"),
-            ("at 11:30", "at eleven thirty"),
             ("a hundred", "100"),
         ] {
             assert_eq!(
@@ -996,6 +1206,103 @@ mod tests {
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].expected.as_deref(), Some("5"));
         assert_eq!(diffs[0].heard.as_deref(), Some("6"));
+    }
+
+    #[test]
+    fn numbers_never_fuse_across_punctuation() {
+        assert_eq!(
+            shown("Pick twenty, one at a time"),
+            tokens("pick 20 one at a time")
+        );
+        assert_eq!(
+            shown("I ordered 10, 20, and 30"),
+            tokens("i ordered 10 20 and 30")
+        );
+        assert_eq!(
+            shown("I ordered ten, twenty, and thirty"),
+            tokens("i ordered 10 20 and 30")
+        );
+        assert_eq!(
+            shown("chapter twenty, first part"),
+            tokens("chapter 20 first part")
+        );
+        // Heard words carry their punctuation; a comma ends the number.
+        let said = |text: &str| -> Vec<String> {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            normalize_parts(&parts)
+                .iter()
+                .map(|(token, _, _)| token.display())
+                .collect()
+        };
+        assert_eq!(
+            said("pick twenty, one at a time"),
+            tokens("pick 20 one at a time")
+        );
+        assert_eq!(said("ten, twenty, and thirty"), tokens("10 20 and 30"));
+        // Without punctuation a number still spans heard words.
+        assert_eq!(said("eighteen sixty seven"), tokens("1867"));
+        // The pairing rule does not cross punctuation either.
+        let diffs = align(
+            &normalize("Pick twenty, one at a time"),
+            &heard("Pick 21 at a time"),
+        );
+        assert_ne!(diffs, []);
+    }
+
+    #[test]
+    fn first_and_second_are_ordinals_only_when_attached() {
+        assert_eq!(shown("a sixty second timer"), tokens("a 60 second timer"));
+        assert_eq!(shown("first we go"), tokens("first we go"));
+        assert_eq!(shown("twenty-first"), tokens("21st"));
+        assert_eq!(shown("sixty-second"), tokens("62nd"));
+        assert_eq!(shown("twenty first"), tokens("20 first"));
+        assert_eq!(shown("2nd and 1st"), tokens("2nd and 1st"));
+        // Other ordinals are unambiguous.
+        assert_eq!(shown("twenty third"), tokens("23rd"));
+        assert_eq!(shown("the third"), tokens("the 3rd"));
+    }
+
+    #[test]
+    fn align_matches_split_and_joined_numbers() {
+        for (script, said) in [
+            ("a sixty second timer", "a 60-second timer"),
+            ("a 60-second timer", "a sixty-second timer"),
+            ("the 21st century", "the twenty first century"),
+            ("the 2nd day", "the second day"),
+            ("the 1st day", "the first day"),
+            ("the 62nd floor", "the sixty second floor"),
+            ("twenty one", "21"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_rule_needs_a_clock_time_in_the_script() {
+        for said in ["at eleven thirty", "at 11:30", "at 11 30", "at nine thirty"] {
+            let script = if said.contains("nine") {
+                "at 9:30"
+            } else {
+                "at 11:30"
+            };
+            assert_eq!(align(&normalize(script), &heard(said)), [], "{said}");
+        }
+        // Without a colon, two numbers are not a time.
+        assert_ne!(align(&normalize("in 1130"), &heard("in 11 30")), []);
+        assert_ne!(align(&normalize("10 20"), &heard("1020")), []);
+        assert_ne!(
+            align(&normalize("at eleven thirty"), &heard("at 11 30")),
+            []
+        );
     }
 
     #[test]
