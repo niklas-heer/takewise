@@ -8,7 +8,7 @@
 
 ![Two takes of the line "A capsule waits at its port, ready to bring the crew home." recorded over a film of the space station. In the first, a 3-2-1 count-in runs over the docked capsule, the words fill at the pace of the line's slot, the take stops, shows "checking…" and comes back "retake, missing home", shown close up. The second take comes back "keep"; Enter chooses it, and the close-up shows its star filled.](docs/images/loop.webp)
 
-<sub>Two takes of one line at twice their speed. The first comes back `retake · missing “home”`, the second `keep`. The hollow star marks the best take so far; Enter chooses a take and fills it. Demo film: NASA's public-domain "Earth Views from the International Space Station"; takes spoken by macOS `say` and checked by Takewise.</sub>
+<sub>Two takes of one line at twice their speed. The first comes back `retake · missing “home”`, the second `keep`. The hollow star marks the best checked take that isn't a `retake`; Enter chooses a take and fills it. Demo film: NASA's public-domain "Earth Views from the International Space Station"; takes spoken by macOS `say` and checked by Takewise.</sub>
 
 ## Why
 
@@ -23,7 +23,7 @@ Takewise is a recording window plus a `takewise` command for everything around i
 1. **Script.** `takewise init` starts a project from the finished film. The script is a small text file, `script.toml`: one entry per line, each with its start in film time. You write it, or an agent drafts it. Rough starts are fine: M moves the line's start to the playhead while the film plays (during a take or P). A line's *slot* runs from its start to the next line's start (or to an end you set); it is the time the line has to fit in.
 2. **Record to picture.** `takewise record` opens the window. Press Space: the film plays from 2 s before the line, counts in 3-2-1, and the words fill at an even pace across the slot. Space stops the take; otherwise it ends by itself 1.5 s after the slot.
 3. **Checks.** After each take, Takewise compares a local whisper.cpp transcript with the script and flags likely word, timing and sound problems: `keep`, `listen` or `retake`, with the reason. Listen back before choosing.
-4. **Choose.** The hollow star marks the best take so far; Enter chooses a take. Takewise never chooses for you.
+4. **Choose.** The hollow star marks the best checked take that isn't a `retake`; Enter chooses a take. Takewise never chooses for you.
 5. **Export.** `takewise export` writes one narration file exactly as long as the film, with each chosen take where it belongs. Line up the file's first sample with the first frame of the cut you imported, in any editor.
 
 ## Install
@@ -37,28 +37,37 @@ takewise models install
 takewise doctor
 ```
 
-The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, and an audio input that runs at 48 kHz. The app is signed and notarized.
+The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones delay the film's sound and aren't supported for recording. The app is signed and notarized.
 
 The speech model (`ggml-large-v3-turbo.bin`, 1.5 GB) is downloaded once, from whisper.cpp's repository on Hugging Face and is installed only when its SHA-256 matches the one pinned in Takewise. The recording window offers the same download with a button. After that, nothing needs the network.
 
-The first take asks for microphone access. If you said no, turn Takewise on in System Settings › Privacy & Security › Microphone and reopen it.
+macOS asks for microphone access the first time Takewise listens to your input, usually when you pick it in the audio panel. If you said no, turn Takewise on in System Settings › Privacy & Security › Microphone and reopen it.
 
 ## Try it on one line
 
-You need a finished film at least 5 seconds long. Start a project for it:
+You need a finished film. To try Takewise without one, fetch the demo film the screenshots use: NASA's public-domain "Earth Views from the International Space Station" (120 MB), cut to 60 seconds:
+
+```sh
+nasa=https://images-assets.nasa.gov/video
+clip="Earth%20Views%20from%20the%20International%20Space%20Station"
+curl -fLo earth-views.mp4 "$nasa/$clip/$clip~large.mp4"
+ffmpeg -ss 16 -t 60 -i earth-views.mp4 -c:v libx264 -c:a aac film.mp4
+```
+
+Or use your own: an H.264 or HEVC `.mp4` or `.mov` that plays in QuickTime. Start a project for it:
 
 ```sh
 takewise init demo.takewise --film film.mp4
 ```
 
-Add one line to `demo.takewise/script.toml`. `start` and `end` are seconds of film time, so this line's slot runs from 1.0 to 4.0 s:
+Add one line to `demo.takewise/script.toml`. `start` and `end` are seconds of film time, so this line's slot runs from 25.0 to 29.1 s, where the demo film shows a capsule docked at the station (on your own film, pick a slot inside it):
 
 ```toml
 [[line]]
-id = "hello"
-start = 1.0
-end = 4.0
-text = "Hello, and welcome to the film."
+id = "capsule"
+start = 25.0
+end = 29.1
+text = "A capsule waits at its port, ready to bring the crew home."
 ```
 
 Open the recording window:
@@ -67,7 +76,15 @@ Open the recording window:
 takewise record demo.takewise
 ```
 
-Press **A** and pick your microphone's input and channel and the output, press **C** and run the setup check, press **Space** to record a take, press **Enter** to choose it, and close the window. Then export:
+1. **Pick your devices.** On a new project the audio panel is already open, since no input is chosen yet. Pick your microphone's input (macOS asks for microphone access now), speak, and pick the channel whose meter moves. Then pick the output your headphones are on. If the panel offers **Switch to 48 kHz**, use it.
+2. **Press A** to close the panel. Left open, it and the setup check together squeeze the picture.
+3. **Press C** for the setup check. It shows your devices first; Enter goes on to the next step, and Space starts each measurement: read the sentence until the level fits, stay quiet for five seconds for the room, then hold your headphones to the microphone while beeps measure the latency.
+4. **Press Space** to record. The film starts 2 s before the line and counts in 3-2-1; read as the words fill. Space stops the take, or it ends by itself 1.5 s after the slot.
+5. **Wait for the verdict.** "checking…" turns into `keep`, `listen` or `retake`, with the reason.
+6. **Press P** to play the take back with the film.
+7. **Press Enter** to choose it, and close the window.
+
+Then export:
 
 ```sh
 takewise export demo.takewise
@@ -93,7 +110,7 @@ After each take, on your Mac:
 
 - **Words.** whisper.cpp transcribes the take without being shown the script, so it doesn't hear what it expects. Missing or extra words give `retake`. A word heard differently, such as “dock” for “port”, gives `listen`, because names and numbers are often misheard.
 - **Timing.** Speech that ends more than 0.25 s after the slot, or starts more than 0.3 s before the line, gives `retake`.
-- **Sound.** No speech or clipped samples give `retake`. A cough or another sound inside the speech, or a voice less than 30 dB above the take's background noise, gives `listen`.
+- **Sound.** No speech or clipped samples give `retake`. If Whisper marks a cough or another sound inside the speech, Takewise flags the take with `listen`; so does a voice less than 30 dB above the background noise, measured in the take's pre-roll before you speak.
 
 The first finding is the reason shown under the take. These are automated checks with limits: P plays the line in context, the take locked to the film, so you can listen before you choose. The word checks default to English; `[check] language` in `project.toml` takes any Whisper language code, but the matching of numbers and contractions is tuned for English. Until the speech model is installed, takes get `listen` ("words not checked") while timing and sound can still give `retake`, and their words are checked once it is there.
 
@@ -107,11 +124,13 @@ Takewise records at 48 kHz from an input running at that rate. For an input set 
 
 ### A setup check before the first take
 
-<p align="center"><img src="docs/images/setup-check.png" alt="Two steps of the setup check side by side. Voice: read &quot;The quick brown fox jumps over the lazy dog, then naps by the warm fire.&quot;; peak −9.0 dBFS, speech −22.7 dBFS; the level fits. Room: stay quiet for five seconds; room floor −66.2 dBFS, your voice 43 dB above it: good; saved as room tone." width="784"><br><sub>The setup check's voice and room steps, each with its result.</sub></p>
+<p align="center"><img src="docs/images/setup-voice.png" alt="The setup check's voice step: read &quot;The quick brown fox jumps over the lazy dog, then naps by the warm fire.&quot;; peak −9.0 dBFS, speech −22.7 dBFS; the level fits." width="380"> <img src="docs/images/setup-room.png" alt="The setup check's room step: stay quiet for five seconds; room floor −66.2 dBFS, your voice 43 dB above it: good; saved as room tone." width="380"><br><sub>The setup check's voice and room steps, each with its result.</sub></p>
 
 Press C, and Takewise walks you through your devices, flagging speakers and Bluetooth headphones. Then it listens while you read a sentence and tells you how far to turn the gain on your interface. Next it records five seconds of silence and rates how far your voice stands above the room's noise; that recording is kept as room tone for the export's noise reduction. When the latency hasn't been measured for these devices, a last step does it: hold your headphones against the microphone and press Space, and beeps play for about 15 seconds while Takewise measures where they land (`takewise calibrate --write` does the same from the command line).
 
 ### Export for your editor
+
+<p align="center"><img src="docs/images/export.png" alt="The demo project's export/narration.wav drawn as one strip from 0:00 to 1:00, 60.0 s, as long as the film, at −16.0 LUFS and a true peak of −1.5 dBTP: six takes, each shaded where the manifest places it and labeled orbit, coast, capsule, storm, ocean and desert, with silence between them." width="830"><br><sub>The demo's export, its takes spoken by macOS <code>say</code>: one file as long as the film, each line's take where <code>export/manifest.json</code> places it.</sub></p>
 
 `takewise export` writes `export/narration.wav` (or FLAC): one mono file that starts at the film's first frame and is exactly as long as the film. Each chosen take is placed at its line's current start plus the offset it was recorded at, and trimmed to its detected speech with a short margin, so moving a line's start moves its take with it. Beside the file, `export/manifest.json` lists each line's sample positions, words and timings, for an agent or script that adds markers or places takes one by one.
 
@@ -127,11 +146,13 @@ You stay at the mic. An agent can draft the script, read line and take status as
 
 ```console
 $ takewise status earth.takewise
-earth.takewise  ·  film 60.0 s  ·  4 line(s)
+earth.takewise  ·  film 60.0 s  ·  6 line(s)
 orbit           1 take(s)  chosen 1 (narrator)   proposed 1  keep
 coast           1 take(s)  chosen 1 (narrator)   proposed 1  keep
 capsule         4 take(s)  chosen 4 (narrator)   proposed 4  keep
 storm           1 take(s)  chosen –              proposed 1  keep
+ocean           1 take(s)  chosen 1 (narrator)   proposed 1  keep
+desert          1 take(s)  chosen 1 (narrator)   proposed 1  keep
 $ takewise judge earth.takewise storm 1 --verdict keep \
     --reason "clear, unhurried" --by claude-opus-5-5 --score 0.8
 Judged storm take 1: keep
@@ -140,7 +161,7 @@ Chose storm take 1 (claude-opus-5-5)
 $ takewise export earth.takewise
 ```
 
-The export then reports `Wrote earth.takewise/export/narration.wav (4 line(s)): clean 48000 Hz 24-bit wav, -16.0 LUFS, true peak -1.5 dBTP`.
+The export then reports `Wrote earth.takewise/export/narration.wav (6 line(s)): clean 48000 Hz 24-bit wav, -16.0 LUFS, true peak -1.5 dBTP`. This is the demo project of the screenshots, takes spoken by macOS `say`; `mise run screenshots` runs these commands on a copy of it.
 
 [docs/agents.md](docs/agents.md) is the agent's guide: the whole loop with the exact commands and JSON. A test runs the guide's commands in order on a scratch project, with fixture takes in place of the narrator's `takewise record`, and checks that every JSON example has the shape of the real output.
 
@@ -176,7 +197,7 @@ H and the monitor volume keys (`,` and `.`) belong to monitoring, which isn't av
 
 ## Status
 
-0.1.0 is the first release. The checks and the export are tested against recorded human narration; recording is covered by automated tests with simulated devices, and a full session on real interfaces is still to come. Not yet:
+0.1.0 is the first release. The check thresholds were tuned on eight lines of real narration recorded, outside Takewise, for an earlier film, and the clean export was measured on them (−16.0 LUFS, −1.5 dBTP). Automated tests use synthetic speech and simulated devices; a full session recorded in Takewise on a real interface is still to come. Not yet:
 
 - **Hearing your own voice through Takewise.** Use your interface's direct (hardware) monitoring.
 - **Writing the script inside the app.** In the window, E edits a line's text and M its start; new lines go into `script.toml`.
