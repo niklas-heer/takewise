@@ -117,6 +117,8 @@ struct Placed {
     /// Source start and destination start and end, after cropping.
     src: usize,
     dest: (usize, usize),
+    /// The speech without its margins in destination samples, cropped.
+    speech: (usize, usize),
     /// The take was recorded against different text than the line has now.
     old_text: bool,
     /// The unclamped speech in film seconds, when part of it lies outside
@@ -200,6 +202,7 @@ fn export_locked(
             message,
         });
     }
+    split_margins(&mut placed);
     refused.extend(overlaps(&placed));
     if !refused.is_empty() {
         remove_if_present(&dir.join(MANIFEST_FILE))?;
@@ -342,6 +345,10 @@ fn place(
             "chosen takes whose speech lies outside the film",
         ));
     }
+    let speech_dest = (
+        (offset + seconds_to_samples(speech_start, rate)).clamp(0, film_len),
+        (offset + seconds_to_samples(speech_end, rate)).clamp(0, film_len),
+    );
     let clamped = (speech_film.0.max(0.0), speech_film.1.min(duration));
     let cropped_speech = (clamped != speech_film).then_some(speech_film);
     let (src0, src1, dest0, dest1) = (
@@ -364,6 +371,7 @@ fn place(
         samples,
         src: src0,
         dest: (dest0, dest1),
+        speech: (to_usize(speech_dest.0), to_usize(speech_dest.1)),
         old_text: take.recorded_against_old_text,
         cropped_speech,
     })
@@ -428,16 +436,45 @@ fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
     warnings
 }
 
+/// Where only the margins of two neighbouring takes overlap, splits the
+/// gap between their speech at its midpoint: each keeps its margin up to
+/// there. Takes whose speech overlaps are left for [`overlaps`].
+fn split_margins(placed: &mut [Placed]) {
+    let mut order: Vec<usize> = (0..placed.len()).collect();
+    order.sort_by_key(|&i| placed[i].speech);
+    for pair in order.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let (a_end, b_start) = (placed[a].speech.1, placed[b].speech.0);
+        if a_end > b_start || placed[a].dest.1 <= placed[b].dest.0 {
+            continue;
+        }
+        let mid = a_end + (b_start - a_end) / 2;
+        let first = &mut placed[a];
+        first.dest.1 = first.dest.1.min(mid);
+        let second = &mut placed[b];
+        if second.dest.0 < mid {
+            second.src += mid - second.dest.0;
+            second.dest.0 = mid;
+        }
+    }
+    for p in placed {
+        let len = p.dest.1 - p.dest.0;
+        p.line.source_samples = [to_u64(p.src), to_u64(p.src + len)];
+        p.line.dest_samples = [to_u64(p.dest.0), to_u64(p.dest.1)];
+    }
+}
+
+/// Pairs of takes whose speech (without the margins) overlaps in the film.
 fn overlaps(placed: &[Placed]) -> Vec<Refusal> {
     let mut refused = Vec::new();
     for (i, a) in placed.iter().enumerate() {
         for b in placed.iter().skip(i + 1) {
-            if a.dest.0 < b.dest.1 && b.dest.0 < a.dest.1 {
+            if a.speech.0 < b.speech.1 && b.speech.0 < a.speech.1 {
                 refused.push(Refusal {
                     code: "overlap",
                     lines: vec![a.line.id.clone(), b.line.id.clone()],
                     message: format!(
-                        "{} and {} overlap in the film; choose another take or move a start",
+                        "the speech of {} and {} overlaps in the film; choose another take or move a start",
                         a.line.id, b.line.id
                     ),
                 });
@@ -777,6 +814,32 @@ mod tests {
         );
         assert_eq!(report.lines, []);
         assert!(!dir.join("export/narration.wav").exists());
+    }
+
+    #[test]
+    fn export_splits_overlapping_margins_between_neighbours() {
+        // Speech at 10..11 s and 11.1..12.1 s of film: only the 150 ms
+        // margins overlap, so the 0.1 s gap is split at 11.05 s.
+        let script = "[[line]]\nid = \"one\"\nstart = 10.0\ntext = \"A.\"\n\n[[line]]\nid = \"two\"\nstart = 11.1\ntext = \"B.\"\n";
+        let (_tmp, dir) = setup(script);
+        let a = take(&dir, "one", Some((2.0, 3.0)));
+        let b = take(&dir, "two", Some((2.0, 3.0)));
+        choose(&dir, &a);
+        choose(&dir, &b);
+        let report = run(&dir, false);
+        assert_eq!(refused_codes(&report), Vec::<&str>::new(), "{report:?}");
+        let (one, two) = (&report.lines[0], &report.lines[1]);
+        assert_eq!(one.dest_samples[1], two.dest_samples[0]);
+        assert!(one.dest_samples[1].abs_diff(530_400) <= 480, "{one:?}");
+        // Each keeps its margin on the other side and its source range
+        // follows its destination.
+        assert_eq!(one.dest_samples[0], 384_000 + 96_000 - 7_200);
+        assert_eq!(
+            one.source_samples[1] - one.source_samples[0],
+            one.dest_samples[1] - one.dest_samples[0]
+        );
+        assert_eq!(two.dest_samples[0] - 436_800, two.source_samples[0]);
+        assert_eq!(two.source_samples[1], 144_000 + 7_200);
     }
 
     #[test]

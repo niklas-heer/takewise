@@ -26,8 +26,8 @@ pub struct State {
     /// validation problems and missing chosen take files.
     pub problems: Vec<Problem>,
     /// Worth knowing but not blocking: crash leftovers (torn or bad ledger
-    /// lines, partial and unadopted files), stale chosen takes, missing
-    /// files of takes that are not chosen.
+    /// lines, partial and unadopted files), stale chosen takes, chosen takes
+    /// whose speech overlaps, missing files of takes that are not chosen.
     pub notices: Vec<Problem>,
 }
 
@@ -255,6 +255,8 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
         });
     }
 
+    speech_overlaps(&lines, &mut notices);
+
     let ids: HashSet<&str> = project.script.lines.iter().map(|l| l.id.as_str()).collect();
     let mut orphans: Vec<TakeRef> = ledger
         .events
@@ -346,6 +348,37 @@ fn take_findings(
                     take.take
                 ),
             ));
+        }
+    }
+}
+
+/// Chosen takes of two lines whose speech (from their latest checks)
+/// overlaps in the film, which export refuses: a notice naming both, so the
+/// narrator learns before exporting.
+fn speech_overlaps(lines: &[LineState], notices: &mut Vec<Problem>) {
+    let spans: Vec<(&str, f64, f64)> = lines
+        .iter()
+        .filter_map(|line| {
+            let (chosen, _) = line.chosen.as_ref()?;
+            let take = line.takes.iter().find(|t| t.take == *chosen)?;
+            let (start, end) = take.speech?;
+            let at = line.start + take.line_offset_s;
+            Some((line.id.as_str(), at + start, at + end))
+        })
+        .collect();
+    for (i, &(a, a_start, a_end)) in spans.iter().enumerate() {
+        for &(b, b_start, b_end) in spans.iter().skip(i + 1) {
+            if a_start < b_end && b_start < a_end {
+                notices.push(Problem::new(
+                    Some(a),
+                    "speech-overlap",
+                    format!(
+                        "the speech of the chosen takes of {a} and {b} overlaps from {:.2} s to {:.2} s of the film; export refuses them",
+                        a_start.max(b_start),
+                        a_end.min(b_end)
+                    ),
+                ));
+            }
         }
     }
 }
@@ -872,6 +905,43 @@ text = "Today we start."
             "{:?}",
             state.notices
         );
+    }
+
+    #[test]
+    fn overlapping_speech_of_chosen_takes_is_a_notice() {
+        // Each take's speech is 2..3 s of a take from 2 s before its line:
+        // 10..11 s and 10.5..11.5 s of film.
+        let script = "[[line]]\nid = \"one\"\nstart = 10.0\ntext = \"A.\"\n\n[[line]]\nid = \"two\"\nstart = 10.5\ntext = \"B.\"\n";
+        let (_tmp, project) = setup(script);
+        for line in ["one", "two"] {
+            recorded(&project, line, 1);
+            checked(&project, line, 1, Verdict::Keep, 0, None);
+        }
+        let overlaps = |state: &State| -> Vec<Problem> {
+            state
+                .notices
+                .iter()
+                .filter(|n| n.code == "speech-overlap")
+                .cloned()
+                .collect()
+        };
+        // Only chosen takes count.
+        chosen(&project, "one", 1, "narrator");
+        assert_eq!(overlaps(&fold_now(&project)), []);
+        chosen(&project, "two", 1, "narrator");
+        let found = overlaps(&fold_now(&project));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].line.as_deref(), Some("one"));
+        assert!(found[0].message.contains("two"), "{found:?}");
+
+        // Speech apart, margins or not, is fine.
+        let (_tmp, project) = setup(TWO_LINES);
+        for line in ["hook", "today"] {
+            recorded(&project, line, 1);
+            checked(&project, line, 1, Verdict::Keep, 0, None);
+            chosen(&project, line, 1, "narrator");
+        }
+        assert_eq!(overlaps(&fold_now(&project)), []);
     }
 
     #[test]
