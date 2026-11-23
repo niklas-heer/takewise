@@ -2433,3 +2433,214 @@ fn long_line_scrolls_forward_and_a_retake_starts_at_the_top(cx: &mut TestAppCont
         "a retake starts from the top"
     );
 }
+
+/// Five seconds of a voice-like tone (150 Hz with harmonics) peaking at
+/// `peak_dbfs`, as capture buffers of 100 ms.
+fn voice_buffers(peak_dbfs: f64) -> Vec<Vec<i32>> {
+    let full = f64::from((1 << 23) - 1);
+    let wave = |t: f64| {
+        (1..=8)
+            .map(|k| (std::f64::consts::TAU * 150.0 * f64::from(k) * t).sin() / f64::from(k))
+            .sum::<f64>()
+    };
+    let n = 5 * 48_000;
+    let raw: Vec<f64> = (0..n).map(|i| wave(f64::from(i) / 48_000.0)).collect();
+    let peak = raw.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let gain = 10f64.powf(peak_dbfs / 20.0) * full / peak;
+    #[allow(clippy::cast_possible_truncation)]
+    let samples: Vec<i32> = raw.iter().map(|v| (v * gain).round() as i32).collect();
+    samples.chunks(4_800).map(<[i32]>::to_vec).collect()
+}
+
+/// Five seconds of quiet noise at about −70 dBFS, as buffers of 100 ms.
+fn room_buffers() -> Vec<Vec<i32>> {
+    let mut state: u32 = 0x9e37_79b9;
+    let amplitude = f64::from((1 << 23) - 1) * 10f64.powf(-70.0 / 20.0) * 3f64.sqrt();
+    #[allow(clippy::cast_possible_truncation)]
+    let samples: Vec<i32> = (0..5 * 48_000)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = f64::from(state >> 8) / f64::from(1u32 << 24) * 2.0 - 1.0;
+            (unit * amplitude).round() as i32
+        })
+        .collect();
+    samples.chunks(4_800).map(<[i32]>::to_vec).collect()
+}
+
+/// Space in the setup check, then the buffers as the capture delivers them
+/// over five seconds, then the frame that analyzes them.
+fn listen(cx: &mut TestAppContext, f: &Fixture, buffers: &[Vec<i32>]) {
+    press(cx, f.window, &["space"]);
+    let start = f.media.0.borrow().now;
+    for (i, samples) in buffers.iter().enumerate() {
+        let sink = f.media.0.borrow().sink.clone().expect("the meter captures");
+        sink.send(takewise_media::CaptureBuffer {
+            host_time_s: start + 0.1 * i as f64,
+            samples: samples.clone(),
+        })
+        .expect("the window receives");
+    }
+    f.media.set_now(start + 5.05);
+    frame(cx, f.window);
+}
+
+fn setup_step(cx: &mut TestAppContext, f: &Fixture) -> Option<super::setup::Step> {
+    f.view
+        .read_with(cx, |view, _| view.setup.as_ref().map(|s| s.step))
+}
+
+/// Opens the setup check and reads the sentence at a level that fits.
+fn through_voice(cx: &mut TestAppContext, f: &Fixture) {
+    frame(cx, f.window); // the meter's capture starts
+    press(cx, f.window, &["c", "enter"]);
+    listen(cx, f, &voice_buffers(-10.0));
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, f), Some(super::setup::Step::Room));
+}
+
+#[gpui_kit::test]
+fn setup_offered_on_first_open(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    let offer = f.view.read_with(cx, |view, _| view.setup_offer.clone());
+    assert!(
+        offer
+            .as_deref()
+            .is_some_and(|o| o.contains("no setup check")),
+        "{offer:?}"
+    );
+    // Offered, not forced: Space still records.
+    assert_eq!(setup_step(cx, &f), None);
+    press(cx, f.window, &["c"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Devices));
+    // The speakers are flagged.
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.output_warning())
+            .is_some_and(|w| w.contains("wired headphones"))
+    );
+    press(cx, f.window, &["escape"]);
+    assert_eq!(setup_step(cx, &f), None);
+}
+
+#[gpui_kit::test]
+fn setup_not_offered_when_current(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        let info = tw::SetupInfo {
+            date: "2026-11-23".to_owned(),
+            input: DEVICE.to_owned(),
+            channel: 1,
+            output: "MacBook Speakers".to_owned(),
+            room_floor_dbfs: Some(-70.0),
+            speech_to_noise_db: Some(48.0),
+        };
+        tw::set_setup(dir, &info).expect("setup");
+    });
+    frame(cx, f.window);
+    assert_eq!(
+        f.view.read_with(cx, |view, _| view.setup_offer.clone()),
+        None
+    );
+}
+
+#[gpui_kit::test]
+fn setup_never_opens_during_a_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    press(cx, f.window, &["c"]);
+    assert_eq!(setup_step(cx, &f), None);
+    assert!(message(cx, &f.view).contains("Finish the take"));
+}
+
+#[gpui_kit::test]
+fn voice_step_repeats_until_level_fits(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    press(cx, f.window, &["c", "enter"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Voice));
+    // Enter before reading stays.
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Voice));
+
+    // Too quiet: the report asks for about 20 dB more gain.
+    listen(cx, &f, &voice_buffers(-30.0));
+    let voice = f
+        .view
+        .read_with(cx, |view, _| {
+            view.setup.as_ref().and_then(|s| s.voice.clone())
+        })
+        .expect("a report");
+    assert!(!voice.level_fits(), "{voice:?}");
+    assert!((voice.gain_change_db - 20.0).abs() < 0.5, "{voice:?}");
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Voice));
+
+    // Read again after turning the gain up: it fits.
+    listen(cx, &f, &voice_buffers(-10.0));
+    let voice = f
+        .view
+        .read_with(cx, |view, _| {
+            view.setup.as_ref().and_then(|s| s.voice.clone())
+        })
+        .expect("a report");
+    assert!(voice.level_fits(), "{voice:?}");
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Room));
+    // No take was recorded.
+    assert_eq!(recorded(&f.dir), []);
+}
+
+#[gpui_kit::test]
+fn room_tone_saved_with_devices(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    through_voice(cx, &f);
+    listen(cx, &f, &room_buffers());
+    let room = f
+        .view
+        .read_with(cx, |view, _| {
+            view.setup.as_ref().and_then(|s| s.room.clone())
+        })
+        .expect("a room report");
+    assert!((room.floor_dbfs + 70.0).abs() < 1.5, "{room:?}");
+    let tones = tw::room::room_tones(&f.dir).expect("room tones");
+    assert_eq!(tones.len(), 1, "{tones:?}");
+    let tone = &tones[0];
+    assert_eq!(
+        (tone.input.as_str(), tone.channel, tone.output.as_str()),
+        (DEVICE, 1, "MacBook Speakers")
+    );
+    assert!((tone.floor_dbfs - room.floor_dbfs).abs() < 1e-9);
+    assert!(!tone.gated);
+    assert_eq!(tone.samples, 5 * 48_000);
+    assert!(f.dir.join(&tone.file).is_file());
+    assert!(tone.file.starts_with("takes/.room/"), "{}", tone.file);
+    assert_eq!(recorded(&f.dir), []);
+}
+
+#[gpui_kit::test]
+fn setup_writes_project_toml(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    through_voice(cx, &f);
+    listen(cx, &f, &room_buffers());
+    let setup = Project::open(&f.dir)
+        .expect("project")
+        .config
+        .setup
+        .expect("[setup] written");
+    assert_eq!(setup.input, DEVICE);
+    assert_eq!(setup.channel, 1);
+    assert_eq!(setup.output, "MacBook Speakers");
+    let floor = setup.room_floor_dbfs.expect("a floor");
+    assert!((floor + 70.0).abs() < 1.5, "{floor}");
+    let snr = setup.speech_to_noise_db.expect("speech to noise");
+    assert!(snr > 40.0, "{snr}");
+    assert_eq!(setup.date.len(), 10);
+    // The offer is gone; Enter finishes (the calibration is not stale for
+    // a project without an offset).
+    assert_eq!(
+        f.view.read_with(cx, |view, _| view.setup_offer.clone()),
+        None
+    );
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, &f), None);
+    assert!(message(cx, &f.view).contains("Setup check saved"));
+}

@@ -12,7 +12,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
 use crate::project::{
-    CalibrationInfo, FilmInfo, PROJECT_FILE, SCRIPT_FILE, parse_script, read_config,
+    CalibrationInfo, FilmInfo, PROJECT_FILE, SCRIPT_FILE, SetupInfo, parse_script, read_config,
     read_script_bytes,
 };
 use crate::script::validate;
@@ -192,6 +192,35 @@ pub fn set_calibration(dir: &Path, offset_ms: i32, info: &CalibrationInfo) -> Re
         set_value(cal, "date", Some(Value::from(info.date.as_str())));
         Ok(())
     })
+}
+
+/// Writes the setup check's result as `[setup]` under the lock, keeping
+/// the file's comments and layout; values the check did not measure are
+/// removed.
+pub fn set_setup(dir: &Path, info: &SetupInfo) -> Result<()> {
+    edit_project(dir, |doc| {
+        let setup = table(doc, "setup")?;
+        set_value(setup, "date", Some(Value::from(info.date.as_str())));
+        set_value(setup, "input", Some(Value::from(info.input.as_str())));
+        set_value(setup, "channel", Some(Value::from(i64::from(info.channel))));
+        set_value(setup, "output", Some(Value::from(info.output.as_str())));
+        set_value(
+            setup,
+            "room_floor_dbfs",
+            info.room_floor_dbfs.map(|db| Value::from(round_db(db))),
+        );
+        set_value(
+            setup,
+            "speech_to_noise_db",
+            info.speech_to_noise_db.map(|db| Value::from(round_db(db))),
+        );
+        Ok(())
+    })
+}
+
+/// A level to one decimal, as people read it.
+fn round_db(db: f64) -> f64 {
+    (db * 10.0).round() / 10.0
 }
 
 /// Sets the input device and channel and/or the output device in
@@ -470,6 +499,37 @@ text = "Third."
         let config = crate::project::read_config(&dir).unwrap();
         assert_eq!(config.input.device.as_deref(), Some("Main Stereo"));
         assert_eq!(config.output.device.as_deref(), Some("Speakers"));
+    }
+
+    #[test]
+    fn set_setup_writes_the_table() {
+        let (_tmp, dir) = project();
+        let info = SetupInfo {
+            date: "2026-11-23".to_owned(),
+            input: "Duo".to_owned(),
+            channel: 2,
+            output: "Duo Phones".to_owned(),
+            room_floor_dbfs: Some(-68.04),
+            speech_to_noise_db: Some(46.27),
+        };
+        set_setup(&dir, &info).unwrap();
+        let config = Project::open(&dir).unwrap().config;
+        assert_eq!(
+            config.setup,
+            Some(SetupInfo {
+                room_floor_dbfs: Some(-68.0),
+                speech_to_noise_db: Some(46.3),
+                ..info.clone()
+            })
+        );
+        // A gated input has no floor to store.
+        let gated = SetupInfo {
+            room_floor_dbfs: None,
+            speech_to_noise_db: None,
+            ..info
+        };
+        set_setup(&dir, &gated).unwrap();
+        assert_eq!(Project::open(&dir).unwrap().config.setup, Some(gated));
     }
 
     #[test]

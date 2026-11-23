@@ -63,6 +63,9 @@ pub struct Recorder {
     meter: Option<Receiver<CaptureBuffer>>,
     meter_input: Option<(String, u16)>,
     meter_retry_at: f64,
+    /// A short clip recorded from the meter's capture, without a take (the
+    /// setup check's voice and room steps), while one is being recorded.
+    clip: Option<Vec<i32>>,
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
     unsaved_retry_at: f64,
@@ -151,6 +154,7 @@ impl Recorder {
             meter: None,
             meter_input: None,
             meter_retry_at: 0.0,
+            clip: None,
             unsaved: Vec::new(),
             unsaved_retry_at: 0.0,
         }
@@ -227,6 +231,19 @@ impl Recorder {
             Phase::Recording(take) => take.writer.progress().peak_dbfs,
             _ => self.tick_peak,
         }
+    }
+
+    /// Starts keeping what the meter's capture hears, from the next tick on,
+    /// as a clip that is not a take; `false` (and nothing kept) while the
+    /// meter does not run.
+    pub fn start_clip(&mut self) -> bool {
+        self.clip = self.meter.is_some().then(Vec::new);
+        self.clip.is_some()
+    }
+
+    /// Ends the clip and hands over what it kept.
+    pub fn take_clip(&mut self) -> Option<Vec<i32>> {
+        self.clip.take()
     }
 
     /// Rests the film at `film_s` while nothing plays.
@@ -617,6 +634,9 @@ impl Recorder {
         self.tick_peak = None;
         if let Some(meter) = &self.meter {
             while let Ok(buffer) = meter.try_recv() {
+                if let Some(clip) = &mut self.clip {
+                    clip.extend_from_slice(&buffer.samples);
+                }
                 if !buffer.samples.is_empty() {
                     let peak = peak_dbfs(&buffer.samples);
                     self.level = Some((peak, now));

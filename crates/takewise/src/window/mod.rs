@@ -17,6 +17,7 @@ mod meter;
 mod panel;
 mod prompter;
 mod recorder;
+mod setup;
 mod takes;
 #[cfg(test)]
 mod tests;
@@ -69,6 +70,10 @@ gpui_kit::actions!(
         FilmLouder,
         MonitorQuieter,
         MonitorLouder,
+        ToggleSetup,
+        SetupListen,
+        SetupNext,
+        CloseSetup,
         Quit,
     ]
 );
@@ -78,8 +83,10 @@ const CONTEXT: &str = "Recorder";
 /// The key context while the line's text is edited (E): the recording keys
 /// are off so they type into the field.
 const EDITING: &str = "RecorderEditing";
+/// The key context while the setup check is open: Space and Enter drive it.
+const SETUP: &str = "RecorderSetup";
 /// The keys, along the window's bottom edge.
-const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · −/+ film · ,/. monitor · K clear clip";
+const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · ,/. monitor · K clear clip";
 /// How often the input devices are checked while idle.
 const INPUT_CHECK_S: f64 = 2.0;
 
@@ -117,6 +124,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("+", FilmLouder, Some(CONTEXT)),
         KeyBinding::new(",", MonitorQuieter, Some(CONTEXT)),
         KeyBinding::new(".", MonitorLouder, Some(CONTEXT)),
+        KeyBinding::new("c", ToggleSetup, Some(CONTEXT)),
+        KeyBinding::new("space", SetupListen, Some(SETUP)),
+        KeyBinding::new("enter", SetupNext, Some(SETUP)),
+        KeyBinding::new("escape", CloseSetup, Some(SETUP)),
+        KeyBinding::new("c", ToggleSetup, Some(SETUP)),
+        KeyBinding::new("a", TogglePanel, Some(SETUP)),
         KeyBinding::new("escape", CancelEdit, Some(EDITING)),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", Quit, None),
@@ -283,6 +296,11 @@ pub struct RecordingWindow {
     /// the last frame (with the text it laid out).
     scroll: prompter::Scroll,
     text_layout: Option<(String, gpui_kit::TextLayout)>,
+    /// The setup check while it is open (C).
+    setup: Option<setup::Setup>,
+    /// Why the setup check should run (none ran, or the devices changed),
+    /// shown as an offer.
+    setup_offer: Option<String>,
 }
 
 impl RecordingWindow {
@@ -357,6 +375,8 @@ impl RecordingWindow {
             defaults_path: None,
             scroll: prompter::Scroll::default(),
             text_layout: None,
+            setup: None,
+            setup_offer: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -560,6 +580,7 @@ impl RecordingWindow {
         self.note_issue(panel::input_issue(configured.as_deref(), &inputs));
         self.inputs = inputs;
         self.panel.calibration = tw::calibration_stale(&self.project.config, &self.current_route());
+        self.update_setup_offer();
         self.inputs_checked_at = Some(self.media.host_now_s());
     }
 
@@ -655,6 +676,7 @@ impl RecordingWindow {
         let update = self.recorder.tick(&mut *self.media, &self.dir);
         self.show(update);
         self.pause_checks_while_recording();
+        self.tick_setup(now);
         self.tick_panel(now);
         self.save_volumes(false);
         let level = self.recorder.level_dbfs(&*self.media);
@@ -974,6 +996,22 @@ fn audio_actions(
         view.toggle_monitor();
         cx.notify();
     }))
+    .on_action(cx.listener(|view, _: &ToggleSetup, _, cx| {
+        view.toggle_setup();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &SetupListen, _, cx| {
+        view.setup_listen();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &SetupNext, _, cx| {
+        view.setup_next();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &CloseSetup, _, cx| {
+        view.close_setup();
+        cx.notify();
+    }))
     .on_action(cx.listener(|view, _: &ClearClip, _, cx| {
         view.peak_meter.clear();
         cx.notify();
@@ -1026,11 +1064,26 @@ impl Render for RecordingWindow {
         let (prompter, layout) = prompter.render();
         self.text_layout = text.zip(layout);
         let panel_view = self.panel.open.then(|| self.render_panel(cx));
+        let setup_view = self.render_setup();
         let key_context = if self.editing.is_some() {
             EDITING
+        } else if self.setup.is_some() {
+            SETUP
         } else {
             CONTEXT
         };
+        let offer = self
+            .setup_offer
+            .as_ref()
+            .filter(|_| self.setup.is_none())
+            .map(|why| {
+                div()
+                    .px(px(16.))
+                    .pt(px(8.))
+                    .text_size(px(13.))
+                    .text_color(rgb(colors::WARN))
+                    .child(format!("Setup: {why}. Press C for the setup check."))
+            });
 
         let root = div()
             .id("recording-window")
@@ -1069,8 +1122,10 @@ impl Render for RecordingWindow {
                             .child(prompter),
                     )
                     .children(panel_view)
+                    .children(setup_view)
                     .child(self.side_column()),
             )
+            .children(offer)
             .child(
                 div()
                     .px(px(16.))

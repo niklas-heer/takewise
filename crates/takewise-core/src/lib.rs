@@ -9,6 +9,7 @@ pub mod export;
 pub mod fsutil;
 pub mod ledger;
 pub mod project;
+pub mod room;
 pub mod route;
 pub mod run_check;
 pub mod script;
@@ -26,7 +27,7 @@ pub mod words;
 pub use check::Transcript;
 pub use edit::{
     Field, ScriptVersion, script_version, set_calibration, set_film_info, set_latency_offset,
-    set_line_field, set_route, set_volumes,
+    set_line_field, set_route, set_setup, set_volumes,
 };
 pub use error::{Error, Result};
 pub use export::{
