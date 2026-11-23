@@ -148,7 +148,8 @@ pub struct Unchecked {
 /// The takes of the script's lines without a current check, in script and
 /// take order. A take's check is the newest `checked` event matching the
 /// line as it is now, as the fold shows it; it is current when its words
-/// were checked by the configured model with the current preprocessing
+/// were checked by the configured model (compared by file name, as the
+/// `checker` names it) with the current preprocessing
 /// ([`PREPROCESSING`]). One checked by another model or preprocessing is
 /// listed (as stale) only while transcription can be set up, so a missing
 /// model never turns its words into a failure. One whose transcription
@@ -229,6 +230,13 @@ fn select_unchecked(
     setup: Option<&str>,
     current_key: (&str, &str),
 ) -> Vec<Unchecked> {
+    // The checker names the model by its file name; the setting may be a path.
+    let (model, pre) = current_key;
+    let model = Path::new(model)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model);
+    let current_key = (model, pre);
     let mut found = Vec::new();
     for line in &project.script.lines {
         let Some(current) = project.snapshot(&line.id) else {
@@ -732,6 +740,10 @@ mod tests {
         );
         let other_pre = ("ggml-fake.bin", "hp80+norm");
         assert_eq!(select_unchecked(&project, &ledger, None, other_pre), stale);
+        // `[check] whisper_model` may name the model by a path; the checker
+        // names its file.
+        let by_path = ("models/ggml-fake.bin", PREPROCESSING);
+        assert_eq!(select_unchecked(&project, &ledger, None, by_path), []);
         // Not while transcription cannot be set up: checking again would
         // only replace the words with a failure.
         let missing = Some("whisper model x not found");
