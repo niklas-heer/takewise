@@ -701,15 +701,7 @@ impl Shot {
         let window_media = media.clone();
         let dir = dir.to_path_buf();
         let (window, view) = cx.update(|cx| {
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: point(px(0.), px(0.)),
-                    size: size(px(width), px(height)),
-                })),
-                focus: false,
-                show: false,
-                ..WindowOptions::default()
-            };
+            let options = hidden_window((width, height), cx);
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
                     RecordingWindow::new(
@@ -1149,6 +1141,73 @@ async fn social_preview(
     write_png(&out.join("social-preview.png"), &small)
 }
 
+/// Options for a hidden window of `width`×`height` logical pixels on the
+/// display with the highest scale, so the renders stay sharp when the main
+/// display is a 1x monitor.
+fn hidden_window((width, height): (f32, f32), cx: &mut App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(width), px(height)),
+        })),
+        focus: false,
+        show: false,
+        display_id: sharpest_display(cx),
+        ..WindowOptions::default()
+    }
+}
+
+thread_local! {
+    static SHARPEST: std::cell::Cell<Option<gpui_kit::DisplayId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The display whose windows have the highest scale, found once by opening
+/// a hidden window on each; `None`, without displays, leaves the choice to
+/// GPUI.
+fn sharpest_display(cx: &mut App) -> Option<gpui_kit::DisplayId> {
+    if let Some(known) = SHARPEST.get() {
+        return Some(known);
+    }
+    let mut best: Option<(gpui_kit::DisplayId, f32)> = None;
+    for display in cx.displays() {
+        let id = display.id();
+        let options = WindowOptions {
+            focus: false,
+            show: false,
+            display_id: Some(id),
+            ..WindowOptions::default()
+        };
+        let mut scale = 0.0;
+        let opened = gpui_kit::open_window(options, cx, |window, cx| {
+            scale = window.scale_factor();
+            cx.new(|_| Probe)
+        });
+        if let Ok((handle, _)) = opened {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        if best.is_none_or(|(_, top)| scale > top) {
+            best = Some((id, scale));
+        }
+    }
+    let chosen = best.map(|(id, _)| id);
+    SHARPEST.set(chosen);
+    chosen
+}
+
+/// An empty view for [`sharpest_display`]'s probe windows.
+struct Probe;
+
+impl gpui_kit::Render for Probe {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        gpui_kit::div()
+    }
+}
+
 /// Renders `view` offscreen in a hidden window of `width`×`height`
 /// logical pixels, at the screen's scale.
 async fn render_view<V: gpui_kit::Render + 'static>(
@@ -1157,15 +1216,7 @@ async fn render_view<V: gpui_kit::Render + 'static>(
     cx: &mut AsyncApp,
 ) -> Result<RgbaImage, String> {
     let (handle, _) = cx.update(|cx| {
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: size(px(width), px(height)),
-            })),
-            focus: false,
-            show: false,
-            ..WindowOptions::default()
-        };
+        let options = hidden_window((width, height), cx);
         gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| view))
             .map_err(|err| format!("cannot open the window: {err}"))
     })?;
@@ -1345,13 +1396,7 @@ async fn take_loop(demo: &Demo, work: &Path, out: &Path, cx: &mut AsyncApp) -> R
     let mut frames = Frames::default();
     for (n, &spoken) in LOOP_TAKES.iter().enumerate() {
         shot.update(cx, RecordingWindow::start_take);
-        let first = frames.0.len();
         record(&shot, &demo.spoken[spoken], &mut frames, cx).await?;
-        if n == 0 {
-            // The loop opens on the count-in's first frame: hold it a
-            // little, as the still a page shows before it plays.
-            frames.0[first].1 = 500;
-        }
         shot.update(cx, RecordingWindow::finish_take);
         shot.wait_for(cx, "the take to be saved", |view| {
             view.line_state().is_some_and(|line| line.takes.len() > n)
@@ -1389,8 +1434,8 @@ async fn take_loop(demo: &Demo, work: &Path, out: &Path, cx: &mut AsyncApp) -> R
 }
 
 /// Runs a take in `shot` while the voice says `speech` from just after the
-/// line's start, adding a frame every 0.25 s of film; stops when the speech
-/// has ended.
+/// line's start, adding a frame every 0.25 s of film from the count-in on;
+/// stops when the speech has ended.
 async fn record(
     shot: &Shot,
     speech: &[i32],
@@ -1418,7 +1463,17 @@ async fn record(
                 return Ok(());
             }
         }
-        if step % FRAME_EVERY == 0 {
+        // The take's frames start with the count-in's 3, so the loop opens
+        // on it; the moment before the film starts shows no digit.
+        let counting = cx.update(|cx| {
+            let view = shot.view.read(cx);
+            view.recorder.count_in(&*view.media).is_some()
+                || view
+                    .recorder
+                    .playhead_s(&*view.media)
+                    .is_some_and(|film_s| film_s >= line_start)
+        });
+        if step % FRAME_EVERY == 0 && counting {
             frames.add(&shot.render(cx).await?, 125);
         }
     }
