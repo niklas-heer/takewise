@@ -136,6 +136,13 @@ enum Command {
     /// Check whisper-cli (with a 1 s transcription), the whisper model,
     /// ffmpeg, ffprobe, the film and the audio devices.
     Doctor { dir: Option<PathBuf> },
+    /// Writes this process's microphone permission as JSON to `out`;
+    /// `doctor` runs it inside Takewise.app, whose permission it is.
+    #[command(hide = true)]
+    MicStatus {
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// The speech model the word checks need (not bundled, 1.5 GB).
     Models {
         #[command(subcommand)]
@@ -341,11 +348,21 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
         }
         Command::Export(args) => export(&args),
         Command::Doctor { dir } => Ok(doctor(dir.as_deref())),
+        Command::MicStatus { out } => mic_status(&out),
         Command::Models { command } => match command {
             ModelsCommand::Status => Ok(models_status()),
             ModelsCommand::Install => models_install(),
         },
     }
+}
+
+/// Writes this process's microphone permission to `out` (run inside
+/// Takewise.app by `doctor`).
+fn mic_status(out: &Path) -> Result<Outcome, CliError> {
+    let permission = takewise_media::microphone_permission();
+    std::fs::write(out, json!(permission).to_string())
+        .map_err(|err| CliError::Setup(format!("{}: {err}", out.display())))?;
+    Ok(Outcome::new(json!(permission), permission.as_str()))
 }
 
 /// The model Takewise downloads: `[check] whisper_model`'s default.
@@ -1370,6 +1387,43 @@ fn model_check(model: &str) -> Check {
     }
 }
 
+/// Whether Takewise.app may use the microphone. The permission is the
+/// app's, so it is asked inside the app (in the background, without a
+/// window or a prompt); this process would report its terminal's.
+fn microphone_check() -> Result<Check, String> {
+    let bundle = find_bundle().map_err(|err| err.to_string())?;
+    let work = tempfile::Builder::new()
+        .prefix("takewise-doctor-")
+        .tempdir()
+        .map_err(|err| err.to_string())?;
+    let out = work.path().join("microphone.json");
+    let status = std::process::Command::new("open")
+        .args(["-n", "-W", "-g", "-j"])
+        .arg(&bundle)
+        .args(["--args", "mic-status", "--out"])
+        .arg(&out)
+        .status()
+        .map_err(|err| format!("could not run `open`: {err}"))?;
+    if !status.success() {
+        return Err(format!("`open {}` failed ({status})", bundle.display()));
+    }
+    let text = std::fs::read_to_string(&out).map_err(|err| format!("no answer ({err})"))?;
+    let permission: tw::MicPermission =
+        serde_json::from_str(&text).map_err(|err| format!("unreadable answer: {err}"))?;
+    let (ok, detail) = match (permission, tw::mic_advice(permission)) {
+        (_, Some(advice)) => (false, advice),
+        (tw::MicPermission::NotDetermined, None) => {
+            (true, "not asked yet; the first take asks for it".to_owned())
+        }
+        (_, None) => (true, format!("{} may use it", bundle.display())),
+    };
+    Ok(Check {
+        name: "microphone",
+        ok,
+        detail,
+    })
+}
+
 /// Transcribes one second of silence, to prove whisper-cli, ffmpeg and
 /// the model work together.
 fn transcription_check(config: &CheckConfig) -> Check {
@@ -1449,8 +1503,14 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         }
     }
 
-    let devices = audio_devices(project.as_ref().and_then(|p| p.as_ref().ok()));
-    checks.extend(devices.checks);
+    let mut devices = audio_devices(project.as_ref().and_then(|p| p.as_ref().ok()));
+    checks.append(&mut devices.checks);
+    match microphone_check() {
+        Ok(check) => checks.push(check),
+        Err(why) => devices.warnings.push(format!(
+            "could not ask Takewise.app for its microphone permission: {why}"
+        )),
+    }
 
     let mut text = String::new();
     for check in &checks {

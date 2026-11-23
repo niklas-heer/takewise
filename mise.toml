@@ -13,6 +13,10 @@ run = "cargo run -p takewise --"
 description = "Build build/Takewise.app (release); set TAKEWISE_SIGN_IDENTITY to sign with Developer ID"
 run = "scripts/bundle"
 
+[tasks.release]
+description = "Prepare a signed release in build/release: TAKEWISE_BUILD=N mise run release [-- --notarize] (RELEASE.md)"
+run = "scripts/release"
+
 [tasks.test]
 description = "Run all tests"
 run = "cargo test --workspace"

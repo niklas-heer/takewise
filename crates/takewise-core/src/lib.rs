@@ -11,6 +11,7 @@ pub mod ffmpeg;
 pub mod fsutil;
 pub mod ledger;
 pub mod models;
+pub mod permission;
 pub mod project;
 pub mod render;
 pub mod room;
@@ -43,6 +44,7 @@ pub use ledger::{
     Checked, Chosen, Event, EventKind, Judged, Ledger, Reason, Recorded, Snapshot, Verdict, Word,
     WordDiff, WordDiffKind, append, read,
 };
+pub use permission::{MicPermission, mic_advice};
 pub use project::{
     CalibrationInfo, CheckConfig, ExportConfig, ExportFormat, FilmInfo, InputConfig, MonitorConfig,
     OutputConfig, Processing, Project, ProjectConfig, RecordConfig, SetupInfo,

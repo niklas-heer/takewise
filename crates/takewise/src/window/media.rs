@@ -72,6 +72,8 @@ pub trait Media {
     /// Why software monitoring cannot run at all, if it cannot; the seam
     /// monitoring plugs into once the hardware spike proved it.
     fn monitor_unavailable(&self) -> Option<String>;
+    /// Whether macOS lets this app use the microphone.
+    fn microphone_permission(&self) -> takewise_core::MicPermission;
 }
 
 /// The real media: AVPlayer for the film and takes, cpal for capture.
@@ -238,5 +240,9 @@ impl Media for RealMedia {
 
     fn monitor_unavailable(&self) -> Option<String> {
         Monitor::available().err().map(|err| err.to_string())
+    }
+
+    fn microphone_permission(&self) -> takewise_core::MicPermission {
+        takewise_media::microphone_permission()
     }
 }

@@ -77,6 +77,7 @@ gpui_kit::actions!(
         SetupNext,
         CloseSetup,
         InstallModel,
+        InstallCommand,
         Quit,
     ]
 );
@@ -206,7 +207,11 @@ pub fn run(dir: &Path) -> Result<(), String> {
         gpui_kit::init(cx);
         bind_keys(cx);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.set_menus([Menu::new("Takewise").items([MenuItem::action("Quit Takewise", Quit)])]);
+        cx.set_menus([Menu::new("Takewise").items([
+            MenuItem::action("Install Command Line Tool…", InstallCommand),
+            MenuItem::separator(),
+            MenuItem::action("Quit Takewise", Quit),
+        ])]);
         let media = match RealMedia::open(&film) {
             Ok(media) => media,
             Err(err) => {
@@ -627,7 +632,8 @@ impl RecordingWindow {
     fn check_inputs(&mut self) {
         let inputs: Vec<AvailableInput> = self.media.inputs();
         let configured = self.project.config.input.device.clone();
-        self.input_problem = check_input(configured.as_deref(), &inputs).err();
+        self.input_problem = tw::mic_advice(self.media.microphone_permission())
+            .or_else(|| check_input(configured.as_deref(), &inputs).err());
         self.note_issue(panel::input_issue(configured.as_deref(), &inputs));
         self.inputs = inputs;
         self.panel.calibration = tw::calibration_stale(&self.project.config, &self.current_route());
@@ -1214,6 +1220,10 @@ impl Render for RecordingWindow {
             .on_action(cx.listener(Self::cancel_edit))
             .on_action(cx.listener(|view, _: &InstallModel, _, cx| {
                 view.install_model();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|view, _: &InstallCommand, _, cx| {
+                view.message = Some(crate::cli_install::install());
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &PrevLine, _, cx| view.move_line(-1, cx)))

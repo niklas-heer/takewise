@@ -2,6 +2,7 @@
 
 mod calibrate;
 mod cli;
+mod cli_install;
 mod film;
 mod output;
 mod window;

@@ -51,6 +51,7 @@ struct Fake {
     levels: Vec<f32>,
     /// Why switching the sample rate fails, when it does.
     rate_error: Option<String>,
+    mic: tw::MicPermission,
 }
 
 #[derive(Clone)]
@@ -83,6 +84,7 @@ impl FakeMedia {
             channel_meter: None,
             levels: vec![-40.0, f32::NEG_INFINITY],
             rate_error: None,
+            mic: tw::MicPermission::Granted,
         })))
     }
 
@@ -254,6 +256,9 @@ impl Media for FakeMedia {
     }
     fn monitor_unavailable(&self) -> Option<String> {
         Some("not available yet: monitoring needs a test on your setup".to_owned())
+    }
+    fn microphone_permission(&self) -> tw::MicPermission {
+        self.0.borrow().mic
     }
 }
 
@@ -2760,4 +2765,25 @@ fn progress_then_checks_resume(cx: &mut TestAppContext) {
     assert_eq!(unheard(&f.dir), Vec::<tw::TakeRef>::new());
     let shown = message(cx, &f.view);
     assert!(shown.contains("checking the words of 1 take"), "{shown}");
+}
+
+#[gpui_kit::test]
+fn a_denied_microphone_blocks_recording_with_the_settings_path(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.0.borrow_mut().mic = tw::MicPermission::Denied;
+    press(cx, f.window, &["space"]);
+    assert!(!f.media.capturing(), "no take starts");
+    let blocked = f
+        .view
+        .read_with(cx, |view, _| view.blocked().map(str::to_owned))
+        .expect("blocked");
+    assert!(
+        blocked.contains("System Settings › Privacy & Security › Microphone"),
+        "{blocked}"
+    );
+
+    // Not asked yet: the first take asks, so recording goes ahead.
+    f.media.0.borrow_mut().mic = tw::MicPermission::NotDetermined;
+    press(cx, f.window, &["space"]);
+    assert!(f.media.capturing(), "the take starts and macOS asks");
 }

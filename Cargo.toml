@@ -17,7 +17,7 @@ takewise-media = { path = "crates/takewise-media" }
 # The macOS bridges; one version for takewise-media and the window, matching
 # the objc2 crates gpui-kit uses (CVPixelBuffer must be the same type).
 objc2 = "0.6.5"
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "AVAsset", "AVTime", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "AVAsset", "AVTime", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2-core-audio-types"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime", "CMSync", "CMBase"] }

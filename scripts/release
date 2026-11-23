@@ -1,0 +1,84 @@
+#!/bin/bash
+# Prepare a Developer ID signed Takewise release in build/release.
+# Publishing the GitHub release and the cask stays a separate, manual step
+# (RELEASE.md).
+#
+#   TAKEWISE_BUILD=2 scripts/release              signed dry run: nothing leaves this Mac
+#   TAKEWISE_BUILD=2 scripts/release --notarize   also submits the app to Apple's notary
+#                                                 service and staples the ticket
+#
+# Overrides: TAKEWISE_SIGN_IDENTITY (`-` signs ad hoc, to try the script
+# without the certificate; such artifacts are never published) and
+# TAKEWISE_NOTARY_PROFILE.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+notarize=false
+case "${1:-}" in
+  --notarize) notarize=true ;;
+  "") ;;
+  *) echo "Usage: TAKEWISE_BUILD=N scripts/release [--notarize]" >&2; exit 64 ;;
+esac
+identity="${TAKEWISE_SIGN_IDENTITY:-Developer ID Application: Niklas Heer (WL5ASJ82YX)}"
+profile="${TAKEWISE_NOTARY_PROFILE:-keywink-notary}"
+build="${TAKEWISE_BUILD:?Set TAKEWISE_BUILD to a build number higher than the last release}"
+artifacts="build/release"
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo 'Tracked files must be clean before preparing a release.' >&2
+  exit 65
+fi
+if [[ "$identity" == "-" ]]; then
+  if $notarize; then
+    echo 'An ad hoc signature cannot be notarized; set TAKEWISE_SIGN_IDENTITY to a Developer ID.' >&2
+    exit 64
+  fi
+  identity=""
+else
+  security find-identity -v -p codesigning | grep -qF "$identity" || { echo "No signing identity matching '$identity' in the Keychain." >&2; exit 64; }
+fi
+
+TAKEWISE_SIGN_IDENTITY="$identity" TAKEWISE_BUILD="$build" scripts/bundle
+app="build/Takewise.app"
+plist="$app/Contents/Info.plist"
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" == com.niklasheer.takewise ]] || { echo 'Unexpected bundle identifier.' >&2; exit 65; }
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "$build" ]] || { echo 'Unexpected build number.' >&2; exit 65; }
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+
+# The signature, the microphone entitlement and, for Developer ID, the
+# hardened runtime that notarization requires.
+codesign --verify --deep --strict --verbose=2 "$app"
+codesign -d --entitlements - --xml "$app" 2>/dev/null | grep -q 'com.apple.security.device.audio-input' || { echo 'The app lacks the audio-input entitlement.' >&2; exit 65; }
+if [[ -n "$identity" ]]; then
+  codesign -dv "$app" 2>&1 | grep -q 'flags=.*runtime' || { echo 'The app is not signed with the hardened runtime.' >&2; exit 65; }
+fi
+
+artifact="$artifacts/Takewise-$version-$build.zip"
+if [[ -e "$artifact" ]]; then
+  echo "A release artifact for $version ($build) already exists in $artifacts." >&2
+  exit 73
+fi
+
+temporary="$(mktemp -d "${TMPDIR:-/tmp}/takewise-release.XXXXXX")"
+trap 'rm -rf "$temporary"' EXIT
+if $notarize; then
+  ditto -c -k --sequesterRsrc --keepParent "$app" "$temporary/Takewise-notarization.zip"
+  xcrun notarytool submit "$temporary/Takewise-notarization.zip" --keychain-profile "$profile" --wait
+  xcrun stapler staple "$app"
+  xcrun stapler validate "$app"
+  spctl --assess --type execute --verbose "$app"
+fi
+
+mkdir -p "$artifacts"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$artifact"
+(cd "$artifacts" && shasum -a 256 "$(basename "$artifact")" > "$(basename "$artifact").sha256")
+
+echo "Prepared release artifacts:"
+echo "  $artifact"
+echo "  $artifact.sha256"
+if $notarize; then
+  echo "Publish with: gh release create v$version $artifact $artifact.sha256 --title 'Takewise $version' --notes-file <notes>"
+  echo "Then update the cask from packaging/takewise.rb: version \"$version,$build\", sha256 $(cut -d' ' -f1 "$artifact.sha256")"
+else
+  echo "Dry run: the app is ${identity:+signed but }not notarized${identity:-, and signed ad hoc}. Do not publish these artifacts."
+fi

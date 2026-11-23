@@ -33,7 +33,7 @@ if [[ -n "$identity" ]]; then
 else
   codesign --force --sign - --entitlements packaging/Takewise.entitlements "$app"
 fi
-codesign --verify --strict "$app"
+codesign --verify --deep --strict "$app"
 
 rm -rf build/Takewise.app
 mv "$app" build/Takewise.app

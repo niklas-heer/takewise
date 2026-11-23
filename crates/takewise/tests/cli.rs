@@ -15,12 +15,16 @@ use takewise_core::{Project, RecordedInput, TakeRef, begin_take, commit_take, wr
 const RATE: u32 = 48_000;
 
 /// The CLI, with the app's defaults read from a file that does not exist
-/// (tests never see the user's own device choices).
+/// (tests never see the user's own device choices) and no Takewise.app to
+/// start (`doctor` asks it for the microphone permission).
 fn takewise() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_takewise"));
     cmd.env("TAKEWISE_SETTINGS", "/nonexistent/takewise-settings.toml");
+    cmd.env("TAKEWISE_APP", NO_APP);
     cmd
 }
+
+const NO_APP: &str = "/nonexistent/Takewise.app";
 
 /// A 51.5 s WAV that ffprobe reads as the film.
 fn film(dir: &Path) -> PathBuf {
@@ -799,7 +803,8 @@ fn doctor_finds_the_tools_with_a_minimal_path() {
             .arg("doctor")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("HOME", tmp.path()),
+            .env("HOME", tmp.path())
+            .env("TAKEWISE_APP", NO_APP),
     );
     let checks = value["data"]["checks"].as_array().unwrap();
     for tool in ["whisper-cli", "ffmpeg", "ffprobe"] {
@@ -862,7 +867,14 @@ fn doctor_reports_checks() {
         "{input}"
     );
     assert!(value["data"]["inputs"].is_array(), "{value}");
-    assert!(value["data"]["warnings"].is_array(), "{value}");
+    // Without Takewise.app the permission cannot be asked: a warning.
+    let warnings = value["data"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("microphone permission")),
+        "{value}"
+    );
 }
 
 #[test]
