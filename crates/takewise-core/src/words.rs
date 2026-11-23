@@ -915,38 +915,78 @@ fn ordinal(word: &str) -> String {
 /// alignment; an annotation may span several words. Words keep their times.
 /// When a bracket is never closed, nothing is removed.
 pub fn drop_annotations(words: Vec<Word>) -> Vec<Word> {
+    isolate_annotations(words)
+        .into_iter()
+        .filter(|word| !is_annotation(&word.text))
+        .collect()
+}
+
+/// Whether a word is an annotation for a sound, such as `(coughs)`.
+pub fn is_annotation(text: &str) -> bool {
+    text.starts_with(['[', '(']) && text.ends_with([']', ')'])
+}
+
+/// Makes each annotation whisper writes for a sound a word of its own,
+/// such as `(clears throat)` from the words `(clears` and `throat)`, timed
+/// from the start of its first word to the end of its last; the spoken rest
+/// of a word stays a word with that word's times, before the annotations
+/// that close in it. When a bracket is never closed, nothing changes.
+pub fn isolate_annotations(words: Vec<Word>) -> Vec<Word> {
     let mut depth = 0_usize;
-    let mut kept = Vec::new();
+    let mut note: Option<Word> = None;
+    let mut out = Vec::new();
     for word in &words {
         let mut text = String::new();
         let mut bracketed = false;
+        let mut closed = Vec::new();
+        if let Some(note) = note.as_mut() {
+            note.text.push(' ');
+        }
         for c in word.text.chars() {
             match c {
                 '[' | '(' => {
                     depth += 1;
                     bracketed = true;
+                    note.get_or_insert_with(|| Word {
+                        text: String::new(),
+                        ..word.clone()
+                    })
+                    .text
+                    .push(c);
                 }
                 ']' | ')' => {
-                    depth = depth.saturating_sub(1);
                     bracketed = true;
+                    if let Some(open) = note.as_mut() {
+                        open.text.push(c);
+                        depth -= 1;
+                        if depth == 0
+                            && let Some(mut done) = note.take()
+                        {
+                            done.end = word.end;
+                            closed.push(done);
+                        }
+                    }
                 }
-                _ if depth == 0 => text.push(c),
-                _ => bracketed = true,
+                _ => match note.as_mut() {
+                    Some(open) => open.text.push(c),
+                    None => text.push(c),
+                },
             }
         }
         if !bracketed {
-            kept.push(word.clone());
+            out.push(word.clone());
         } else if text.chars().any(char::is_alphanumeric) {
-            kept.push(Word {
+            out.push(Word {
                 text: text.trim().to_owned(),
                 ..word.clone()
             });
         }
+        out.extend(closed);
     }
     if depth > 0 {
         return words;
     }
-    kept
+    out
 }
 
 /// A normalized heard token with the times of the words it came from.
@@ -1465,6 +1505,37 @@ mod tests {
         );
         // An unclosed bracket is not an annotation.
         assert_eq!(said(drop_annotations(heard("a (b c"))), ["a", "(b", "c"]);
+    }
+
+    #[test]
+    fn isolates_annotations_as_words_of_their_own() {
+        let said =
+            |words: &[Word]| -> Vec<String> { words.iter().map(|w| w.text.clone()).collect() };
+        let words = isolate_annotations(heard(
+            "[BLANK_AUDIO] Nobody (clears throat) misses hello(laughs) birthday.",
+        ));
+        assert_eq!(
+            said(&words),
+            [
+                "[BLANK_AUDIO]",
+                "Nobody",
+                "(clears throat)",
+                "misses",
+                "hello",
+                "(laughs)",
+                "birthday."
+            ]
+        );
+        // A multi-word annotation spans its words; others keep their times.
+        assert_eq!((words[2].start, words[2].end), (2.0, 3.5));
+        assert_eq!((words[5].start, words[5].end), (5.0, 5.5));
+        assert!(is_annotation("(clears throat)") && is_annotation("[Music]"));
+        assert!(!is_annotation("hello") && !is_annotation("(b"));
+        // An unclosed bracket is not an annotation.
+        assert_eq!(
+            said(&isolate_annotations(heard("a (b c"))),
+            ["a", "(b", "c"]
+        );
     }
 
     #[test]

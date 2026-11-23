@@ -11,14 +11,16 @@
 //!    (`overrun`, `early-start`)
 //! 5. transcription failed → `listen` (`words-not-checked`)
 //! 6. only substitutions → `listen` (`possible-mishearing`)
-//! 7. otherwise `keep`, with no reasons.
+//! 7. a sound whisper annotates inside the speech, such as `(coughs)` or
+//!    `[Music]` → `listen` (`non-speech-sound`); outside it is dropped
+//! 8. otherwise `keep`, with no reasons.
 //!
 //! Tolerances are absolute; a short line is held to the same word rules as a
 //! long one.
 
 use crate::ledger::{Checked, Reason, Snapshot, Verdict, Word, WordDiff, WordDiffKind};
 use crate::speech::Analysis;
-use crate::words::{align, normalize};
+use crate::words::{align, is_annotation, normalize};
 
 /// Speech may end this long after the slot before it is an overrun.
 pub const OVERRUN_TOLERANCE_S: f64 = 0.25;
@@ -55,25 +57,14 @@ pub fn build_checked(
     transcript: &Transcript,
     checker: &str,
 ) -> Checked {
-    let (heard, word_diffs) = match transcript {
-        Transcript::Words(words) => (
-            Some(words.clone()),
-            align(&normalize(&snapshot.text), words),
-        ),
-        Transcript::Failed(_) => (None, Vec::new()),
-    };
+    let (heard, sounds) = split_sounds(transcript, analysis.speech);
+    let word_diffs = heard
+        .as_deref()
+        .map(|spoken| align(&normalize(&snapshot.text), spoken))
+        .unwrap_or_default();
     let slot = snapshot.end - snapshot.start;
     let overrun_s = analysis.speech.map(|(_, end)| line_offset_s + end - slot);
-    let first_word = heard
-        .as_deref()
-        .and_then(|words| words.iter().map(|w| w.start).min_by(f64::total_cmp));
-    let energy_start = analysis.speech.map(|(start, _)| start);
-    let onset = match (energy_start, first_word) {
-        (Some(energy), Some(word)) if word - energy > ONSET_LEAD_S => Some(word),
-        (Some(energy), _) => Some(energy),
-        (None, word) => word,
-    };
-    let early_s = onset.map(|start| -(line_offset_s + start));
+    let early_s = speech_onset(analysis, heard.as_deref()).map(|start| -(line_offset_s + start));
 
     let mut reasons = Vec::new();
     let mut verdict = None;
@@ -139,6 +130,15 @@ pub fn build_checked(
             Verdict::Listen,
         );
     }
+    if !sounds.is_empty() {
+        add(
+            reason(
+                "non-speech-sound",
+                format!("non-speech sound in the speech: {}", sounds.join(", ")),
+            ),
+            Verdict::Listen,
+        );
+    }
 
     Checked {
         snapshot: snapshot.clone(),
@@ -153,6 +153,42 @@ pub fn build_checked(
         reasons,
         checker: checker.to_owned(),
     }
+}
+
+/// When the speech starts, in seconds from the take's first sample, for the
+/// early-start rule (see [`build_checked`]).
+fn speech_onset(analysis: &Analysis, heard: Option<&[Word]>) -> Option<f64> {
+    let first_word = heard.and_then(|words| words.iter().map(|w| w.start).min_by(f64::total_cmp));
+    let energy_start = analysis.speech.map(|(start, _)| start);
+    match (energy_start, first_word) {
+        (Some(energy), Some(word)) if word - energy > ONSET_LEAD_S => Some(word),
+        (Some(energy), _) => Some(energy),
+        (None, word) => word,
+    }
+}
+
+/// The spoken words of a transcript (`None` when it failed) and the sounds
+/// whisper annotated inside the speech, quoted, such as `“(coughs)”`; an
+/// annotation counts as inside when its middle lies in the speech range.
+fn split_sounds(
+    transcript: &Transcript,
+    speech: Option<(f64, f64)>,
+) -> (Option<Vec<Word>>, Vec<String>) {
+    let Transcript::Words(words) = transcript else {
+        return (None, Vec::new());
+    };
+    let (sounds, spoken): (Vec<&Word>, Vec<&Word>) =
+        words.iter().partition(|w| is_annotation(&w.text));
+    let inside = |sound: &&Word| {
+        let middle = f64::midpoint(sound.start, sound.end);
+        speech.is_some_and(|(start, end)| (start..=end).contains(&middle))
+    };
+    let sounds = sounds
+        .into_iter()
+        .filter(inside)
+        .map(|sound| format!("“{}”", sound.text))
+        .collect();
+    (Some(spoken.into_iter().cloned().collect()), sounds)
 }
 
 fn reason(code: &str, message: String) -> Reason {
@@ -396,6 +432,61 @@ mod tests {
             unreachable!()
         };
         assert_eq!(checked.transcript, Some(heard));
+    }
+
+    /// Words with a time each: (text, start, end) in seconds of the take.
+    fn timed(words: &[(&str, f64, f64)]) -> Transcript {
+        Transcript::Words(
+            words
+                .iter()
+                .map(|&(text, start, end)| Word {
+                    text: text.to_owned(),
+                    start,
+                    end,
+                    confidence: Some(0.9),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn non_speech_sound_inside_the_speech_listens() {
+        let transcript = timed(&[
+            ("Nobody", 1.0, 1.5),
+            ("(coughs)", 1.5, 2.0),
+            ("misses", 2.0, 2.5),
+            ("a", 2.5, 2.8),
+            ("birthday.", 2.8, 3.5),
+        ]);
+        let checked = check(&analysis(), &transcript);
+        assert_eq!(checked.verdict, Verdict::Listen);
+        assert_eq!(codes(&checked), ["non-speech-sound"]);
+        assert!(
+            checked.reasons[0].message.contains("“(coughs)”"),
+            "{:?}",
+            checked.reasons
+        );
+        assert_eq!(checked.word_diffs, []);
+        let heard: Vec<&str> = checked
+            .transcript
+            .iter()
+            .flatten()
+            .map(|w| w.text.as_str())
+            .collect();
+        assert_eq!(heard, ["Nobody", "misses", "a", "birthday."]);
+
+        // Outside the speech an annotation is dropped.
+        let transcript = timed(&[
+            ("[BLANK_AUDIO]", 0.0, 0.9),
+            ("Nobody", 1.0, 1.5),
+            ("misses", 2.0, 2.5),
+            ("a", 2.5, 2.8),
+            ("birthday.", 2.8, 3.5),
+            ("[Music]", 3.6, 4.5),
+        ]);
+        let checked = check(&analysis(), &transcript);
+        assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
+        assert_eq!(checked.transcript.map(|w| w.len()), Some(4));
     }
 
     #[test]
