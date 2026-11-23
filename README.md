@@ -1,10 +1,91 @@
 # Takewise
 
-A macOS app for recording voiceover narration over a finished film.
+Record the voiceover for a finished film, line by line, and know right away which takes are good.
 
-Takewise shows the script as a teleprompter timed to the picture, records several takes per line, and judges each take against the script: wrong words, overrun timing and sound problems. The chosen takes, with their timings, are written to a plain folder that agents and DaVinci Resolve can pick up.
+![The Takewise recording window during a take: the film's frame with a REC badge, the line "A capsule waits at its port, ready to bring the crew home." filling at the pace of its slot, the input meter, and the line's earlier takes with their verdicts: listen (heard "dock" for "port"), retake (speech ends 0.31 s after the slot), retake (missing "home") and keep, the proposed take.](docs/images/recording.png)
 
-Status: 0.1.0, the first release, covers every milestone of [the design](docs/design.md). It has been tested against recorded narration, not yet in a full session on every kind of audio interface; please report what you find.
+Takewise is a macOS app for anyone who narrates over a cut that is already done: a promo, a documentary, an explainer, a YouTube video. The script runs as a teleprompter timed to the picture. Every take of every line is kept and checked against the script, so a wrong word or a line that runs long shows up seconds after you said it, not later in the edit. When you are done, one command writes a single narration file exactly as long as the film, levelled and placed to the sample, with a manifest for DaVinci Resolve.
+
+## Why
+
+Recording narration inside an editor such as DaVinci Resolve means working against a tool built for something else. The track has to be armed and the microphone patched in a dialog; the script lives in marker notes you can't read while you speak; retakes pile up on the timeline and have to be sorted by ear. The mistakes surface later: a flubbed word you only notice while cutting, a line that runs into the next shot, a peak that clipped, a room that hums. Then the narration still needs levelling and noise cleanup.
+
+Takewise takes that job out of the editor:
+
+- **Read to picture.** The line to read is shown large under the film, with a count-in and a pace guide that fills the words across the line's slot.
+- **Retake without bookkeeping.** Every take of every line is kept. Nothing is overwritten or deleted.
+- **Know what you have.** Each take is checked for wrong and missing words, timing, clipping, stray sounds and background noise, and gets a verdict with the reason. The best take is proposed; you choose.
+- **Start with a good sound.** A setup check gets the level, the room and the latency right before the first take.
+- **Hand off one file.** The export is one narration file for the whole film at −16 LUFS, true peak below −1 dBTP, every take at its exact sample position.
+
+Everything is local: recording and checking need no network, no account and no Resolve.
+
+## How it works
+
+1. **Script.** Start a project from the finished film and write the script: one line per sentence or phrase, each with its start in film time. You write it by hand, or an AI agent drafts it.
+2. **Record to picture.** Press Space. The film plays from a little before the line, counts in, and the line fills at an even pace. Press Space again to stop.
+3. **Checked takes.** Within seconds every take has a verdict: `keep`, `listen` or `retake`, with the reason, such as `missing “home”` or `speech ends 0.31 s after the slot`. Record as many as you like.
+4. **Choose.** The top take is proposed with a hollow star. Press Enter on the one you want; Takewise never chooses for you.
+5. **Export to Resolve.** `takewise export` writes the narration file and its manifest; put it on a track at the film's first frame and every line sits where it was recorded.
+
+## What it does
+
+### Reading to picture
+
+The recording window shows the film, the line to read, its note for the narrator and the next line. Recording starts the film two seconds (`preroll_s`) before the line with a 3-2-1 count-in, and runs until you stop it or 1.5 s (`tail_s`) after the line's slot ends. The words fill from left to right at an even pace across the slot, a bar shows the slot running out, and a line longer than three rows scrolls with the pace guide, keeping the current words on the middle row. You can fix a line's wording in place (E) or set its start to the playhead while the film plays (M).
+
+### Every take checked
+
+<img src="docs/images/takes.png" alt="The takes of the line &quot;capsule&quot;: 1 listen, heard &quot;dock&quot; for &quot;port&quot;; 2 retake, speech ends 0.31 s after the slot; 3 retake, missing &quot;home&quot;; 4 keep, chosen (filled star)." width="300" align="right">
+
+After each take Takewise checks, on your Mac:
+
+- **Words**, with whisper.cpp, which hears the take without being shown the script, so it does not hear what it expects. Missing and extra words give `retake`; a word heard differently, such as “dock” for “port”, gives `listen`, since names and numbers are often misheard.
+- **Timing**: speech that ends more than 0.25 s after the line's slot, or starts more than 0.3 s before the line, gives `retake` with the amount.
+- **Sound**: no speech or clipped samples give `retake`; a cough or another sound inside the speech, or a voice less than 30 dB above the take's own background noise, gives `listen`.
+
+The first finding is the reason shown under the take. The takes of a line are ranked, the top one gets a hollow star (proposed), and the take you choose with Enter gets a filled one. P plays the line in context, the take locked to the film, so you can listen before you choose.
+
+<br clear="right">
+
+### A setup check before the first take
+
+<img src="docs/images/setup-check.png" alt="The setup check: the voice step reports peak −9.0 dBFS and speech −22.7 dBFS, the level fits; the room step reports a room floor of −66.2 dBFS with the voice 43 dB above it: good, saved as room tone." width="380" align="right">
+
+Press C and Takewise walks you through your devices, your voice and your room. It listens while you read a sentence and tells you how far to turn the gain on your interface; it records five seconds of silence and rates how far your voice stands above the room's noise, with tips when it is too close. It flags speakers and Bluetooth headphones, and asks for a latency calibration when the devices changed. The silence is kept as room tone for noise reduction in the export.
+
+<br clear="right">
+
+### Sound you can see
+
+![The audio panel next to the film: the input "USB Audio Interface" with a live meter per channel, the output, film and monitor volume sliders, monitoring switched off with the reason, and the input meter's red near-clipping light.](docs/images/audio-panel.png)
+
+Press A for the audio panel: the input and the channel your microphone is on (each channel has its own meter, so the one that moves is yours), the output the film plays through, and the film and monitor volume. The input meter shows a target band and a near-clipping light that stays red until you clear it with K.
+
+### Clean export for Resolve
+
+`takewise export` uses each line's chosen take and writes `export/narration.wav` (or FLAC), mono, starting at the film's first frame and exactly as long as the film, with `export/manifest.json` listing every line's exact sample positions, its words and timings. The default `clean` processing high-passes each take, reduces its noise when a room tone from the setup check matches it, and brings the narration to −16 LUFS integrated with a transparent limiter that keeps the true peak below −1 dBTP. Takes themselves are never changed. The export refuses, naming the lines, when a line has no chosen take or two lines overlap, so a mistake does not reach the edit.
+
+### Built for agents
+
+Every step is also a command with JSON output, and the project is a plain folder of TOML, JSONL and WAV. An AI agent can run the whole loop around the narrator: draft `script.toml` from the cut, read every take's verdict, add its own judgment (`takewise judge`), choose takes, export, and place the narration in Resolve with the manifest. [docs/agents.md](docs/agents.md) walks through that loop with the exact commands and JSON shapes; a test runs every command in it.
+
+```console
+$ takewise status earth.takewise
+earth.takewise  ·  film 60.0 s  ·  6 line(s)
+orbit           1 take(s)  chosen 1 (narrator)   proposed 1  keep
+coast           1 take(s)  chosen 1 (narrator)   proposed 1  keep
+capsule         4 take(s)  chosen 4 (narrator)   proposed 4  keep
+storm           1 take(s)  chosen –              proposed 1  keep
+ocean           0 take(s)  chosen –              proposed –
+desert          0 take(s)  chosen –              proposed –
+
+$ takewise status earth.takewise --json | jq -c '.data.lines[] | select(.id == "capsule") | .takes[] | {take, effective, reason}'
+{"take":1,"effective":"listen","reason":"heard “dock” for “port”"}
+{"take":2,"effective":"retake","reason":"speech ends 0.31 s after the slot"}
+{"take":3,"effective":"retake","reason":"missing “home”"}
+{"take":4,"effective":"keep","reason":null}
+```
 
 ## Install
 
@@ -22,10 +103,6 @@ The first take asks for the microphone. If you said no, the window says so and d
 
 Recording, choosing and `raw` WAV export at 48 kHz work without `whisper-cli` and `ffmpeg`.
 
-### From source
-
-With Rust (pinned in `rust-toolchain.toml`) and [mise](https://mise.jdx.dev): `mise run build`, `mise run run -- <command>`, `mise run check`. Recording runs inside `Takewise.app`, so the microphone permission belongs to Takewise rather than to the terminal that started it: build the bundle with `mise run bundle` (a release build in `build/Takewise.app`, signed ad hoc, so macOS asks for the microphone again after each rebuild; set `TAKEWISE_SIGN_IDENTITY` to a Developer ID to keep the grant). `takewise record` looks for the bundle it runs in, then `$TAKEWISE_APP`, then `/Applications/Takewise.app`, then the repository's `build/Takewise.app`. Without Homebrew, **Takewise › Install Command Line Tool…** in the app links `~/.local/bin/takewise` to the binary inside the bundle; it never replaces a file that is not a link to a Takewise bundle. Releases are described in [RELEASE.md](RELEASE.md).
-
 ## A first session
 
 1. **Start a project** from the finished film and write the script, by hand or with an agent ([the agent guide](docs/agents.md)):
@@ -35,9 +112,20 @@ With Rust (pinned in `rust-toolchain.toml`) and [mise](https://mise.jdx.dev): `m
    $EDITOR promo.takewise/script.toml
    ```
 
-   Each line is a `[[line]]` table with an `id`, the `start` in seconds of film time, an optional `end`, the `text` and an optional `note`; see [Project folder](docs/design.md#project-folder).
+   Each line is a `[[line]]` table with an `id`, the `start` in seconds of film time, an optional `end`, the `text` and an optional `note`:
 
-2. **Open the recording window** with `takewise record promo.takewise`. Press **A** to pick the microphone's input and channel and the headphones' output, then **C** for [the setup check](#the-setup-check): your level, the room's noise and the latency. Run `takewise calibrate promo.takewise --write` once per device pair when it asks.
+   ```toml
+   [[line]]
+   id = "capsule"
+   start = 22.5
+   end = 26.6
+   text = "A capsule waits at its port, ready to bring the crew home."
+   note = "Calm. Let it land on “home”."
+   ```
+
+   See [Project folder](docs/design.md#project-folder) for the whole format.
+
+2. **Open the recording window** with `takewise record promo.takewise`. Press **A** to pick the microphone's input and channel and the headphones' output, then **C** for [the setup check](docs/reference.md#the-setup-check): your level, the room's noise and the latency. Run `takewise calibrate promo.takewise --write` once per device pair when it asks.
 
 3. **Record.** Space starts a take of the current line: the film plays from a little before the line, counts in, and the line fills at an even pace across its slot. Space again stops. Every take is kept and checked: words, timing and sound, with a verdict (`keep`, `listen`, `retake`) in the take list. Record more takes with R, listen with P, and press Enter on the take you want.
 
@@ -63,72 +151,37 @@ With Rust (pinned in `rust-toolchain.toml`) and [mise](https://mise.jdx.dev): `m
 | K | Clear the clipping light |
 | I | Install the speech model, while it is missing |
 
+Monitoring your own voice through Takewise is not available yet: it waits for a test on a real interface with wired headphones. If your interface has direct (hardware) monitoring, use that to hear yourself.
+
 ### The start window
 
 Opening `Takewise.app` from the Dock or Finder shows the start window. **Open project…** (⌘O) opens a `.takewise` folder; any other folder asks for the finished film and starts a project there (in a new `<film>.takewise` folder inside it, unless the folder is empty or named `….takewise`). If that `<film>.takewise` project exists already for this film, it opens; if it belongs to another film of the same name, the new project is named after the film's full file name (`Promo.mov.takewise`). Recent projects are listed below; a project that is already open comes to the front instead of opening twice.
 
-## Agents
-
-Every state the window shows is readable with `--json`, and the folder is plain TOML, JSONL and WAV, so an agent can run everything but the recording itself: write the script, read the checks, judge and choose takes, export, and place the narration in Resolve. [docs/agents.md](docs/agents.md) walks through that loop with the exact commands and JSON shapes; a test runs every command in it.
-
-## Command line
-
-Every command takes the project directory. With `--json` it prints one JSON object on stdout: `{"ok":true,"data":…}`, or `{"ok":false,"error":{"code":…,"message":…}}` with the data that led to it. Exit codes: 0 success, 1 a finding (an export that refuses, `status --strict` with problems, a failed `doctor` check), 2 a usage or setup error.
-
-```sh
-takewise init promo.takewise --film renders/promo.mp4   # measure the film, create an empty script
-$EDITOR promo.takewise/script.toml                      # agents write the [[line]] tables
-takewise status promo.takewise                          # lines, takes, verdicts, proposed and chosen takes, problems
-takewise script set promo.takewise hook --start 1.5     # change one field of one line, keeping comments
-takewise judge promo.takewise hook 2 --verdict keep --reason "clear, warm" --by claude-opus-5-5 --score 0.8
-takewise choose promo.takewise hook 2 --by claude-opus-5-5
-takewise export promo.takewise                          # export/narration.wav (or .flac) and export/manifest.json
-takewise record promo.takewise                          # open the recording window in Takewise.app
-takewise calibrate promo.takewise --write               # loopback test: store latency_offset_ms
-takewise doctor promo.takewise                          # tools, the model, the microphone, the film, input devices and the output
-takewise models status                                  # whether the speech model is installed
-takewise models install                                 # download and verify it (1.5 GB), resuming
-```
-
-- `status --strict` exits 1 while a line has no chosen take or any problem exists; `--repair` adopts takes a crash left without a ledger event; `--refresh-film` re-measures a film that changed. Notices, which do not fail `--strict`, include `calibration-stale` (the input, the output or the capture buffer differs from the ones the latency was measured on) `no-setup` (no setup check has run yet) and `setup-changed` (the devices changed since the setup check); for either, press C in the recording window.
-- `script set` takes exactly one of `--text`, `--start`, `--end`, `--note`, `--clear-end` and `--clear-note`. Pass `--expect <script_version>` from `status --json` to refuse the edit if the script changed since you read it.
-- `export` uses each line's chosen take and refuses, naming the lines, when one has none, when a take has no detectable speech, or when two lines overlap. It also refuses when the film is missing (`film-missing`) or changed since it was measured (`film-changed`: its size, modification time or duration differ; check the timings, then run `status --refresh-film`; the film is probed again just before the files are published, so one replaced during the export refuses too), and when the project changed twice while it rendered (`state-changed`; export again). `--use-proposed` fills unchosen lines with the proposed take. `[export]` in `project.toml` sets the file, and `--format wav|flac`, `--bit-depth 16|24`, `--sample-rate 48000|44100` and `--processing raw|clean` override it for one export. `raw` places the takes as recorded. `clean`, the default for projects made by `init`, high-passes each take at 80 Hz, reduces its noise by up to 10 dB when a room tone from the setup check matches it (a `noise-reduction-skipped` warning says per line when and why it did not), and brings the narration to −16 LUFS integrated with one gain and a transparent look-ahead peak limiter that keeps the true peak below −1 dBTP; the limiter never takes more than 6 dB, so very dynamic narration can stay below the target (`loudness_target_reached: false` and a `loudness-target-missed` warning). The manifest records the measured loudness and true peak of the final file. Takes are never changed. 16-bit files are dithered. `ffmpeg` is needed for `clean`, 44.1 kHz and FLAC; `raw` WAV at 48 kHz works without it. A project without `[export]` exports 48 kHz 24-bit WAV, `raw`. Only one narration file sits beside the manifest: switching the format removes the other.
-- `record` refuses a script with validation problems (exit 1) and exits 2 when no `Takewise.app` is found. In the window: Space records or stops a take of the current line (pre-roll, a count-in, the line filling at an even pace across its slot), Enter chooses the selected take, R records another, P plays the line in context with the take locked to the film, M sets the line's start to the playhead while the film plays, E edits the line's text, ↑/↓ move between lines and ←/→ between takes. A line longer than three rows scrolls with the pace guide, keeping the current words on the middle row. The audio keys are described [below](#sound-the-audio-panel-and-meters), and C opens [the setup check](#the-setup-check). The window records only from the project's `[input] device` at 48 kHz and says why when it cannot. It reloads when `script.toml` or `takes.jsonl` change, and refuses an edit made against a script that changed on disk. Closing it mid-take keeps the take.
-- `calibrate` plays ten short beeps (made with `ffmpeg`) with seeks through the default output, or `--output <device>`, while the project's input records them in Takewise.app; hold the headphones to the microphone. It prints where the beeps landed (mean and standard deviation in ms) and with `--write` stores the offset that cancels the mean in `[input] latency_offset_ms`, with the input, output and capture buffer size it was measured on in `[calibration]`, keeping `project.toml`'s comments. Without `--output` it plays through the project's `[output] device`, else the system output. Fewer than six detected beeps exits 1. Calibrate again whenever `status` or the audio panel says the calibration is stale.
-- `check` runs the checks (energy speech detection, whisper-cli words, sound, timing, background noise) on every take without a current check and appends a `checked` event each; `--line` and `--take` re-run those takes even when checked, `--stale-only` only those checked against older text or an older slot, or transcribed by another model (`[check] whisper_model`) or preprocessing. Whisper hears a copy high-passed at 60 Hz and peak-normalized; the take is never changed. A missing whisper-cli, ffmpeg or model exits 2 with how to install it.
-- `doctor` lists the input devices with their sample rates and channels, checks the project's input device (chosen, connected, at 48 kHz), and warns when the output is Bluetooth.
-
-The project folder is plain TOML, JSONL and WAV; see [Project folder](docs/design.md#project-folder) in the design.
-
-## Sound: the audio panel and meters
-
-Press **A** in the recording window for the audio panel. It also opens by itself when the project's input is missing, not chosen, or not running at 48 kHz, and says so in plain words; recording stays off until that is fixed.
-
-- **Input, channel and output.** Pick the input device and the output the film plays through. Every channel of the input has its own live meter: speak, and the channel that moves carries your microphone (on the RØDECaster Duo that depends on RØDE Central's routing); click it to record from it. An input at another rate offers **Switch to 48 kHz**, which sets the device's rate as Audio MIDI Setup would, or says why the device refused. Device changes apply between takes; during a take the pickers are disabled. The choices are saved in `project.toml` (`[input]`, `[output]`) and as the defaults for new projects in `~/Library/Application Support/Takewise/settings.toml`.
-- **Volume.** Film volume and monitor volume are sliders and keys that match the character you type, so they work on QWERTY and QWERTZ alike: `-` and `+` for the film, `,` and `.` for the monitor, 1 dB per press (film −60 to 0 dB, monitor −60 to +6 dB). They work during a take too, and are saved to `[record] film_gain_db` and `[monitor] volume_db` between takes.
-- **Meters.** The input meter holds its peak for 1.5 s over a shaded target band from −18 to −6 dBFS. The near-clipping light turns red at −1 dBFS and stays red until **K** or the next take. A take whose samples reached −0.1 dBFS says "clipped" in its row.
-- **Monitoring (H)** is not available yet: it waits for a test on a real interface with wired headphones, which proves it adds no dropouts and does not move the takes. Until then the panel's switch stays off with that reason, and H says so. If your interface has direct (hardware) monitoring, use it to hear yourself; when software monitoring arrives, leave it off with direct monitoring on, or you will hear yourself twice. Monitoring will never change what is recorded.
-
-## The setup check
-
-Press **C** in the recording window. The window offers it, with a line above the keys, when no setup check has run on the project or the devices changed since; it never opens by itself and never during a take. It walks through four steps (Enter goes on, Esc closes):
-
-1. **Devices:** the input, channel and output (change them in the audio panel, A). Speakers and Bluetooth output are flagged: use wired headphones.
-2. **Voice:** press Space and read the sentence on screen. You get the peak and the average speech level, any clipping, and the gain change on your interface that puts the peaks near −10 dBFS; read again until it says the level fits. Hints for popped consonants (a pop filter, or the mic slightly off-axis) and a boomy sound (a little further from the mic) never block anything.
-3. **Room:** press Space and stay quiet for five seconds. You get the room's noise floor and how far your voice stands above it (40 dB or more good, 30–40 acceptable, below 30 noisy, with tips), and mains hum when it is there. The recording is kept as room tone in `takes/.room/`, which `clean` export uses for noise reduction on takes recorded on the same input, channel and (local) day at the same gain.
-4. **Latency:** only when the latency calibration does not match the devices; it says to run `takewise calibrate --write`.
-
-The results go to `[setup]` in `project.toml`. Every take's check also compares its speech with the noise in its own pre-roll: less than 30 dB apart gives `listen` with `background-noise`.
-
 ## Placing the narration in DaVinci Resolve
 
-The narration file (`export/narration.wav` or `.flac`, mono, at the manifest's `sample_rate` and `bit_depth`) starts at the film's first frame and is exactly as long as the film. Takewise has no Resolve code; an agent with Resolve tools places it:
+The narration file (`export/narration.wav` or `.flac`, mono, at the manifest's `sample_rate` and `bit_depth`) starts at the film's first frame and is exactly as long as the film. Takewise has no Resolve code; you, or an agent with Resolve tools, place it:
 
 1. Import the narration file named in the manifest's `narration.file` into the media pool.
 2. Add a new mono audio track to the film's timeline and place it at the timeline's start (the film's first frame), so sample 0 lines up with frame 0.
 3. For each entry in `export/manifest.json` under `lines`, add a timeline marker at `speech_film_s[0]` with the line's `id` as its name and `text` as its note.
 
 To place takes individually instead, put each line's `take_file` (always the raw original at 48 kHz) on the track at `dest_samples[0] / sample_rate` seconds and trim it to `source_samples` (take samples at `source_sample_rate`, 48 kHz); the positions in the manifest are exact sample offsets.
+
+## Reference
+
+- [docs/reference.md](docs/reference.md): every command and its options, exit codes and refusals, the export formats and processing, the audio panel and meters, the setup check step by step, and how the screenshots are made.
+- [docs/agents.md](docs/agents.md): an agent's full loop with the exact commands and JSON.
+- [docs/design.md](docs/design.md): the design, the folder format and the reasons behind them.
+
+### From source
+
+With Rust (pinned in `rust-toolchain.toml`) and [mise](https://mise.jdx.dev): `mise run build`, `mise run run -- <command>`, `mise run check`. Recording runs inside `Takewise.app`, so the microphone permission belongs to Takewise rather than to the terminal that started it: build the bundle with `mise run bundle` (a release build in `build/Takewise.app`, signed ad hoc, so macOS asks for the microphone again after each rebuild; set `TAKEWISE_SIGN_IDENTITY` to a Developer ID to keep the grant). `takewise record` looks for the bundle it runs in, then `$TAKEWISE_APP`, then `/Applications/Takewise.app`, then the repository's `build/Takewise.app`. Without Homebrew, **Takewise › Install Command Line Tool…** in the app links `~/.local/bin/takewise` to the binary inside the bundle; it never replaces a file that is not a link to a Takewise bundle. Releases are described in [RELEASE.md](RELEASE.md).
+
+## Status
+
+0.1.0, the first release, covers every milestone of [the design](docs/design.md). It has been tested against recorded narration, not yet in a full session on every kind of audio interface; please report what you find.
+
+The screenshots show a demo project over NASA's public-domain footage "Earth Views from the International Space Station", with takes spoken by macOS `say`; `mise run screenshots` makes them again ([how](docs/reference.md#regenerating-the-screenshots)).
 
 ## License
 
