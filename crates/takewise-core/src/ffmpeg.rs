@@ -6,10 +6,49 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::whisper::{find_tool, run_tool_stderr, tool_command};
+use crate::whisper::{ToolError, find_tool, run_tool_captured, run_tool_stderr, tool_command};
 
 /// How long one export step may run before `ffmpeg` is stopped.
 pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long `ffprobe` may take to read the film's duration; export probes
+/// the film again under the project lock, which a stalled probe must not
+/// hold.
+pub const FILM_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `ffprobe` ran longer than its timeout and was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeTimedOut;
+
+/// The film's duration in seconds as `ffprobe` (run at lower priority)
+/// reads it; `None` when it cannot (it fails, or reports no duration);
+/// [`ProbeTimedOut`] when it runs longer than `timeout`.
+pub fn probe_duration(
+    ffprobe: &Path,
+    film: &Path,
+    timeout: Duration,
+) -> Result<Option<f64>, ProbeTimedOut> {
+    let mut command = tool_command(ffprobe);
+    command
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(film);
+    let stdout = match run_tool_captured(&mut command, ffprobe, timeout, true) {
+        Ok((stdout, _)) => stdout,
+        Err(ToolError::TimedOut(_)) => return Err(ProbeTimedOut),
+        Err(ToolError::Failed(_)) => return Ok(None),
+    };
+    Ok(serde_json::from_slice::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|value| value["format"]["duration"].as_str()?.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0))
+}
 
 /// The `ffmpeg` executable and how long a run may take.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,5 +160,45 @@ mod tests {
         // 24-bit PCM reads scaled to −1..1.
         crate::takes::write_take_wav(&path, &[1 << 22], 48_000).unwrap();
         assert_eq!(read_float_wav(&path).unwrap(), (vec![0.5], 48_000));
+    }
+
+    /// A script at `dir/name` running `body`.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_film_probe_reads_the_duration_and_stops_when_it_stalls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let film = tmp.path().join("film.mp4");
+        std::fs::write(&film, b"").unwrap();
+        let reads = script(
+            tmp.path(),
+            "ffprobe",
+            r#"echo '{"format": {"duration": "52.250000"}}'"#,
+        );
+        assert_eq!(
+            probe_duration(&reads, &film, Duration::from_secs(10)),
+            Ok(Some(52.25))
+        );
+        let fails = script(tmp.path(), "broken", "exit 1");
+        assert_eq!(
+            probe_duration(&fails, &film, Duration::from_secs(10)),
+            Ok(None)
+        );
+        let stalls = script(tmp.path(), "stalls", "exec sleep 30");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            probe_duration(&stalls, &film, Duration::from_millis(300)),
+            Err(ProbeTimedOut)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stopped in time"
+        );
     }
 }

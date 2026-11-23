@@ -762,7 +762,9 @@ impl ExportArgs {
 }
 
 /// The film at `path` now, measured like `init` measured it: its size and
-/// modification time, and its duration when `ffprobe` can read it.
+/// modification time, and its duration when `ffprobe` can read it within
+/// [`tw::ffmpeg::FILM_PROBE_TIMEOUT`] (export probes again under the
+/// project lock; a stalled probe is stopped and refuses the export).
 fn film_on_disk(path: &Path) -> tw::Result<tw::FilmOnDisk> {
     if !path.exists() {
         return Ok(tw::FilmOnDisk::Missing);
@@ -771,7 +773,15 @@ fn film_on_disk(path: &Path) -> tw::Result<tw::FilmOnDisk> {
         path: path.to_path_buf(),
         source,
     })?;
-    let duration_s = film::probe(path).ok().map(|info| info.duration_s);
+    let duration_s = match tw::whisper::find_tool("ffprobe") {
+        Some(ffprobe) => {
+            match tw::ffmpeg::probe_duration(&ffprobe, path, tw::ffmpeg::FILM_PROBE_TIMEOUT) {
+                Ok(duration_s) => duration_s,
+                Err(tw::ffmpeg::ProbeTimedOut) => return Ok(tw::FilmOnDisk::ProbeTimedOut),
+            }
+        }
+        None => None,
+    };
     Ok(tw::FilmOnDisk::Found {
         size,
         modified,

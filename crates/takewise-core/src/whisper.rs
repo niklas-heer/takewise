@@ -38,7 +38,7 @@
 //! rejected rather than trusted.
 
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -411,27 +411,77 @@ pub(crate) fn run_tool_stderr(
     tool: &Path,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
+    run_tool_captured(command, tool, timeout, false)
+        .map(|(_, stderr)| stderr)
+        .map_err(ToolError::into_message)
+}
+
+/// Why a tool run through [`run_tool_captured`] did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolError {
+    /// It ran longer than its timeout and was stopped.
+    TimedOut(String),
+    /// It could not start, or failed.
+    Failed(String),
+}
+
+impl ToolError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            ToolError::TimedOut(message) | ToolError::Failed(message) => message,
+        }
+    }
+}
+
+/// Runs a tool as [`run_tool`] does; returns its stdout (when `stdout` asks
+/// for it, else empty) and stderr, and tells a timeout from a failure.
+pub(crate) fn run_tool_captured(
+    command: &mut Command,
+    tool: &Path,
+    timeout: Duration,
+    stdout: bool,
+) -> Result<(Vec<u8>, Vec<u8>), ToolError> {
     if !is_executable(tool) {
-        return Err(format!(
+        return Err(ToolError::Failed(format!(
             "could not run {}: not an executable file",
             tool.display()
-        ));
+        )));
     }
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("could not run {}: {err}", tool.display()))?;
-    // Read stderr on the side, so a chatty tool never blocks on a full pipe.
-    let (sender, receiver) = mpsc::channel();
-    if let Some(mut stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = stderr.read_to_end(&mut buffer);
-            let _ = sender.send(buffer);
-        });
-    }
+        .map_err(|err| ToolError::Failed(format!("could not run {}: {err}", tool.display())))?;
+    // Read both pipes on the side, so a chatty tool never blocks on a full
+    // pipe.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = mpsc::channel();
+        if let Some(mut pipe) = pipe {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.read_to_end(&mut buffer);
+                let _ = sender.send(buffer);
+            });
+        }
+        receiver
+    };
+    let out_receiver = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let receiver = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -441,12 +491,14 @@ pub(crate) fn run_tool_stderr(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(match waited {
-                    Err(err) => format!("could not wait for {}: {err}", tool.display()),
-                    Ok(_) => format!(
+                    Err(err) => {
+                        ToolError::Failed(format!("could not wait for {}: {err}", tool.display()))
+                    }
+                    Ok(_) => ToolError::TimedOut(format!(
                         "{} timed out after {} s and was stopped",
                         tool.display(),
                         timeout.as_secs_f64()
-                    ),
+                    )),
                 });
             }
         }
@@ -456,7 +508,10 @@ pub(crate) fn run_tool_stderr(
         .recv_timeout(Duration::from_secs(1))
         .unwrap_or_default();
     if status.success() {
-        return Ok(stderr);
+        let out = out_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_default();
+        return Ok((out, stderr));
     }
     let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -467,7 +522,7 @@ pub(crate) fn run_tool_stderr(
     if !tail.is_empty() {
         let _ = write!(message, ": {}", tail.join(" / "));
     }
-    Err(message)
+    Err(ToolError::Failed(message))
 }
 
 /// The DTW preset for a model file name: `ggml-large-v3-turbo-q5_0.bin` is

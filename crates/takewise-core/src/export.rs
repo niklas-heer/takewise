@@ -271,6 +271,21 @@ pub enum FilmOnDisk {
         /// and modification time decide alone.
         duration_s: Option<f64>,
     },
+    /// `ffprobe` stalled and was stopped: whether the film is the one
+    /// measured is unknown, so export refuses with `film-probe-timeout`.
+    ProbeTimedOut,
+}
+
+/// The refusal for a film probe that stalled.
+fn probe_timeout_refusal() -> Refusal {
+    Refusal {
+        code: "film-probe-timeout",
+        lines: Vec::new(),
+        message: format!(
+            "ffprobe did not read the film within {} s and was stopped; export again",
+            crate::ffmpeg::FILM_PROBE_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 /// Durations closer than this are the same film.
@@ -282,6 +297,7 @@ fn film_refusal(project: &Project, film: &FilmOnDisk) -> Option<Refusal> {
     let info = &project.config.film_info;
     let refresh = "check the timings, then run `takewise status --refresh-film`";
     match film {
+        FilmOnDisk::ProbeTimedOut => Some(probe_timeout_refusal()),
         FilmOnDisk::Missing => Some(Refusal {
             code: "film-missing",
             lines: Vec::new(),
@@ -459,6 +475,7 @@ fn film_moved(project: &Project, started: &FilmOnDisk, now: &FilmOnDisk) -> Opti
         return None;
     }
     Some(match now {
+        FilmOnDisk::ProbeTimedOut => probe_timeout_refusal(),
         FilmOnDisk::Missing => Refusal {
             code: "film-missing",
             lines: Vec::new(),
@@ -1981,6 +1998,7 @@ mod tests {
         let probes = std::cell::Cell::new(0);
         for (later, code) in [
             (FilmOnDisk::Missing, "film-missing"),
+            (FilmOnDisk::ProbeTimedOut, "film-probe-timeout"),
             (
                 FilmOnDisk::Found {
                     size: size + 1,
