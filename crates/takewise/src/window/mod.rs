@@ -77,6 +77,8 @@ const CONTEXT: &str = "Recorder";
 /// The key context while the line's text is edited (E): the recording keys
 /// are off so they type into the field.
 const EDITING: &str = "RecorderEditing";
+/// The keys, along the window's bottom edge.
+const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · −/+ film · ,/. monitor · K clear clip";
 /// How often the input devices are checked while idle.
 const INPUT_CHECK_S: f64 = 2.0;
 
@@ -272,6 +274,10 @@ pub struct RecordingWindow {
     /// Where device choices are saved as defaults for new projects; none in
     /// tests.
     defaults_path: Option<PathBuf>,
+    /// How far the current line is scrolled, and its text's layout from
+    /// the last frame (with the text it laid out).
+    scroll: prompter::Scroll,
+    text_layout: Option<(String, gpui_kit::TextLayout)>,
 }
 
 impl RecordingWindow {
@@ -344,6 +350,8 @@ impl RecordingWindow {
             peak_meter: meter::PeakMeter::default(),
             take_peaks: HashMap::new(),
             defaults_path: None,
+            scroll: prompter::Scroll::default(),
+            text_layout: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -571,6 +579,7 @@ impl RecordingWindow {
         }
         self.message = None;
         self.peak_meter.clear();
+        self.scroll.reset();
         self.panel.picker = None;
         if let Err(err) = self
             .recorder
@@ -649,6 +658,49 @@ impl RecordingWindow {
             self.recorder.clip_peak_dbfs(),
             self.media.host_now_s(),
         );
+    }
+
+    /// How many rows the prompter scrolls the current line now: toward the
+    /// row of the pace fill's current word, read from the last frame's
+    /// layout of the same text; never back during a take.
+    fn scroll_rows(&mut self, film_s: f64, now: f64) -> f32 {
+        let recording = self.recorder.is_recording();
+        let target = match (self.prompter_line(), &self.text_layout) {
+            (Some(reading), Some((text, layout))) if text == reading.text => {
+                let filled = prompter::filled_bytes(reading, film_s);
+                prompter::current_row(layout, reading.text, filled).map_or(0.0, |(row, rows)| {
+                    prompter::scroll_offset(row, rows, prompter::VISIBLE_ROWS)
+                })
+            }
+            _ => 0.0,
+        };
+        self.scroll.aim(target, now, recording);
+        self.scroll.at(now)
+    }
+
+    /// The lines and the current line's takes.
+    fn side_column(&self) -> gpui_kit::AnyElement {
+        div()
+            .w(px(300.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(colors::PANEL))
+            .child(lines::lines(
+                &self.state,
+                self.line,
+                self.recorder.recording_line(),
+            ))
+            .child(takes::takes(
+                self.line_state(),
+                self.take,
+                &self
+                    .line_id()
+                    .map(|id| self.checks.pending_of(id))
+                    .unwrap_or_default(),
+                &self.clipped_takes(),
+            ))
+            .into_any_element()
     }
 
     /// The current line's takes marked "clipped": by their latest check,
@@ -875,6 +927,7 @@ impl RecordingWindow {
         };
         self.recorder.stop_playback(&mut *self.media);
         self.line = next;
+        self.scroll.reset();
         self.take = None;
         self.fix_take();
         self.park();
@@ -947,6 +1000,8 @@ impl Render for RecordingWindow {
         let recording = self.recorder.is_recording();
         let frame = self.media.latest_frame();
 
+        let now = self.media.host_now_s();
+        let scroll_rows = self.scroll_rows(film_s, now);
         let (note, next) = self.prompter_cues();
         let prompter = prompter::Prompter {
             film_s,
@@ -960,7 +1015,11 @@ impl Render for RecordingWindow {
             blocked: self.blocked(),
             message: self.message.as_deref(),
             editor: self.editing.as_ref().map(|draft| &draft.input),
+            scroll_rows,
         };
+        let text = prompter.reading.map(|reading| reading.text.to_owned());
+        let (prompter, layout) = prompter.render();
+        self.text_layout = text.zip(layout);
         let panel_view = self.panel.open.then(|| self.render_panel(cx));
         let key_context = if self.editing.is_some() {
             EDITING
@@ -1002,27 +1061,10 @@ impl Render for RecordingWindow {
                             .flex()
                             .flex_col()
                             .child(video::video(frame, count_in, recording))
-                            .child(prompter.render()),
+                            .child(prompter),
                     )
                     .children(panel_view)
-                    .child(
-                        div()
-                            .w(px(300.))
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .bg(rgb(colors::PANEL))
-                            .child(lines::lines(&self.state, self.line, self.recorder.recording_line()))
-                            .child(takes::takes(
-                                self.line_state(),
-                                self.take,
-                                &self
-                                    .line_id()
-                                    .map(|id| self.checks.pending_of(id))
-                                    .unwrap_or_default(),
-                                &self.clipped_takes(),
-                            )),
-                    ),
+                    .child(self.side_column()),
             )
             .child(
                 div()
@@ -1030,9 +1072,7 @@ impl Render for RecordingWindow {
                     .py(px(8.))
                     .text_size(px(13.))
                     .text_color(rgb(colors::DIM))
-                    .child(
-                        "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · −/+ film · ,/. monitor · K clear clip",
-                    ),
+                    .child(KEY_HINTS),
             )
     }
 }

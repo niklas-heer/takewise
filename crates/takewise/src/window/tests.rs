@@ -2363,3 +2363,39 @@ fn stale_calibration_shows_in_the_panel(cx: &mut TestAppContext) {
         None
     );
 }
+
+#[gpui_kit::test]
+fn long_line_scrolls_forward_and_a_retake_starts_at_the_top(cx: &mut TestAppContext) {
+    let words = "every answer becomes a page worth opening again ".repeat(9);
+    let script = format!(
+        "[[line]]\nid = \"long\"\nstart = 0.0\nend = 10.0\ntext = \"{}\"\n",
+        words.trim()
+    );
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        fs::write(dir.join("script.toml"), &script).expect("script");
+    });
+    begin(cx, &f, 100.0); // film 0 at host 102.4
+    let mut seen = Vec::new();
+    for step in 0..=40 {
+        let now = 102.4 + f64::from(step) * 0.25;
+        f.media.set_now(now);
+        f.media.send(now, 480);
+        frame(cx, f.window);
+        frame(cx, f.window);
+        seen.push(f.view.read_with(cx, |view, _| view.scroll.at(now)));
+    }
+    assert!(
+        seen.windows(2).all(|w| w[1] >= w[0] - 1e-6),
+        "never scrolls back during a take: {seen:?}"
+    );
+    let last = *seen.last().expect("values");
+    assert!(last >= 1.0, "a long line scrolls: {seen:?}");
+    assert!(seen[0].abs() < f32::EPSILON, "the first rows hold still");
+
+    press(cx, f.window, &["r"]);
+    let now = f.media.0.borrow().now;
+    assert!(
+        f.view.read_with(cx, |view, _| view.scroll.at(now)).abs() < f32::EPSILON,
+        "a retake starts from the top"
+    );
+}
