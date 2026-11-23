@@ -1798,6 +1798,9 @@ fn verdict_appears_after_commit(cx: &mut TestAppContext) {
         let (text, _) = super::takes::label(&state.takes[0], true);
         assert_eq!(text, "checking…");
         assert_eq!(state.takes[0].effective, None);
+        // Proposed, but no hollow star until its check is in.
+        assert_eq!(state.proposed, Some(1));
+        assert_eq!(super::takes::star(state, &state.takes[0], true), "");
     });
     release.send(()).expect("the check waits");
     for _ in 0..2000 {
@@ -1817,6 +1820,9 @@ fn verdict_appears_after_commit(cx: &mut TestAppContext) {
         assert_eq!(checked.effective, Some(tw::Verdict::Retake));
         assert_eq!(checked.reason.as_deref(), Some("no speech detected"));
         assert_eq!(super::takes::label(checked, false).0, "retake");
+        // Still proposed for agents, but a retake gets no hollow star.
+        assert_eq!(state.proposed, Some(1));
+        assert_eq!(super::takes::star(state, checked, false), "");
     });
     assert_eq!(
         *gated.heard.lock().expect("heard"),
