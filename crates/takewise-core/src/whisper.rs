@@ -176,6 +176,10 @@ pub struct WhisperCli {
     pub ffmpeg_timeout: Duration,
     /// [`WHISPER_TIMEOUT`] unless changed.
     pub whisper_timeout: Duration,
+    /// The name prefix of each transcription's temporary directory:
+    /// [`TEMP_PREFIX`] unless changed. A window's check worker extends it
+    /// with its own tag, so it signals only the tools it started.
+    pub temp_prefix: String,
 }
 
 impl WhisperCli {
@@ -200,6 +204,7 @@ impl WhisperCli {
             dtw_preset: preset.to_owned(),
             ffmpeg_timeout: FFMPEG_TIMEOUT,
             whisper_timeout: WHISPER_TIMEOUT,
+            temp_prefix: TEMP_PREFIX.to_owned(),
         })
     }
 
@@ -243,7 +248,7 @@ impl WhisperCli {
 
     fn run(&self, wav: &Path) -> Result<Vec<Word>, String> {
         let tmp = tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
+            .prefix(&self.temp_prefix)
             .tempdir()
             .map_err(|err| format!("could not create a temporary directory: {err}"))?;
         let filtered = tmp.path().join("filtered.wav");
@@ -870,6 +875,22 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         let out = args.split_whitespace().skip_while(|a| *a != "-of").nth(1);
         let out = PathBuf::from(out.unwrap());
         assert!(!out.parent().unwrap().exists(), "{}", out.display());
+    }
+
+    #[test]
+    fn both_tools_name_the_temp_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whisper = fake_whisper(tmp.path(), &format!(r#"cp "{FIXTURE}" "$out.json""#));
+        let mut cli = cli(tmp.path(), whisper);
+        cli.temp_prefix = format!("{TEMP_PREFIX}w7-");
+        assert!(matches!(
+            cli.transcribe(&tmp.path().join("take.wav")),
+            Transcript::Words(_)
+        ));
+        for file in ["args.txt", "ffmpeg-args.txt"] {
+            let args = fs::read_to_string(tmp.path().join(file)).unwrap();
+            assert!(args.contains("/takewise-whisper-w7-"), "{file}: {args}");
+        }
     }
 
     #[test]

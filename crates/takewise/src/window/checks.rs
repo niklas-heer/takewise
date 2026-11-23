@@ -9,8 +9,10 @@
 //! temporary files are removed; the cancelled check records nothing.
 //!
 //! The tools are this process's direct children whose arguments name them
-//! (`pkill -P … -f`): the transcriber in `takewise-core` starts them, and
-//! nothing else in the recording window runs them.
+//! and the worker's tag (`pkill -P … -f`): the transcriber in
+//! `takewise-core` starts them in a temporary directory whose name carries
+//! the tag ([`worker_tag`]), so two windows in one process never stop or
+//! kill each other's checks.
 //!
 //! A crash or force-quit during a take leaves them stopped for good, so the
 //! window and `takewise check` first kill the tools an earlier Takewise left
@@ -19,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -42,6 +45,17 @@ pub type SharedTranscriber = Arc<dyn Transcriber + Send + Sync>;
 pub struct Checker {
     pub transcriber: SharedTranscriber,
     pub tools: Vec<PathBuf>,
+    /// The temporary-directory prefix the transcriber's tools name
+    /// ([`worker_tag`]): only tools whose arguments name it are signalled.
+    pub tag: String,
+}
+
+/// A temporary-directory prefix no other check worker in this process
+/// uses: the transcriber's prefix with a worker number.
+pub fn worker_tag() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{}w{n}-", tw::whisper::TEMP_PREFIX)
 }
 
 /// A finished check: its verdict, or why the take could not be checked.
@@ -145,7 +159,7 @@ fn abandon() -> ! {
 
 /// Stops the tools while paused, continues them after, and kills them once
 /// cancelled; returns when cancelled and no transcription runs.
-fn signal_tools(control: &Control, tools: &[PathBuf]) {
+fn signal_tools(control: &Control, tools: &[PathBuf], tag: &str) {
     let mut stopped = false;
     let mut flags = control.lock();
     loop {
@@ -154,7 +168,7 @@ fn signal_tools(control: &Control, tools: &[PathBuf]) {
                 return;
             }
             drop(flags);
-            signal(tools, "KILL");
+            signal(tools, tag, "KILL");
             flags = control.lock();
             flags = control
                 .changed
@@ -164,7 +178,7 @@ fn signal_tools(control: &Control, tools: &[PathBuf]) {
         } else if flags.paused && flags.transcribing.is_some() {
             flags.transcribing = Some(Paused(true));
             drop(flags);
-            signal(tools, "STOP");
+            signal(tools, tag, "STOP");
             stopped = true;
             flags = control.lock();
             flags = control
@@ -174,7 +188,7 @@ fn signal_tools(control: &Control, tools: &[PathBuf]) {
                 .0;
         } else if stopped && !flags.paused {
             drop(flags);
-            signal(tools, "CONT");
+            signal(tools, tag, "CONT");
             stopped = false;
             flags = control.lock();
         } else {
@@ -187,16 +201,18 @@ fn signal_tools(control: &Control, tools: &[PathBuf]) {
 }
 
 /// Sends `signal` (such as `STOP`) to this process's direct children whose
-/// arguments name one of `tools` (also while `nice` still starts one).
-fn signal(tools: &[PathBuf], signal: &str) {
+/// arguments name one of `tools` (also while `nice` still starts one) and
+/// then a file under a directory named with `tag`.
+fn signal(tools: &[PathBuf], tag: &str, signal: &str) {
     let pattern: Vec<String> = tools
         .iter()
         .map(|tool| escape_regex(&tool.to_string_lossy()))
         .collect();
+    let pattern = format!("({}).*/{}", pattern.join("|"), escape_regex(tag));
     let _ = Command::new("/usr/bin/pkill")
         .arg(format!("-{signal}"))
         .args(["-P", &std::process::id().to_string(), "-f"])
-        .arg(pattern.join("|"))
+        .arg(pattern)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -325,7 +341,11 @@ impl Checks {
     /// Starts the worker; it ends once the `Checks` is dropped, abandoning
     /// a check in progress.
     pub fn new(dir: PathBuf, checker: Checker) -> Self {
-        let Checker { transcriber, tools } = checker;
+        let Checker {
+            transcriber,
+            tools,
+            tag,
+        } = checker;
         let (jobs_tx, jobs_rx) = channel::<TakeRef>();
         let (done_tx, done_rx) = channel();
         let control = Arc::new(Control::default());
@@ -363,7 +383,7 @@ impl Checks {
         let signalled = !tools.is_empty()
             && std::thread::Builder::new()
                 .name("takewise-check-tools".to_owned())
-                .spawn(move || signal_tools(&signaller_control, &tools))
+                .spawn(move || signal_tools(&signaller_control, &tools, &tag))
                 .is_ok();
         Self {
             jobs: worker.is_ok().then_some(jobs_tx),
@@ -489,6 +509,47 @@ mod tests {
         format!(
             "{FFMPEG} -nostdin -y -loglevel error -i /p/takes/a/001.wav -ar 16000 -ac 1 -c:a pcm_s16le {dir}/take.wav"
         )
+    }
+
+    /// A child of this process whose arguments name a file under `tag`,
+    /// as a check's tools name their temporary directory.
+    fn child_tagged(tag: &str) -> std::process::Child {
+        Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :"])
+            .arg(format!("/var/folders/T/{tag}x1/take.wav"))
+            .spawn()
+            .unwrap()
+    }
+
+    fn stopped(pid: u32) -> bool {
+        let out = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().starts_with('T')
+    }
+
+    #[test]
+    fn a_worker_signals_only_its_own_tools() {
+        let mine = worker_tag();
+        let other = worker_tag();
+        assert_ne!(mine, other);
+        assert!(mine.starts_with(tw::whisper::TEMP_PREFIX), "{mine}");
+        let mut own = child_tagged(&mine);
+        let mut theirs = child_tagged(&other);
+        let sh = [PathBuf::from("/bin/sh")];
+        signal(&sh, &mine, "STOP");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !stopped(own.id()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (own_stopped, theirs_stopped) = (stopped(own.id()), stopped(theirs.id()));
+        for child in [&mut own, &mut theirs] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(own_stopped, "its own tool is stopped");
+        assert!(!theirs_stopped, "another window's tool runs on");
     }
 
     #[test]

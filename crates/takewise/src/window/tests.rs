@@ -18,7 +18,7 @@ use takewise_core::{
 };
 use takewise_media::{CaptureBuffer, DeviceInfo, Frame, Transport};
 
-use super::checks::{Checker, SharedTranscriber};
+use super::checks::{Checker, Checks, SharedTranscriber, worker_tag};
 use super::clock::FilmClock;
 use super::{Media, RecordingWindow, bind_keys, load};
 
@@ -371,7 +371,7 @@ fn open_checked(
     prepare: impl FnOnce(&Path),
     transcriber: SharedTranscriber,
 ) -> Fixture {
-    open_tooled(cx, inputs, prepare, transcriber, Vec::new())
+    open_tooled(cx, inputs, prepare, transcriber, Vec::new(), worker_tag())
 }
 
 /// [`open_checked`] with the executables the transcriber runs as child
@@ -382,6 +382,7 @@ fn open_tooled(
     prepare: impl FnOnce(&Path),
     transcriber: SharedTranscriber,
     tools: Vec<PathBuf>,
+    tag: String,
 ) -> Fixture {
     let (tmp, dir) = project(DEVICE);
     prepare(&dir);
@@ -406,7 +407,11 @@ fn open_tooled(
                     loaded,
                     Box::new(window_media),
                     None,
-                    Checker { transcriber, tools },
+                    Checker {
+                        transcriber,
+                        tools,
+                        tag,
+                    },
                     window,
                     cx,
                 )
@@ -1975,6 +1980,9 @@ fn the_check_queue_follows_what_was_checked(cx: &mut TestAppContext) {
 struct Spawning {
     tool: &'static str,
     args: &'static [&'static str],
+    /// The worker's tag, which the temporary directory is named with; the
+    /// tool's last argument is a file in it, as the real tools' are.
+    tag: String,
     child: Mutex<Option<(u32, PathBuf)>>,
 }
 
@@ -1983,8 +1991,17 @@ impl Spawning {
         Arc::new(Self {
             tool,
             args,
+            tag: worker_tag(),
             child: Mutex::new(None),
         })
+    }
+
+    fn checker(self: &Arc<Self>) -> Checker {
+        Checker {
+            transcriber: Arc::clone(self) as SharedTranscriber,
+            tools: vec![PathBuf::from(self.tool)],
+            tag: self.tag.clone(),
+        }
     }
 
     /// The running child's pid and temporary directory, once it started.
@@ -1995,10 +2012,14 @@ impl Spawning {
 
 impl tw::Transcriber for Spawning {
     fn transcribe(&self, _: &Path) -> tw::Transcript {
-        let tmp = tempfile::tempdir().expect("temp dir");
+        let tmp = tempfile::Builder::new()
+            .prefix(&self.tag)
+            .tempdir()
+            .expect("temp dir");
         fs::write(tmp.path().join("take.wav"), b"").expect("temp file");
         let mut child = std::process::Command::new(self.tool)
             .args(self.args)
+            .arg(tmp.path().join("take.wav"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -2017,6 +2038,15 @@ impl tw::Transcriber for Spawning {
     fn model(&self) -> String {
         "ggml-spawning.bin".to_owned()
     }
+}
+
+fn open_spawning(cx: &mut TestAppContext, spawning: &Arc<Spawning>) -> Fixture {
+    let Checker {
+        transcriber,
+        tools,
+        tag,
+    } = spawning.checker();
+    open_tooled(cx, &[(DEVICE, 48_000)], |_| {}, transcriber, tools, tag)
 }
 
 /// The process state `ps` reports for `pid` (`T` when stopped), or `None`
@@ -2053,9 +2083,9 @@ fn checked_events(dir: &Path) -> usize {
 
 #[gpui_kit::test]
 fn a_running_check_is_paused_while_a_take_records(cx: &mut TestAppContext) {
-    let spawning = Spawning::new("/bin/sleep", &["1"]);
-    let tools = vec![PathBuf::from("/bin/sleep")];
-    let f = open_tooled(cx, &[(DEVICE, 48_000)], |_| {}, spawning.clone(), tools);
+    // The file argument is the shell's `$0`.
+    let spawning = Spawning::new("/bin/sh", &["-c", "sleep 1; :"]);
+    let f = open_spawning(cx, &spawning);
     record_take(cx, &f); // a take 1: its check runs the tool
     wait_until(cx, &f, || spawning.child().is_some());
     let (pid, _) = spawning.child().expect("the check runs");
@@ -2077,10 +2107,51 @@ fn a_running_check_is_paused_while_a_take_records(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_window_pausing_its_checks_leaves_another_windows_running(cx: &mut TestAppContext) {
+    // Both windows' tools are `cat`, children of this one process.
+    let mine = Spawning::new("/bin/cat", &["-"]);
+    let f = open_spawning(cx, &mine);
+    record_take(cx, &f); // a take 1: this window checks it
+    wait_until(cx, &f, || mine.child().is_some());
+    let (my_pid, _) = mine.child().expect("this window's check runs");
+
+    let theirs = Spawning::new("/bin/cat", &["-"]);
+    let mut other = Checks::new(f.dir.clone(), theirs.checker());
+    let take = tw::TakeRef {
+        line: "a".to_owned(),
+        take: 1,
+    };
+    let snapshot = Project::open(&f.dir)
+        .expect("project")
+        .snapshot("a")
+        .expect("line a");
+    other.queue(&take, &snapshot);
+    wait_until(cx, &f, || theirs.child().is_some());
+    let (their_pid, _) = theirs.child().expect("the other window's check runs");
+
+    press(cx, f.window, &["down"]);
+    begin(cx, &f, 200.0); // this window records: its own check stops
+    wait_until(cx, &f, || {
+        process_state(my_pid).is_some_and(|state| state.starts_with('T'))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let their_state = process_state(their_pid);
+
+    other.cancel(); // quitting one window kills only its own tool
+    assert_eq!(process_state(their_pid), None);
+    assert!(process_state(my_pid).is_some(), "this window's check lives");
+    f.view.update(cx, |view, _| view.shutdown());
+    assert!(
+        their_state.is_some_and(|state| !state.starts_with('T')),
+        "the other window's check runs on"
+    );
+}
+
+#[gpui_kit::test]
 fn quitting_mid_check_kills_its_child_and_temporary_files(cx: &mut TestAppContext) {
-    let spawning = Spawning::new("/bin/cat", &[]);
-    let tools = vec![PathBuf::from("/bin/cat")];
-    let f = open_tooled(cx, &[(DEVICE, 48_000)], |_| {}, spawning.clone(), tools);
+    // Reads its held-open standard input first.
+    let spawning = Spawning::new("/bin/cat", &["-"]);
+    let f = open_spawning(cx, &spawning);
     record_take(cx, &f);
     wait_until(cx, &f, || spawning.child().is_some());
     let (pid, tmp) = spawning.child().expect("the check runs");
@@ -3103,6 +3174,7 @@ impl super::model::Installer for FakeInstaller {
         Checker {
             transcriber: Arc::clone(&self.transcriber),
             tools: Vec::new(),
+            tag: worker_tag(),
         }
     }
 }

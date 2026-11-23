@@ -47,7 +47,7 @@ use takewise_core::{
 };
 
 pub use checks::reap_orphaned_tools;
-use checks::{Checker, Checks};
+use checks::{Checker, Checks, worker_tag};
 pub use clock::FilmClock;
 pub use media::{Media, RealMedia};
 use recorder::Recorder;
@@ -173,13 +173,16 @@ fn load(dir: &Path) -> Result<Loaded, tw::Error> {
 /// with the reason. Kills the tools an earlier Takewise left behind.
 fn checker(project: &Project) -> Checker {
     let config = &project.config.check;
+    let tag = worker_tag();
     match WhisperCli::discover(config) {
-        Ok(whisper) => {
+        Ok(mut whisper) => {
             let tools = vec![whisper.whisper.clone(), whisper.ffmpeg.clone()];
             reap_orphaned_tools(&tools);
+            whisper.temp_prefix.clone_from(&tag);
             Checker {
                 tools,
                 transcriber: Arc::new(whisper),
+                tag,
             }
         }
         Err(err) => Checker {
@@ -188,6 +191,7 @@ fn checker(project: &Project) -> Checker {
                 model: config.whisper_model.clone(),
             }),
             tools: Vec::new(),
+            tag,
         },
     }
 }
