@@ -208,7 +208,8 @@ impl RecordingWindow {
             return Err(format!("Could not keep the room tone: {err}"));
         }
         let info = SetupInfo {
-            date: now.strftime("%Y-%m-%d").to_string(),
+            // The local date, as the narrator's day is meant.
+            date: jiff::ZonedDateTime::now().date().to_string(),
             input,
             channel: route.channel,
             output,
@@ -232,6 +233,15 @@ impl RecordingWindow {
         let config = &self.project.config;
         let route = self.current_route();
         let mut reasons: Vec<String> = tw::setup_warning(config, &route).into_iter().collect();
+        // A full setup check records the room anyway; otherwise the room
+        // changes from day to day, so today's room tone is asked for.
+        if reasons.is_empty() {
+            let tones = tw::room::room_tones(&self.dir).unwrap_or_default();
+            let now = jiff::ZonedDateTime::now();
+            if !room_tone_today(&tones, &route, now.date(), now.time_zone()) {
+                reasons.push("no room tone recorded today with these devices".to_owned());
+            }
+        }
         if config.input.latency_offset_ms != 0
             && super::recorder::effective_latency_offset(config, &route) == 0
         {
@@ -373,6 +383,22 @@ impl RecordingWindow {
                 .into_any_element(),
         )
     }
+}
+
+/// Whether one of `tones` was recorded on `today` (in `tz`, the local
+/// time zone) with `route`'s input, channel and output.
+pub fn room_tone_today(
+    tones: &[tw::room::RoomTone],
+    route: &tw::Route,
+    today: jiff::civil::Date,
+    tz: &jiff::tz::TimeZone,
+) -> bool {
+    tones.iter().any(|tone| {
+        tz.to_datetime(tone.recorded_at).date() == today
+            && route.input.as_deref() == Some(tone.input.as_str())
+            && route.channel == tone.channel
+            && route.output.as_deref() == Some(tone.output.as_str())
+    })
 }
 
 /// A line of text in `color`.

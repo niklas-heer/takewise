@@ -2626,12 +2626,99 @@ fn setup_not_offered_when_current(cx: &mut TestAppContext) {
             speech_to_noise_db: Some(48.0),
         };
         tw::set_setup(dir, &info).expect("setup");
+        save_room_tone_at(dir, jiff::Timestamp::now());
     });
     frame(cx, f.window);
     assert_eq!(
         f.view.read_with(cx, |view, _| view.setup_offer.clone()),
         None
     );
+}
+
+/// Keeps a room tone recorded at `at` on the test devices.
+fn save_room_tone_at(dir: &Path, at: jiff::Timestamp) {
+    let input = tw::room::RoomInput {
+        input: DEVICE,
+        channel: 1,
+        output: "MacBook Speakers",
+        floor_dbfs: -70.0,
+        gated: false,
+    };
+    tw::room::save_room_tone(dir, &vec![0; 4_800], 48_000, at, &input).expect("room tone");
+}
+
+#[gpui_kit::test]
+fn room_step_offered_without_todays_room_tone(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        let info = tw::SetupInfo {
+            date: "2026-11-20".to_owned(),
+            input: DEVICE.to_owned(),
+            channel: 1,
+            output: "MacBook Speakers".to_owned(),
+            room_floor_dbfs: Some(-70.0),
+            speech_to_noise_db: Some(48.0),
+        };
+        tw::set_setup(dir, &info).expect("setup");
+        let days_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(72);
+        save_room_tone_at(dir, days_ago);
+    });
+    frame(cx, f.window);
+    let offer = f
+        .view
+        .read_with(cx, |view, _| view.setup_offer.clone())
+        .expect("an offer");
+    assert!(offer.contains("no room tone recorded today"), "{offer}");
+
+    // The setup check records today's room tone; the offer is gone.
+    through_voice(cx, &f);
+    listen(cx, &f, &room_buffers());
+    let offer = f.view.read_with(cx, |view, _| view.setup_offer.clone());
+    assert!(
+        !offer.is_some_and(|o| o.contains("room tone")),
+        "the room tone is from today"
+    );
+}
+
+#[test]
+fn room_tone_today_uses_the_local_date() {
+    let at: jiff::Timestamp = "2026-11-22T23:30:00Z".parse().expect("time");
+    let tone = tw::room::RoomTone {
+        file: "takes/.room/x.wav".to_owned(),
+        recorded_at: at,
+        input: DEVICE.to_owned(),
+        channel: 1,
+        output: "Test Phones".to_owned(),
+        sample_rate: 48_000,
+        samples: 0,
+        floor_dbfs: -70.0,
+        gated: false,
+    };
+    let route = tw::Route {
+        input: Some(DEVICE.to_owned()),
+        channel: 1,
+        output: Some("Test Phones".to_owned()),
+        buffer_frames: None,
+    };
+    let today = jiff::civil::date(2026, 11, 23);
+    let berlin = jiff::tz::TimeZone::fixed(jiff::tz::offset(1));
+    let utc = jiff::tz::TimeZone::UTC;
+    let tones = std::slice::from_ref(&tone);
+    assert!(super::setup::room_tone_today(tones, &route, today, &berlin));
+    assert!(!super::setup::room_tone_today(tones, &route, today, &utc));
+    let other = tw::Route {
+        channel: 2,
+        ..route.clone()
+    };
+    assert!(!super::setup::room_tone_today(
+        tones, &other, today, &berlin
+    ));
+    let speakers = tw::Route {
+        output: Some("MacBook Speakers".to_owned()),
+        ..route
+    };
+    assert!(!super::setup::room_tone_today(
+        tones, &speakers, today, &berlin
+    ));
 }
 
 #[gpui_kit::test]
