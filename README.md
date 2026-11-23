@@ -37,7 +37,7 @@ takewise models install
 takewise doctor
 ```
 
-The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones delay the film's sound and aren't supported for recording. The app is signed and notarized.
+The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones delay the film's sound and aren't supported for recording. The Mac's built-in microphone and its headphone jack are enough for a first try. The app is signed and notarized.
 
 The speech model (`ggml-large-v3-turbo.bin`, 1.5 GB) is downloaded once, from whisper.cpp's repository on Hugging Face and is installed only when its SHA-256 matches the one pinned in Takewise. The recording window offers the same download with a button. After that, nothing needs the network.
 

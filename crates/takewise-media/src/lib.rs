@@ -28,7 +28,8 @@ mod video;
 
 pub use capture::{CAPTURE_RATE, Capture, CaptureBuffer};
 pub use devices::{
-    DeviceInfo, Transport, default_input, default_output, input_devices, output_devices,
+    DeviceInfo, OutputSource, Transport, default_input, default_output, input_devices,
+    output_devices,
 };
 pub use error::{Error, Result};
 pub use latency::{buffer_frames, input_latency_s, set_nominal_sample_rate};

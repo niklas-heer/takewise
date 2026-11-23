@@ -3,7 +3,7 @@
 use cpal::traits::{DeviceTrait as _, HostTrait as _};
 
 use crate::error::{Error, Result};
-use crate::latency::transport;
+use crate::latency::{output_source, transport};
 
 /// How a device is connected. Bluetooth output is not supported for
 /// recording: its latency is long and varies.
@@ -28,6 +28,17 @@ impl Transport {
     }
 }
 
+/// What an output plays through now, from its current CoreAudio data
+/// source. The Mac's built-in output reports `'ispk'` for its speakers and
+/// `'hdpn'` for the headphone jack; most other devices report no data
+/// source at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSource {
+    Speakers,
+    Headphones,
+    Unknown,
+}
+
 /// An audio device: its name, current sample rate and channel count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -35,6 +46,9 @@ pub struct DeviceInfo {
     pub sample_rate: u32,
     pub channels: u16,
     pub transport: Transport,
+    /// For an output, what it plays through now; [`OutputSource::Unknown`]
+    /// for inputs.
+    pub output_source: OutputSource,
 }
 
 /// The input devices with a usable input configuration. Devices that report
@@ -86,11 +100,16 @@ fn info(device: &cpal::Device, input: bool) -> Result<DeviceInfo> {
     } else {
         device.default_output_config()?
     };
+    let uid = uid(device).ok();
     Ok(DeviceInfo {
         name,
         sample_rate: config.sample_rate(),
         channels: config.channels(),
-        transport: uid(device).map_or(Transport::Other, |uid| transport(&uid)),
+        transport: uid.as_deref().map_or(Transport::Other, transport),
+        output_source: match uid.as_deref() {
+            Some(uid) if !input => output_source(uid),
+            _ => OutputSource::Unknown,
+        },
     })
 }
 

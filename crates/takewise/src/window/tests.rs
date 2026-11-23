@@ -16,7 +16,7 @@ use gpui_kit::{
 use takewise_core::{
     self as tw, AvailableInput, EventKind, Field, FilmInfo, Project, RecordedInput, Timebase,
 };
-use takewise_media::{CaptureBuffer, DeviceInfo, Frame, Transport};
+use takewise_media::{CaptureBuffer, DeviceInfo, Frame, OutputSource, Transport};
 
 use super::checks::{Checker, Checks, SharedTranscriber, worker_tag};
 use super::clock::FilmClock;
@@ -84,8 +84,18 @@ impl FakeMedia {
             timebase: None,
             play_error: None,
             outputs: vec![
-                output("Test Phones", Transport::Usb),
-                output("MacBook Speakers", Transport::BuiltIn),
+                output("Test Phones", Transport::Usb, OutputSource::Unknown),
+                output(
+                    "MacBook Speakers",
+                    Transport::BuiltIn,
+                    OutputSource::Speakers,
+                ),
+                output(
+                    "External Headphones",
+                    Transport::BuiltIn,
+                    OutputSource::Headphones,
+                ),
+                output("Built-in Output", Transport::BuiltIn, OutputSource::Unknown),
             ],
             film_output: None,
             film_gain_db: None,
@@ -142,12 +152,13 @@ impl FakeMedia {
     }
 }
 
-fn output(name: &str, transport: Transport) -> DeviceInfo {
+fn output(name: &str, transport: Transport, output_source: OutputSource) -> DeviceInfo {
     DeviceInfo {
         name: name.to_owned(),
         sample_rate: 48_000,
         channels: 2,
         transport,
+        output_source,
     }
 }
 
@@ -2867,6 +2878,31 @@ fn setup_offered_on_first_open(cx: &mut TestAppContext) {
     );
     press(cx, f.window, &["escape"]);
     assert_eq!(setup_step(cx, &f), None);
+}
+
+/// The output warning for each of the fake outputs.
+fn warning_on(cx: &mut TestAppContext, f: &Fixture, output: &str) -> Option<&'static str> {
+    f.view.update(cx, |view, _| view.choose_output(output));
+    frame(cx, f.window);
+    f.view.read_with(cx, |view, _| view.output_warning())
+}
+
+#[gpui_kit::test]
+fn output_warning_tells_speakers_from_the_headphone_jack(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    assert_eq!(
+        warning_on(cx, &f, "MacBook Speakers"),
+        Some("Film sound from speakers will leak into your takes; use wired headphones.")
+    );
+    assert_eq!(warning_on(cx, &f, "External Headphones"), None);
+    assert_eq!(
+        warning_on(cx, &f, "Built-in Output"),
+        Some(
+            "If this is the Mac's speakers, film sound will leak into your takes; use wired headphones."
+        )
+    );
+    assert_eq!(warning_on(cx, &f, "Test Phones"), None);
 }
 
 #[gpui_kit::test]

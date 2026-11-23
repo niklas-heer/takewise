@@ -82,8 +82,8 @@ fn lists_input_devices() -> Outcome {
     )?;
     let output = default_output().map_err(|e| e.to_string())?;
     println!(
-        "    output {:<32} {} Hz {} ch {:?}",
-        output.name, output.sample_rate, output.channels, output.transport
+        "    output {:<32} {} Hz {} ch {:?} {:?}",
+        output.name, output.sample_rate, output.channels, output.transport, output.output_source
     );
     let input = default_input().map_err(|e| e.to_string())?;
     let latency = input_latency_s(&input.name).map_err(|e| e.to_string())?;
@@ -250,7 +250,10 @@ fn meters_every_channel() -> Outcome {
         meter.channels()
     );
     for output in output_devices().map_err(|e| e.to_string())? {
-        println!("    output {:<32} {:?}", output.name, output.transport);
+        println!(
+            "    output {:<32} {:?} {:?}",
+            output.name, output.transport, output.output_source
+        );
     }
     ensure(levels.len() == usize::from(meter.channels()), || {
         format!("{} levels for {} channels", levels.len(), meter.channels())

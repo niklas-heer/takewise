@@ -36,7 +36,9 @@ use gpui_kit::{
     point, px, size,
 };
 use takewise_core::{self as tw, AvailableInput, Project, RECORD_RATE, TakeRef, Timebase};
-use takewise_media::{CaptureBuffer, DeviceInfo, FilmPlayer, Frame, Monitor, Transport};
+use takewise_media::{
+    CaptureBuffer, DeviceInfo, FilmPlayer, Frame, Monitor, OutputSource, Transport,
+};
 
 use super::checks::{Checker, SharedTranscriber, worker_tag};
 use image::RgbaImage;
@@ -598,12 +600,14 @@ impl Media for DemoMedia {
                 sample_rate: RECORD_RATE,
                 channels: 2,
                 transport: Transport::Usb,
+                output_source: OutputSource::Unknown,
             },
             DeviceInfo {
                 name: SPEAKERS.to_owned(),
                 sample_rate: RECORD_RATE,
                 channels: 2,
                 transport: Transport::BuiltIn,
+                output_source: OutputSource::Speakers,
             },
         ]
     }

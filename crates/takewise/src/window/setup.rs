@@ -13,7 +13,7 @@ use gpui_kit::{
 };
 use takewise_core::setup::{RoomRating, RoomReport, VoiceReport, room_report, voice_report};
 use takewise_core::{self as tw, RECORD_RATE, SetupInfo};
-use takewise_media::Transport;
+use takewise_media::{OutputSource, Transport};
 
 use super::{RecordingWindow, colors};
 
@@ -290,18 +290,23 @@ impl RecordingWindow {
     }
 
     /// A warning about the output for recording: speakers leak into the
-    /// take, Bluetooth adds delay.
+    /// take, Bluetooth adds delay. The Mac's headphone jack is fine; when the
+    /// built-in output does not say which it plays through, the warning is
+    /// conditional.
     pub(super) fn output_warning(&self) -> Option<&'static str> {
         let name = self.current_route().output?;
         let output = self.media.outputs().into_iter().find(|o| o.name == name)?;
-        match output.transport {
-            Transport::BuiltIn => {
-                Some("Film sound from speakers will leak into your takes; use wired headphones.")
-            }
-            Transport::Bluetooth => Some(
+        match (output.transport, output.output_source) {
+            (Transport::Bluetooth, _) => Some(
                 "Bluetooth headphones delay the film's sound and are not supported for recording; use wired headphones.",
             ),
-            Transport::Usb | Transport::Other => None,
+            (_, OutputSource::Speakers) => {
+                Some("Film sound from speakers will leak into your takes; use wired headphones.")
+            }
+            (Transport::BuiltIn, OutputSource::Unknown) => Some(
+                "If this is the Mac's speakers, film sound will leak into your takes; use wired headphones.",
+            ),
+            (Transport::BuiltIn | Transport::Usb | Transport::Other, _) => None,
         }
     }
 

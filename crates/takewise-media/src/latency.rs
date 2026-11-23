@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
     AudioObjectPropertyScope, AudioObjectPropertySelector, AudioObjectSetPropertyData,
-    kAudioDevicePermissionsError, kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyLatency,
+    kAudioDevicePermissionsError, kAudioDevicePropertyBufferFrameSize,
+    kAudioDevicePropertyDataSource, kAudioDevicePropertyLatency,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
     kAudioDevicePropertyStreams, kAudioDevicePropertyTransportType,
     kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
@@ -16,11 +17,12 @@ use objc2_core_audio::{
     kAudioHardwareIllegalOperationError, kAudioHardwareNotRunningError,
     kAudioHardwarePropertyTranslateUIDToDevice, kAudioHardwareUnsupportedOperationError,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioStreamPropertyLatency,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioStreamPropertyLatency,
 };
 use objc2_core_foundation::CFString;
 
-use crate::devices::{Transport, find_input, uid};
+use crate::devices::{OutputSource, Transport, find_input, uid};
 use crate::error::{Error, Result};
 
 /// Input latency of the named device in seconds: device latency plus safety
@@ -167,6 +169,33 @@ pub(crate) fn transport(device_uid: &str) -> Transport {
             Transport::Bluetooth
         }
         _ => Transport::Other,
+    }
+}
+
+/// The built-in output's data source for its speakers. Not a named
+/// constant in the SDK; Apple's drivers and Audio MIDI Setup use it.
+const DATA_SOURCE_SPEAKERS: u32 = u32::from_be_bytes(*b"ispk");
+/// The built-in output's data source for the headphone jack.
+const DATA_SOURCE_HEADPHONES: u32 = u32::from_be_bytes(*b"hdpn");
+
+/// What the output plays through now, from its current data source
+/// (`kAudioDevicePropertyDataSource`, output scope). On Apple Silicon the
+/// speakers are a device of their own whose one source is `'ispk'` (as an
+/// M4 `MacBook` Air reports), and the jack shows up as another device while
+/// headphones are plugged in; on Intel Macs one built-in device switches
+/// between the two sources. Anything else is unknown.
+pub(crate) fn output_source(device_uid: &str) -> OutputSource {
+    let Some(id) = device_id(device_uid) else {
+        return OutputSource::Unknown;
+    };
+    match get_u32(
+        id,
+        kAudioDevicePropertyDataSource,
+        kAudioObjectPropertyScopeOutput,
+    ) {
+        Some(DATA_SOURCE_SPEAKERS) => OutputSource::Speakers,
+        Some(DATA_SOURCE_HEADPHONES) => OutputSource::Headphones,
+        _ => OutputSource::Unknown,
     }
 }
 
