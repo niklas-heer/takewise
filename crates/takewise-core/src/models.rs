@@ -36,12 +36,14 @@ pub struct ModelSpec {
 }
 
 /// The default model, `ggml-large-v3-turbo.bin` from whisper.cpp's model
-/// repository on Hugging Face. Its SHA-256 and size match both the file
-/// listing of `ggerganov/whisper.cpp` (the LFS object id) and the copy used
-/// to tune the checks (verified 2026-11-23).
+/// repository on Hugging Face, at commit `98aa99a0` (the one that added it),
+/// so a moved branch cannot change what is downloaded. Its SHA-256 and size
+/// match the file listing of `ggerganov/whisper.cpp` at that commit (the LFS
+/// object id, also the pinned URL's `x-linked-etag`) and the copy used to
+/// tune the checks (verified 2026-11-23).
 pub const PINNED: PinnedModel = PinnedModel {
     file: "ggml-large-v3-turbo.bin",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-large-v3-turbo.bin",
     sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
     size: 1_624_555_275,
 };
@@ -627,6 +629,16 @@ mod tests {
         assert_eq!(spec.sha256.len(), 64);
         assert_eq!(spec.size, 1_624_555_275);
         assert_eq!(pinned("ggml-base.bin"), None);
+        // Pinned to a commit, not a branch that can move.
+        let rev = spec
+            .url
+            .strip_prefix("https://huggingface.co/ggerganov/whisper.cpp/resolve/")
+            .and_then(|rest| rest.strip_suffix("/ggml-large-v3-turbo.bin"))
+            .unwrap();
+        assert!(
+            rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{rev} is not a commit"
+        );
     }
 
     #[test]
