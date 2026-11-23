@@ -833,8 +833,7 @@ fn scale_of(image: &RgbaImage, window_width: f32) -> f32 {
     image.width() as f32 / window_width
 }
 
-/// `images` one below the other, left-aligned, `gap` pixels apart, on
-/// `fill`.
+/// `images` one below the other, centred, `gap` pixels apart, on `fill`.
 fn stack(images: &[RgbaImage], gap: u32, fill: image::Rgba<u8>) -> RgbaImage {
     let gaps = gap * u32::try_from(images.len().saturating_sub(1)).unwrap_or(0);
     let width = images.iter().map(RgbaImage::width).max().unwrap_or(0);
@@ -842,7 +841,8 @@ fn stack(images: &[RgbaImage], gap: u32, fill: image::Rgba<u8>) -> RgbaImage {
     let mut out = RgbaImage::from_pixel(width, height, fill);
     let mut y = 0;
     for image in images {
-        image::imageops::replace(&mut out, image, 0, i64::from(y));
+        let x = (width - image.width()) / 2;
+        image::imageops::replace(&mut out, image, i64::from(x), i64::from(y));
         y += image.height() + gap;
     }
     out
@@ -998,7 +998,8 @@ async fn setup_check(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     )?;
     write_png(
         &out.join("setup-room.png"),
-        &framed(&crop(&room, WINDOW.0, (x, 0.0, 380.0, 168.0)), scale),
+        // As tall as the voice step, so the two line up side by side.
+        &framed(&crop(&room, WINDOW.0, (x, 0.0, 380.0, 236.0)), scale),
     )
 }
 
@@ -1025,8 +1026,8 @@ async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     let image = shot.render(cx).await?;
     shot.close(cx);
     // The panel (between the film and the side column) down to the film
-    // volume, and the meter row under the film: two cards, left-aligned,
-    // each as wide as what it holds.
+    // volume, and the meter row under the film: two cards, centred, each
+    // as wide as what it holds.
     let scale = scale_of(&image, WINDOW.0);
     let panel = crop(
         &image,
@@ -1511,9 +1512,11 @@ fn agent_session(demo: &Demo, work: &Path) -> Result<PathBuf, String> {
 /// The narration the agent exported, drawn as one strip as long as the
 /// film, each line's id where the manifest places its take.
 async fn export_strip(project: &Path, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
-    const SIZE: (f32, f32) = (830.0, 206.0);
+    // Type about twice the window's, so the strip still reads when a
+    // phone shows it about 324 px wide.
+    const SIZE: (f32, f32) = (830.0, 310.0);
     const PAD: f32 = 20.0;
-    const WAVE_H: f32 = 84.0;
+    const WAVE_H: f32 = 96.0;
     /// Drawn at this many pixels per logical pixel; GPUI scales it.
     const WAVE_SCALE: f32 = 2.0;
     let export = project.join("export");
@@ -1643,7 +1646,7 @@ impl gpui_kit::Render for Strip {
                 .children(items.iter().map(|(text, x)| {
                     let label = div().absolute().top(px(0.)).whitespace_nowrap();
                     // A label at the very end ends there instead.
-                    let label = if *x > self.inner - 40.0 {
+                    let label = if *x > self.inner - 70.0 {
                         label.right(px(0.))
                     } else {
                         label.left(px(*x))
@@ -1666,24 +1669,24 @@ impl gpui_kit::Render for Strip {
                 div()
                     .flex()
                     .flex_none()
-                    .flex_row()
-                    .justify_between()
-                    .pb(px(6.))
-                    .child(div().text_size(px(15.)).child(self.title.clone()))
+                    .flex_col()
+                    .gap(px(2.))
+                    .pb(px(8.))
+                    .child(div().text_size(px(30.)).child(self.title.clone()))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(24.))
                             .text_color(rgb(super::colors::DIM))
                             .child(self.detail.clone()),
                     ),
             )
-            .child(row(18.0, &self.labels, super::colors::TEXT, 13.0))
+            .child(row(32.0, &self.labels, super::colors::TEXT, 24.0))
             .child(
                 img(self.wave.clone())
                     .flex_none()
                     .w(px(self.inner))
                     .h(px(self.wave_h)),
             )
-            .child(row(16.0, &self.ticks, super::colors::DIM, 11.0))
+            .child(row(28.0, &self.ticks, super::colors::DIM, 22.0))
     }
 }
