@@ -47,18 +47,22 @@ const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
 // TODO(r7): switch to `takewise_core::effective_latency_offset(config, route)`
 // once fix/r7-core is merged, and drop this helper.
 pub fn effective_latency_offset(config: &ProjectConfig, route: &Route) -> i32 {
-    let Some(cal) = &config.calibration else {
-        return 0;
-    };
-    let matches = route.input.as_deref() == Some(cal.input.as_str())
-        && route.output.as_deref() == Some(cal.output.as_str())
-        && cal.buffer_frames.is_some()
-        && route.buffer_frames == cal.buffer_frames;
-    if matches {
+    if calibration_matches(config, route) {
         config.input.latency_offset_ms
     } else {
         0
     }
+}
+
+/// Whether `[calibration]` names exactly `route`'s input, output and
+/// buffer size (both known).
+pub fn calibration_matches(config: &ProjectConfig, route: &Route) -> bool {
+    config.calibration.as_ref().is_some_and(|cal| {
+        route.input.as_deref() == Some(cal.input.as_str())
+            && route.output.as_deref() == Some(cal.output.as_str())
+            && cal.buffer_frames.is_some()
+            && route.buffer_frames == cal.buffer_frames
+    })
 }
 
 /// What a tick or a stop produced, for the window to show.
@@ -88,6 +92,11 @@ pub struct Recorder {
     /// A short clip recorded from the meter's capture, without a take (the
     /// setup check's voice and room steps), while one is being recorded.
     clip: Option<Vec<i32>>,
+    /// The meter's buffers with their host times, kept for the latency
+    /// calibration while it runs, and whether the meter's capture stopped
+    /// or moved since the tap began (the buffers then do not line up).
+    tap: Option<Vec<CaptureBuffer>>,
+    tap_broken: bool,
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
     unsaved_retry_at: f64,
@@ -177,6 +186,8 @@ impl Recorder {
             meter_input: None,
             meter_retry_at: 0.0,
             clip: None,
+            tap: None,
+            tap_broken: false,
             unsaved: Vec::new(),
             unsaved_retry_at: 0.0,
         }
@@ -268,6 +279,37 @@ impl Recorder {
         self.clip.take()
     }
 
+    /// Starts handing over the meter's capture buffers, as captured, from
+    /// the next tick on; `false` (and nothing kept) while the meter does not
+    /// run.
+    pub fn start_tap(&mut self) -> bool {
+        self.tap = self.meter.is_some().then(Vec::new);
+        self.tap_broken = false;
+        self.tap.is_some()
+    }
+
+    /// The buffers the tap kept since the last call.
+    pub fn drain_tap(&mut self) -> Vec<CaptureBuffer> {
+        self.tap.as_mut().map(mem::take).unwrap_or_default()
+    }
+
+    /// Whether the meter's capture stopped or moved to another input since
+    /// the tap began.
+    pub fn tap_broken(&self) -> bool {
+        self.tap_broken
+    }
+
+    pub fn stop_tap(&mut self) {
+        self.tap = None;
+        self.tap_broken = false;
+    }
+
+    /// Plays the film muted briefly again before the next take: a newly
+    /// opened film starts cold.
+    pub fn rewarm(&mut self) {
+        self.warmup = Warmup::Pending;
+    }
+
     /// Rests the film at `film_s` while nothing plays.
     pub fn park(&mut self, media: &mut dyn Media, film_s: f64) {
         self.park_s = film_s;
@@ -344,6 +386,10 @@ impl Recorder {
                     }
                 }
             }
+        }
+        let metering = self.meter_input.as_ref().map(|(d, c)| (d.as_str(), *c));
+        if self.tap.is_some() && (self.meter.is_none() || metering != input) {
+            self.tap_broken = true;
         }
     }
 
@@ -665,6 +711,9 @@ impl Recorder {
                     let peak = peak_dbfs(&buffer.samples);
                     self.level = Some((peak, now));
                     self.tick_peak = Some(self.tick_peak.map_or(peak, |max| max.max(peak)));
+                }
+                if let Some(tap) = &mut self.tap {
+                    tap.push(buffer);
                 }
             }
         }

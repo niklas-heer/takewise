@@ -11,6 +11,7 @@
 
 mod checks;
 mod clock;
+mod latency;
 mod lines;
 mod media;
 mod meter;
@@ -321,6 +322,10 @@ pub struct RecordingWindow {
     /// The output the film was last set to play through; `None` is the
     /// system default (none chosen, or the chosen one could not be used).
     film_output: Option<String>,
+    /// The latency calibration while the setup check runs it, and how its
+    /// beep film is made.
+    calibrating: Option<latency::Calibrating>,
+    beep_film: latency::BeepFilm,
 }
 
 impl RecordingWindow {
@@ -399,6 +404,8 @@ impl RecordingWindow {
             setup_offer: None,
             model: None,
             film_output: None,
+            calibrating: None,
+            beep_film: crate::calibrate::make_beep_film,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -436,6 +443,7 @@ impl RecordingWindow {
     /// stops playback and the meter, and cancels the checks (their tools are
     /// killed; the takes are checked when the window opens again).
     fn shutdown(&mut self) {
+        self.calibrating = None;
         if self.recorder.is_recording() {
             self.finish_take();
         }

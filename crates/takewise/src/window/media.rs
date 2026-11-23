@@ -17,6 +17,9 @@ pub trait Media {
     fn host_now_s(&self) -> f64;
 
     fn film_ready(&self) -> bool;
+    /// Replaces the film with the one at `path` (the calibration's beep
+    /// film, then the project's again), playing through the same output.
+    fn film_open(&mut self, path: &Path) -> Result<(), String>;
     /// Plays from `film_s` at `host_s`, holding the frame until then, and
     /// returns the scheduled timebase.
     fn film_play_at(&mut self, film_s: f64, host_s: f64) -> Result<Timebase, String>;
@@ -79,6 +82,8 @@ pub trait Media {
 /// The real media: AVPlayer for the film and takes, cpal for capture.
 pub struct RealMedia {
     film: FilmPlayer,
+    /// The output the film was last set to play through.
+    output: Option<String>,
     take: Option<TakePlayer>,
     capture: Option<Capture>,
     meter: Option<ChannelMeter>,
@@ -90,6 +95,7 @@ impl RealMedia {
         let film = FilmPlayer::open(film).map_err(|err| err.to_string())?;
         Ok(Self {
             film,
+            output: None,
             take: None,
             capture: None,
             meter: None,
@@ -111,6 +117,17 @@ impl Media for RealMedia {
 
     fn film_ready(&self) -> bool {
         self.film.is_ready()
+    }
+
+    fn film_open(&mut self, path: &Path) -> Result<(), String> {
+        let film = FilmPlayer::open(path).map_err(|err| err.to_string())?;
+        if let Some(output) = &self.output {
+            film.set_output_device(output)
+                .map_err(|err| err.to_string())?;
+        }
+        self.film.pause();
+        self.film = film;
+        Ok(())
     }
 
     fn film_play_at(&mut self, film_s: f64, host_s: f64) -> Result<Timebase, String> {
@@ -210,7 +227,9 @@ impl Media for RealMedia {
     }
 
     fn film_set_output(&mut self, device: &str) -> Result<(), String> {
-        self.set_output_device(device)
+        self.set_output_device(device)?;
+        self.output = Some(device.to_owned());
+        Ok(())
     }
 
     fn start_channel_meter(&mut self, device: &str) -> Result<(), String> {

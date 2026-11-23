@@ -3,7 +3,9 @@
 //! `docs/design.md`, "Setup check"). It is offered, never forced: when a
 //! project has no `[setup]` or the devices differ from it, the window says
 //! so and C opens it; it never opens during a take. Its captures are clips
-//! of the meter's capture, never takes.
+//! of the meter's capture, never takes. The latency step runs the loopback
+//! calibration in the window (see `latency.rs`) when the project has none
+//! for the devices in use.
 
 use gpui_kit::{
     AnyElement, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -44,6 +46,8 @@ pub struct Setup {
     pub save_error: Option<String>,
     /// What went wrong last, in words.
     pub error: Option<String>,
+    /// The latency step's outcome: what was stored, or why nothing was.
+    pub latency: Option<Result<String, String>>,
 }
 
 impl Setup {
@@ -55,8 +59,27 @@ impl Setup {
             room: None,
             save_error: None,
             error: None,
+            latency: None,
         }
     }
+}
+
+/// Why the latency calibration should run on `route`, if it should: the
+/// project has none, or it was measured on other devices or another buffer
+/// size (its offset is then not applied).
+pub fn calibration_needed(config: &tw::ProjectConfig, route: &tw::Route) -> Option<String> {
+    if config.calibration.is_none() {
+        return Some("the latency is not calibrated for these devices".to_owned());
+    }
+    if super::recorder::calibration_matches(config, route) {
+        return None;
+    }
+    Some(match config.input.latency_offset_ms {
+        0 => "the latency calibration does not match these devices".to_owned(),
+        offset => format!(
+            "the latency calibration does not match these devices, so takes are placed without its {offset} ms offset"
+        ),
+    })
 }
 
 impl RecordingWindow {
@@ -76,6 +99,7 @@ impl RecordingWindow {
     }
 
     pub(super) fn close_setup(&mut self) {
+        self.cancel_calibration();
         if self
             .setup
             .take()
@@ -91,6 +115,10 @@ impl RecordingWindow {
         let Some(setup) = &mut self.setup else {
             return;
         };
+        if setup.step == Step::Latency {
+            self.start_calibration();
+            return;
+        }
         if setup.listening_until.is_some() || !matches!(setup.step, Step::Voice | Step::Room) {
             return;
         }
@@ -108,13 +136,15 @@ impl RecordingWindow {
     }
 
     /// Enter: the next step; the room step needs the voice step's reading,
-    /// and the latency step is shown only when the calibration is stale.
+    /// and the latency step is shown only when the calibration is missing
+    /// or does not match the devices in use.
     pub(super) fn setup_next(&mut self) {
-        let stale = self.panel.calibration.is_some();
+        let stale = calibration_needed(&self.project.config, &self.current_route()).is_some();
+        let calibrating = self.calibrating.is_some();
         let Some(setup) = &mut self.setup else {
             return;
         };
-        if setup.listening_until.is_some() {
+        if setup.listening_until.is_some() || calibrating {
             return;
         }
         setup.error = None;
@@ -143,13 +173,26 @@ impl RecordingWindow {
     }
 
     fn finish_setup(&mut self) {
-        self.setup = None;
-        self.message = Some("Setup check saved.".to_owned());
+        let calibrated = self
+            .setup
+            .take()
+            .and_then(|s| s.latency)
+            .is_some_and(|l| l.is_ok());
+        let needed = calibration_needed(&self.project.config, &self.current_route());
+        self.message = Some(match (calibrated, needed) {
+            (true, _) => "Setup check saved; the latency is calibrated.".to_owned(),
+            (false, Some(_)) => {
+                "Setup check saved; the latency is not calibrated for these devices yet (C to run it)."
+                    .to_owned()
+            }
+            (false, None) => "Setup check saved.".to_owned(),
+        });
     }
 
     /// Once per frame, after the recorder's tick: analyzes a finished
     /// capture.
     pub(super) fn tick_setup(&mut self, now: f64) {
+        self.tick_calibration();
         let Some(setup) = &mut self.setup else {
             return;
         };
@@ -242,14 +285,7 @@ impl RecordingWindow {
                 reasons.push("no room tone recorded today with these devices".to_owned());
             }
         }
-        if config.input.latency_offset_ms != 0
-            && super::recorder::effective_latency_offset(config, &route) == 0
-        {
-            reasons.push(
-                "the latency calibration does not match these devices, so takes are placed without it"
-                    .to_owned(),
-            );
-        }
+        reasons.extend(calibration_needed(config, &route));
         self.setup_offer = (!reasons.is_empty()).then(|| reasons.join("; "));
     }
 
@@ -325,17 +361,7 @@ impl RecordingWindow {
                     body.push(line(error.clone(), colors::RECORD));
                 }
             }
-            Step::Latency => {
-                let stale = self.panel.calibration.clone().unwrap_or_default();
-                body.push(line(format!("Latency: {stale}."), colors::WARN));
-                body.push(line(
-                    format!(
-                        "Hold your headphones to the mic and run `takewise calibrate {} --write`.",
-                        self.dir.display()
-                    ),
-                    colors::TEXT,
-                ));
-            }
+            Step::Latency => body.extend(self.latency_body(setup)),
         }
         if setup.listening_until.is_some() {
             body.push(line("Listening…".to_owned(), colors::RECORD));
@@ -356,7 +382,7 @@ impl RecordingWindow {
                 "Space listen · Enter next · A audio panel · Esc close",
             ),
             Step::Room => ("3 · Room", "Space listen · Enter next · Esc close"),
-            Step::Latency => ("4 · Latency", "Enter done · Esc close"),
+            Step::Latency => ("4 · Latency", "Space calibrate · Enter done · Esc close"),
         };
         Some(
             div()
@@ -402,7 +428,7 @@ pub fn room_tone_today(
 }
 
 /// A line of text in `color`.
-fn line(text: String, color: u32) -> AnyElement {
+pub(super) fn line(text: String, color: u32) -> AnyElement {
     div().text_color(rgb(color)).child(text).into_any_element()
 }
 

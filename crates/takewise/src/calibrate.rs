@@ -3,9 +3,10 @@
 //! same start routine and sample mapping as a take (and `latency_offset_ms`
 //! = 0). Where the recorded beeps land on the film gives the offset to store.
 //!
-//! The beep film is made with `ffmpeg` by the command line; the measurement
-//! runs inside Takewise.app (`calibrate-run`), which owns the microphone
-//! permission, and hands its result back as JSON.
+//! The beep film is made with `ffmpeg`; the measurement runs inside
+//! Takewise.app, which owns the microphone permission: for `calibrate` as
+//! `calibrate-run`, which hands its result back as JSON, and in the
+//! window's setup check with the window's media.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +17,9 @@ use takewise_core::takes::FULL_SCALE;
 use takewise_core::{
     Assembler, AvailableInput, Project, RECORD_RATE, TimebaseHistory, check_input, sample_film_time,
 };
-use takewise_media::{
-    CaptureBuffer, default_output, host_time_now_s, input_devices, pump_run_loop,
-};
+use takewise_media::{CaptureBuffer, default_output, input_devices, pump_run_loop};
 
-use crate::window::{FilmClock, Media as _, RealMedia};
+use crate::window::{FilmClock, Media, RealMedia};
 
 /// Film times of the beeps; the first is 0.1 s, to test the film's start.
 pub const BEEPS: [f64; 10] = [0.1, 1.3, 2.6, 3.9, 5.2, 6.5, 7.8, 9.1, 10.4, 11.7];
@@ -246,10 +245,220 @@ fn onsets_of(buffers: &[CaptureBuffer], history: &TimebaseHistory, latency_s: f6
         .collect()
 }
 
-/// Plays the beep film and records the project's input through the window's
-/// media and its start routine ([`FilmClock`]): capture first, the film
-/// scheduled once audio arrives, its timebase read back while it plays.
-/// Runs on the main thread inside Takewise.app.
+/// How long the beep film may take to load.
+const LOAD_TIMEOUT_S: f64 = 10.0;
+/// How long the film plays muted first, to wake the output device.
+const WAKE_S: f64 = 0.3;
+/// The pause after the wake-up before listening.
+const SETTLE_S: f64 = 0.2;
+/// How long to wait for the input's first buffer.
+const FIRST_AUDIO_TIMEOUT_S: f64 = 5.0;
+/// The pause after each segment, so its last beep is captured.
+const GAP_S: f64 = 0.4;
+
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Loading { until: f64 },
+    Waking { until: f64 },
+    Settling { until: f64 },
+    Waiting { until: f64 },
+    Playing { segment: usize, until: f64 },
+    Gap { segment: usize, until: f64 },
+}
+
+/// One loopback measurement, advanced a step at a time with
+/// [`Run::tick`]: the beep film (already open in `media`) plays through the
+/// output with the window's start routine ([`FilmClock`]), the film
+/// scheduled once audio arrives and its timebase read back while it plays,
+/// while the caller hands over the input's capture buffers. The command
+/// line drives it with the run loop pumped between ticks; the window's
+/// setup check drives it once per frame with the capture its meter holds.
+#[derive(Debug)]
+pub struct Run {
+    step: Step,
+    device: String,
+    output: String,
+    latency_s: f64,
+    buffer_frames: Option<u32>,
+    clock: FilmClock,
+    expected: Vec<Expected>,
+    buffers: Vec<CaptureBuffer>,
+}
+
+impl Run {
+    /// Starts measuring `device` (whose capture runs) through `output`,
+    /// the name of the output the film plays through.
+    pub fn new(media: &dyn Media, device: &str, output: &str) -> Result<Self, String> {
+        let latency_s = media.input_latency_s(device)?;
+        Ok(Self {
+            step: Step::Loading {
+                until: media.host_now_s() + LOAD_TIMEOUT_S,
+            },
+            device: device.to_owned(),
+            output: output.to_owned(),
+            latency_s,
+            buffer_frames: media.buffer_frames(device),
+            clock: FilmClock::new(),
+            expected: Vec::new(),
+            buffers: Vec::new(),
+        })
+    }
+
+    /// Advances with the buffers captured since the last tick; returns the
+    /// measurement, or why there is none, once done. The film is paused
+    /// when it ends either way.
+    pub fn tick(
+        &mut self,
+        media: &mut dyn Media,
+        buffers: Vec<CaptureBuffer>,
+    ) -> Option<Result<Measurement, String>> {
+        match self.advance(media, buffers) {
+            Ok(None) => None,
+            Ok(Some(measurement)) => Some(Ok(measurement)),
+            Err(err) => {
+                media.film_pause();
+                Some(Err(err))
+            }
+        }
+    }
+
+    fn advance(
+        &mut self,
+        media: &mut dyn Media,
+        buffers: Vec<CaptureBuffer>,
+    ) -> Result<Option<Measurement>, String> {
+        let now = media.host_now_s();
+        // Audio counts from the moment listening starts.
+        if !matches!(
+            self.step,
+            Step::Loading { .. } | Step::Waking { .. } | Step::Settling { .. }
+        ) {
+            self.buffers.extend(buffers);
+        }
+        match self.step {
+            Step::Loading { until } => {
+                if media.film_ready() {
+                    media.film_set_gain_db(0.0);
+                    // Wake the output device, as the window does before
+                    // the first take.
+                    media.film_set_muted(true);
+                    media.film_play_at(0.0, now)?;
+                    self.step = Step::Waking {
+                        until: now + WAKE_S,
+                    };
+                } else if now > until {
+                    return Err("the beep film did not load".to_owned());
+                }
+            }
+            Step::Waking { until } if now >= until => {
+                media.film_pause();
+                media.film_set_muted(false);
+                media.film_seek(0.0);
+                self.step = Step::Settling {
+                    until: now + SETTLE_S,
+                };
+            }
+            Step::Settling { until } if now >= until => {
+                self.step = Step::Waiting {
+                    until: now + FIRST_AUDIO_TIMEOUT_S,
+                };
+            }
+            Step::Waiting { until } => {
+                if !self.buffers.is_empty() {
+                    self.start_segment(media, 0)?;
+                } else if now > until {
+                    return Err(format!("no audio arrived from {:?}", self.device));
+                }
+            }
+            Step::Playing { segment, until } => {
+                self.clock.track(media);
+                if now >= until {
+                    self.clock.stop(media);
+                    self.step = Step::Gap {
+                        segment,
+                        until: now + GAP_S,
+                    };
+                }
+            }
+            Step::Gap { segment, until } if now >= until => {
+                if let Some(err) = media.capture_error() {
+                    return Err(format!("capture failed: {err}"));
+                }
+                if segment + 1 < SEGMENTS.len() {
+                    self.start_segment(media, segment + 1)?;
+                } else {
+                    return Ok(Some(self.measurement()));
+                }
+            }
+            Step::Waking { .. } | Step::Settling { .. } | Step::Gap { .. } => {}
+        }
+        Ok(None)
+    }
+
+    fn start_segment(&mut self, media: &mut dyn Media, segment: usize) -> Result<(), String> {
+        let (from, secs) = SEGMENTS[segment];
+        let start = self.clock.start(media, from, 0.0)?.host_anchor_s;
+        self.expected.extend(
+            BEEPS
+                .iter()
+                .filter(|&&beep| beep >= from && beep < from + secs)
+                .map(|&beep| Expected {
+                    host_s: start + (beep - from),
+                    film_s: beep,
+                }),
+        );
+        self.step = Step::Playing {
+            segment,
+            until: start + secs,
+        };
+        Ok(())
+    }
+
+    fn measurement(&self) -> Measurement {
+        let onsets = onsets_of(&self.buffers, self.clock.history(), self.latency_s);
+        let placed = place_onsets(&onsets, &self.expected);
+        let errors: Vec<f64> = placed.iter().map(|p| p.error_ms).collect();
+        let stats = mean_sd(&errors);
+        Measurement {
+            input: self.device.clone(),
+            output: self.output.clone(),
+            input_latency_ms: self.latency_s * 1000.0,
+            buffer_frames: self.buffer_frames,
+            expected: self.expected.len(),
+            placed,
+            mean_ms: stats.map(|(mean, _)| mean),
+            sd_ms: stats.map(|(_, sd)| sd),
+        }
+    }
+}
+
+/// The offset a measurement supports, or why it supports none: too few
+/// beeps, or beeps too far from the mean error for one fixed offset.
+pub fn judge(measurement: &Measurement) -> Result<i32, String> {
+    let placed = measurement.placed.len();
+    let Some(mean) = measurement.mean_ms else {
+        return Err(
+            "no beeps detected; hold the headphones to the mic and raise the volume".to_owned(),
+        );
+    };
+    if placed < MIN_BEEPS {
+        return Err(format!(
+            "only {placed} beeps detected (need {MIN_BEEPS}); hold the headphones to the mic and raise the volume"
+        ));
+    }
+    let far = outliers(&measurement.placed, mean);
+    if !far.is_empty() {
+        return Err(format!(
+            "{} beep(s) landed more than {MAX_DEVIATION_MS} ms from the mean error, so the placement is not consistent enough for one offset; check the setup (wired headphones held to the mic, nothing else playing) and run it again",
+            far.len()
+        ));
+    }
+    Ok(offset_for(mean))
+}
+
+/// Plays the beep film and records the project's input with [`Run`], the
+/// routine the window's setup check runs too. Runs on the main thread
+/// inside Takewise.app.
 pub fn measure(
     project: &Project,
     film: &Path,
@@ -270,7 +479,6 @@ pub fn measure(
         .collect();
     check_input(Some(&device), &available)?;
     let mut media = RealMedia::open(film)?;
-    let latency_s = media.input_latency_s(&device)?;
     let output = output.or(project.config.output.device.as_deref());
     let output = match output {
         Some(name) => {
@@ -279,83 +487,18 @@ pub fn measure(
         }
         None => default_output().map_or_else(|_| "unknown".to_owned(), |d| d.name),
     };
-    let loading_until = host_time_now_s() + 10.0;
-    while !media.film_ready() {
-        if host_time_now_s() > loading_until {
-            return Err("the beep film did not load".to_owned());
-        }
-        pump_run_loop(0.05);
-    }
-    media.film_set_gain_db(0.0);
-    // Wake the output device, as the window does before the first take.
-    media.film_set_muted(true);
-    media.film_play_at(0.0, host_time_now_s())?;
-    pump_run_loop(0.3);
-    media.film_pause();
-    media.film_set_muted(false);
-    media.film_seek(0.0);
-    pump_run_loop(0.2);
-
     let (tx, rx) = mpsc::channel();
     media.start_capture(&device, config.channel, tx)?;
-    let buffer_frames = takewise_media::buffer_frames(&device).ok();
-    let mut buffers: Vec<CaptureBuffer> = Vec::new();
-    let waiting_until = host_time_now_s() + 5.0;
-    while buffers.is_empty() {
-        if host_time_now_s() > waiting_until {
-            media.stop_capture();
-            return Err(format!("no audio arrived from {device:?}"));
+    let result = Run::new(&media, &device, &output).and_then(|mut run| {
+        loop {
+            pump_run_loop(0.01);
+            if let Some(result) = run.tick(&mut media, rx.try_iter().collect()) {
+                break result;
+            }
         }
-        pump_run_loop(0.01);
-        buffers.extend(rx.try_iter());
-    }
-    let mut clock = FilmClock::new();
-    let mut expected = Vec::new();
-    for (from, secs) in SEGMENTS {
-        let start = clock.start(&mut media, from, 0.0)?.host_anchor_s;
-        expected.extend(
-            BEEPS
-                .iter()
-                .filter(|&&beep| beep >= from && beep < from + secs)
-                .map(|&beep| Expected {
-                    host_s: start + (beep - from),
-                    film_s: beep,
-                }),
-        );
-        let until = start + secs;
-        while host_time_now_s() < until {
-            pump_run_loop(0.02);
-            clock.track(&media);
-            buffers.extend(rx.try_iter());
-        }
-        clock.stop(&mut media);
-        let settle = host_time_now_s() + 0.4;
-        while host_time_now_s() < settle {
-            pump_run_loop(0.02);
-            buffers.extend(rx.try_iter());
-        }
-        if let Some(err) = media.capture_error() {
-            media.stop_capture();
-            return Err(format!("capture failed: {err}"));
-        }
-    }
+    });
     media.stop_capture();
-    buffers.extend(rx.try_iter());
-
-    let onsets = onsets_of(&buffers, clock.history(), latency_s);
-    let placed = place_onsets(&onsets, &expected);
-    let errors: Vec<f64> = placed.iter().map(|p| p.error_ms).collect();
-    let stats = mean_sd(&errors);
-    Ok(Measurement {
-        input: device,
-        output,
-        input_latency_ms: latency_s * 1000.0,
-        buffer_frames,
-        expected: expected.len(),
-        placed,
-        mean_ms: stats.map(|(mean, _)| mean),
-        sd_ms: stats.map(|(_, sd)| sd),
-    })
+    result
 }
 
 #[cfg(test)]

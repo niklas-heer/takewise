@@ -54,6 +54,13 @@ struct Fake {
     mic: tw::MicPermission,
     /// Why monitoring cannot run; `None` once it can.
     monitor_unavailable: Option<String>,
+    /// Every film opened after the first, in order.
+    films: Vec<PathBuf>,
+    muted: bool,
+    /// The plays heard (not muted): (`film_s`, `host_s`).
+    audible: Vec<(f64, f64)>,
+    /// Host times of every pause.
+    pauses: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -90,6 +97,10 @@ impl FakeMedia {
             monitor_unavailable: Some(
                 "not available yet: monitoring needs a test on your setup".to_owned(),
             ),
+            films: Vec::new(),
+            muted: false,
+            audible: Vec::new(),
+            pauses: Vec::new(),
         })))
     }
 
@@ -151,7 +162,12 @@ impl Media for FakeMedia {
         if let Some(err) = self.0.borrow().play_error.clone() {
             return Err(err);
         }
-        self.0.borrow_mut().plays.push((film_s, host_s));
+        let mut fake = self.0.borrow_mut();
+        fake.plays.push((film_s, host_s));
+        if !fake.muted {
+            fake.audible.push((film_s, host_s));
+        }
+        drop(fake);
         Ok(Timebase {
             rate: 1.0,
             film_anchor_s: film_s,
@@ -170,12 +186,22 @@ impl Media for FakeMedia {
             host_anchor_s: host_s,
         }
     }
-    fn film_pause(&mut self) {}
+    fn film_open(&mut self, path: &Path) -> Result<(), String> {
+        self.0.borrow_mut().films.push(path.to_owned());
+        Ok(())
+    }
+    fn film_pause(&mut self) {
+        let mut fake = self.0.borrow_mut();
+        let now = fake.now;
+        fake.pauses.push(now);
+    }
     fn film_seek(&mut self, _: f64) {}
     fn film_set_gain_db(&mut self, db: f64) {
         self.0.borrow_mut().film_gain_db = Some(db);
     }
-    fn film_set_muted(&mut self, _: bool) {}
+    fn film_set_muted(&mut self, muted: bool) {
+        self.0.borrow_mut().muted = muted;
+    }
     fn latest_frame(&mut self) -> Option<Frame> {
         None
     }
@@ -2627,6 +2653,7 @@ fn setup_not_offered_when_current(cx: &mut TestAppContext) {
         };
         tw::set_setup(dir, &info).expect("setup");
         save_room_tone_at(dir, jiff::Timestamp::now());
+        calibrate_on(dir, "MacBook Speakers");
     });
     frame(cx, f.window);
     assert_eq!(
@@ -2812,15 +2839,164 @@ fn setup_writes_project_toml(cx: &mut TestAppContext) {
     let snr = setup.speech_to_noise_db.expect("speech to noise");
     assert!(snr > 40.0, "{snr}");
     assert_eq!(setup.date.len(), 10);
-    // The offer is gone; Enter finishes (the calibration is not stale for
-    // a project without an offset).
+    // Only the latency calibration is still offered, also for a fresh
+    // project with no offset: Enter goes on to it, Enter again skips it.
+    let offer = f
+        .view
+        .read_with(cx, |view, _| view.setup_offer.clone())
+        .expect("an offer");
+    assert_eq!(offer, "the latency is not calibrated for these devices");
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Latency));
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, &f), None);
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("Setup check saved; the latency is not calibrated"),
+        "{shown}"
+    );
+}
+
+/// The beep film in tests: an empty file, since the fake plays nothing.
+fn fake_beep_film(dir: &Path) -> Result<PathBuf, String> {
+    let film = dir.join("beeps.mov");
+    fs::write(&film, b"").map_err(|err| err.to_string())?;
+    Ok(film)
+}
+
+/// What the input hears at stamp time `stamp`: each audible play's beeps,
+/// heard `late_s` after the film plays them, through the fake's latency,
+/// over quiet noise.
+fn loopback_sample(fake: &Fake, stamp: f64, late_s: f64, noise: &mut u32) -> i32 {
+    let full = f64::from((1 << 23) - 1);
+    *noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    let unit = f64::from(*noise >> 8) / f64::from(1u32 << 24) * 2.0 - 1.0;
+    let mut value = unit * full * 0.001;
+    let heard = stamp - LATENCY_S - late_s;
+    for &(from, host) in &fake.audible {
+        let stop = fake
+            .pauses
+            .iter()
+            .copied()
+            .find(|&p| p > host)
+            .unwrap_or(f64::INFINITY);
+        for beep in crate::calibrate::BEEPS.iter().filter(|&&b| b >= from) {
+            let at = host + (beep - from);
+            if at < stop && (at..at + 0.02).contains(&heard) {
+                value += (std::f64::consts::TAU * 1000.0 * (heard - at)).sin() * 0.3 * full;
+            }
+        }
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let sample = value.round() as i32;
+    sample
+}
+
+/// Runs the calibration the latency step started: 20 ms buffers of what
+/// the input hears (`beeps`: the loopback, else silence) until it ends.
+fn run_calibration(cx: &mut TestAppContext, f: &Fixture, beeps: bool) {
+    let mut noise = 0x9e37_79b9_u32;
+    for _ in 0..2000 {
+        if !f.view.read_with(cx, |view, _| view.calibrating.is_some()) {
+            return;
+        }
+        let (start, sink) = {
+            let fake = f.media.0.borrow();
+            (fake.now, fake.sink.clone().expect("the meter captures"))
+        };
+        let samples: Vec<i32> = {
+            let fake = f.media.0.borrow();
+            (0..960)
+                .map(|i| {
+                    let stamp = start + f64::from(i) / 48_000.0;
+                    if beeps {
+                        loopback_sample(&fake, stamp, 0.03, &mut noise)
+                    } else {
+                        0
+                    }
+                })
+                .collect()
+        };
+        sink.send(takewise_media::CaptureBuffer {
+            host_time_s: start,
+            samples,
+        })
+        .expect("the window receives");
+        f.media.set_now(start + 0.02);
+        frame(cx, f.window);
+    }
+    panic!("the calibration did not end");
+}
+
+/// Opens the setup check through the room step to the latency step.
+fn to_latency_step(cx: &mut TestAppContext, f: &Fixture) {
+    f.view.update(cx, |view, _| view.beep_film = fake_beep_film);
+    through_voice(cx, f);
+    listen(cx, f, &room_buffers());
+    press(cx, f.window, &["enter"]);
+    assert_eq!(setup_step(cx, f), Some(super::setup::Step::Latency));
+}
+
+#[gpui_kit::test]
+fn setup_check_calibrates_the_latency(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    to_latency_step(cx, &f);
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    run_calibration(cx, &f, true);
+
+    let latency = setup_of(cx, &f).latency.expect("an outcome");
+    let stored = latency.expect("calibrated");
+    assert!(stored.contains("latency_offset_ms = -30"), "{stored}");
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(config.input.latency_offset_ms, -30);
+    let cal = config.calibration.expect("[calibration]");
+    assert_eq!(
+        (cal.input.as_str(), cal.output.as_str(), cal.buffer_frames),
+        (DEVICE, "MacBook Speakers", Some(512))
+    );
+    // The beep film played, then the project's film came back.
+    let films = f.media.0.borrow().films.clone();
+    assert_eq!(films.len(), 2, "{films:?}");
+    assert!(films[0].ends_with("beeps.mov"), "{films:?}");
+    assert_eq!(
+        films[1],
+        Project::open(&f.dir).expect("project").film_path()
+    );
+    // Calibrated for these devices: no offer, and Enter finishes.
     assert_eq!(
         f.view.read_with(cx, |view, _| view.setup_offer.clone()),
         None
     );
     press(cx, f.window, &["enter"]);
-    assert_eq!(setup_step(cx, &f), None);
-    assert!(message(cx, &f.view).contains("Setup check saved"));
+    assert!(
+        message(cx, &f.view).contains("the latency is calibrated"),
+        "{}",
+        message(cx, &f.view)
+    );
+    assert_eq!(recorded(&f.dir), [], "no take was recorded");
+}
+
+#[gpui_kit::test]
+fn a_calibration_without_beeps_stores_nothing(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    to_latency_step(cx, &f);
+    press(cx, f.window, &["space"]);
+    run_calibration(cx, &f, false);
+    let err = setup_of(cx, &f)
+        .latency
+        .expect("an outcome")
+        .expect_err("failed");
+    assert!(err.contains("no beeps detected"), "{err}");
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(config.calibration, None);
+    assert_eq!(f.media.0.borrow().films.len(), 2, "the film is back");
+    // Escape mid-run cancels and puts the film back too.
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    press(cx, f.window, &["escape"]);
+    assert!(!f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    assert_eq!(f.media.0.borrow().films.len(), 4);
 }
 
 /// The setup check's state, read from the window.
