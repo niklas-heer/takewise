@@ -48,9 +48,13 @@ version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plis
 # The signature, the microphone entitlement and, for Developer ID, the
 # hardened runtime that notarization requires.
 codesign --verify --deep --strict --verbose=2 "$app"
-codesign -d --entitlements - --xml "$app" 2>/dev/null | grep -q 'com.apple.security.device.audio-input' || { echo 'The app lacks the audio-input entitlement.' >&2; exit 65; }
+# Read codesign's output first: with pipefail, `grep -q` closing the pipe
+# early would fail the check when codesign gets SIGPIPE.
+entitlements="$(codesign -d --entitlements - --xml "$app" 2>/dev/null)"
+[[ "$entitlements" == *com.apple.security.device.audio-input* ]] || { echo 'The app lacks the audio-input entitlement.' >&2; exit 65; }
 if [[ -n "$identity" ]]; then
-  codesign -dv "$app" 2>&1 | grep -q 'flags=.*runtime' || { echo 'The app is not signed with the hardened runtime.' >&2; exit 65; }
+  signature="$(codesign -dv "$app" 2>&1)"
+  [[ "$signature" =~ flags=[^[:space:]]*runtime ]] || { echo 'The app is not signed with the hardened runtime.' >&2; exit 65; }
 fi
 
 artifact="$artifacts/Takewise-$version-$build.zip"
