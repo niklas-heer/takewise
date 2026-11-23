@@ -28,7 +28,7 @@ takewise doctor --json
 takewise init promo.takewise --film renders/promo.mp4 --json
 ```
 
-`init` measures the film with `ffprobe` and writes `project.toml` and an empty `script.toml`. Write the lines: an `id` (lowercase letters, digits and `-`, unique), the `start` in seconds of film time, an optional `end` (otherwise the slot runs to the next line's start or the film's end), the `text` and an optional `note` for the narrator.
+`init` measures the film with `ffprobe` and writes `project.toml` and an empty `script.toml`. To time the lines you need your own view of the cut: Takewise doesn't show you the film, so pull frames with `ffmpeg` (for example one every second, or at scene changes) or read the editor's timeline with your own tools. Rough starts are fine; the narrator can move a line's start with M while a take plays. Write the lines: an `id` (lowercase letters, digits and `-`, unique), the `start` in seconds of film time, an optional `end` (otherwise the slot runs to the next line's start or the film's end), the `text` and an optional `note` for the narrator.
 
 <!-- file: promo.takewise/script.toml -->
 ```toml
@@ -225,9 +225,9 @@ cat promo.takewise/export/manifest.json
 }
 ```
 
-## 7. Place it in DaVinci Resolve
+## 7. Place it in the edit
 
-Takewise has no Resolve code; place the export with your Resolve tools:
+Takewise has no editor-specific code; place the export with your own editor tools. In any editor, the narration file goes on a mono track at the start of the film's timeline, so its sample 0 lines up with the film's first frame. In DaVinci Resolve, for example:
 
 1. Import the file named by the manifest's `narration.file` (in `export/`) into the media pool.
 2. Add a mono audio track to the film's timeline and place the narration at the timeline's start, so its sample 0 lines up with the film's first frame.
