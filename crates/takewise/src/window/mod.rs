@@ -20,6 +20,7 @@ mod panel;
 mod prompter;
 mod recorder;
 mod setup;
+mod start;
 mod takes;
 #[cfg(test)]
 mod tests;
@@ -222,8 +223,68 @@ fn prepare(dir: &Path) -> Result<(PathBuf, Loaded), String> {
 /// (see `takewise record`).
 pub fn run(dir: &Path, result: Option<&Path>) -> Result<(), String> {
     let (dir, loaded) = prepare(dir).inspect_err(|err| report_start(result, Err(err)))?;
-    let film = loaded.project.film_path();
     let result = result.map(Path::to_path_buf);
+    gpui_kit::application().run(move |cx: &mut App| {
+        set_up_app(cx);
+        start::remember_opened(&dir);
+        if let Err(err) = open_recording(dir, loaded, cx) {
+            eprintln!("error: {err}");
+            report_start(result.as_deref(), Err(&err));
+            cx.quit();
+            return;
+        }
+        report_start(result.as_deref(), Ok(()));
+        cx.activate(true);
+    });
+    Ok(())
+}
+
+/// Takewise.app opened without a project: the start window, which opens
+/// or creates one. Runs until the last window closes.
+pub fn run_start() {
+    gpui_kit::application().run(|cx: &mut App| {
+        set_up_app(cx);
+        if let Err(err) = start::open(cx) {
+            eprintln!("error: cannot open the window: {err}");
+            cx.quit();
+            return;
+        }
+        cx.activate(true);
+    });
+}
+
+/// The keys, the app menu and quitting once the last window closed.
+fn set_up_app(cx: &mut App) {
+    gpui_kit::init(cx);
+    bind_keys(cx);
+    start::bind_keys(cx);
+    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.set_menus([Menu::new("Takewise").items([
+        MenuItem::action("Open Project…", start::OpenProject),
+        MenuItem::action("Install Command Line Tool…", InstallCommand),
+        MenuItem::separator(),
+        MenuItem::action("Quit Takewise", Quit),
+    ])]);
+    // From the menu with no window to show the outcome in, it is said in
+    // a new start window.
+    cx.on_action(|_: &InstallCommand, cx: &mut App| {
+        let _ = start::open_with_message(cx, crate::cli_install::install());
+    });
+    cx.on_action(|_: &start::OpenProject, cx: &mut App| {
+        let _ = start::open(cx);
+    });
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+}
+
+/// Opens a recording window on the loaded project in `dir`, inside the
+/// running app.
+fn open_recording(dir: PathBuf, loaded: Loaded, cx: &mut App) -> Result<(), String> {
+    let media = RealMedia::open(&loaded.project.film_path())?;
     let title = format!(
         "Takewise — {}",
         dir.file_name().map_or_else(
@@ -231,64 +292,28 @@ pub fn run(dir: &Path, result: Option<&Path>) -> Result<(), String> {
             |name| name.to_string_lossy().into_owned()
         )
     );
-    gpui_kit::application().run(move |cx: &mut App| {
-        gpui_kit::init(cx);
-        bind_keys(cx);
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.set_menus([Menu::new("Takewise").items([
-            MenuItem::action("Install Command Line Tool…", InstallCommand),
-            MenuItem::separator(),
-            MenuItem::action("Quit Takewise", Quit),
-        ])]);
-        let media = match RealMedia::open(&film) {
-            Ok(media) => media,
-            Err(err) => {
-                eprintln!("error: {err}");
-                report_start(result.as_deref(), Err(&err));
-                cx.quit();
-                return;
-            }
-        };
-        let watcher = Watcher::new(&dir).ok();
-        let checker = checker(&loaded.project);
-        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(title.into()),
-                ..TitlebarOptions::default()
-            }),
-            ..WindowOptions::default()
-        };
-        let opened = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| {
-                let mut view = RecordingWindow::new(
-                    dir,
-                    loaded,
-                    Box::new(media),
-                    watcher,
-                    checker,
-                    window,
-                    cx,
-                );
-                view.defaults_path = tw::settings_path();
-                view.model =
-                    model::prompt_for(&view.project.config.check, &tw::whisper::models_dir());
-                view
-            })
-        });
-        if let Err(err) = opened {
-            let err = format!("cannot open the window: {err}");
-            eprintln!("error: {err}");
-            report_start(result.as_deref(), Err(&err));
-            cx.quit();
-            return;
-        }
-        report_start(result.as_deref(), Ok(()));
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
-        cx.activate(true);
-    });
-    Ok(())
+    let watcher = Watcher::new(&dir).ok();
+    let checker = checker(&loaded.project);
+    let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(title.into()),
+            ..TitlebarOptions::default()
+        }),
+        ..WindowOptions::default()
+    };
+    gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| {
+            let mut view =
+                RecordingWindow::new(dir, loaded, Box::new(media), watcher, checker, window, cx);
+            view.defaults_path = tw::settings_path();
+            view.model = model::prompt_for(&view.project.config.check, &tw::whisper::models_dir());
+            view
+        })
+    })
+    .map(drop)
+    .map_err(|err| format!("cannot open the window: {err}"))
 }
 
 /// A line's text being edited (E): the line and the script version it was

@@ -454,7 +454,7 @@ fn models_install() -> Result<Outcome, CliError> {
     ))
 }
 
-fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
+pub(crate) fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
     let film_path = std::fs::canonicalize(film_arg).map_err(|err| {
         CliError::Setup(format!(
             "cannot find the film {}: {err}",
