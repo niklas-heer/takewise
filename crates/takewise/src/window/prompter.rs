@@ -20,6 +20,8 @@ use super::{colors, meter};
 pub const VISIBLE_ROWS: usize = 3;
 /// The current line's row height in pixels.
 const ROW_PX: f32 = 44.0;
+/// The height of the message row under the prompter, kept when empty.
+const MESSAGE_ROW_PX: f32 = 20.0;
 /// How long one scroll step eases.
 pub const SCROLL_S: f64 = 0.2;
 
@@ -293,14 +295,16 @@ impl Prompter<'_> {
                         .child(format!("next: {next}")),
                 )
             })
-            .when_some(self.message, |el, message| {
-                el.child(
-                    div()
-                        .text_size(px(14.))
-                        .text_color(rgb(colors::WARN))
-                        .child(message.to_owned()),
-                )
-            })
+            // The message's row is kept when there is none, so the film
+            // above does not shrink when a message appears.
+            .child(
+                div()
+                    .min_h(px(MESSAGE_ROW_PX))
+                    .line_height(px(MESSAGE_ROW_PX))
+                    .text_size(px(14.))
+                    .text_color(rgb(colors::WARN))
+                    .children(self.message.map(str::to_owned)),
+            )
             .into_any_element();
         (element, layout)
     }

@@ -596,6 +596,34 @@ fn take_stops_itself_after_the_tail(cx: &mut TestAppContext) {
     assert_eq!(recorded(&f.dir).len(), 1);
 }
 
+/// The film's bounds in the window's last frame.
+fn film_bounds(cx: &mut TestAppContext, f: &Fixture) -> Bounds<gpui_kit::Pixels> {
+    frame(cx, f.window);
+    VisualTestContext::from_window(f.window, cx)
+        .debug_bounds("film")
+        .expect("the film is drawn")
+}
+
+#[gpui_kit::test]
+fn film_keeps_its_size_when_a_message_appears(cx: &mut TestAppContext) {
+    // A line of three rows with a note fills the prompter, so a new row
+    // below it would take its height from the film.
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        let text = "A first line long enough to wrap onto three rows of the prompter, \
+            so that the prompter is taller than its least height and every row \
+            under it counts.";
+        tw::set_line_field(dir, "a", Field::Text(text.to_owned()), None).expect("text");
+        tw::set_line_field(dir, "a", Field::Note(Some("Slowly.".to_owned())), None).expect("note");
+    });
+    let before = film_bounds(cx, &f);
+    record_take(cx, &f);
+    wait_for(cx, &f.view, |view| view.message.is_some());
+    let after = film_bounds(cx, &f);
+    let shown = message(cx, &f.view);
+    assert!(shown.starts_with("Recorded a take 1"), "{shown}");
+    assert_eq!(before, after, "the message row is kept while empty");
+}
+
 #[gpui_kit::test]
 fn enter_chooses_selected_take(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);

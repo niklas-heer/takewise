@@ -2,8 +2,8 @@
 //! letterboxed, with the count-in and the recording mark on top.
 
 use gpui_kit::{
-    AnyElement, IntoElement, ParentElement as _, Styled as _, div, prelude::FluentBuilder as _, px,
-    rgb, surface,
+    AnyElement, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div,
+    prelude::FluentBuilder as _, px, rgb, surface,
 };
 use takewise_media::Frame;
 
@@ -16,6 +16,7 @@ pub fn video(frame: Option<Frame>, count_in: Option<u32>, recording: bool) -> An
         None => div().size_full().into_any_element(),
     };
     div()
+        .debug_selector(|| "film".to_owned())
         .flex_1()
         .min_h(px(0.))
         .relative()
