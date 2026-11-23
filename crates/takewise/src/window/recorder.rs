@@ -361,6 +361,8 @@ impl Recorder {
         let first_film_s = written.first_host_s.and_then(|host| {
             sample_film_time(clock.history(), host, 0, RECORD_RATE, latency_s, offset_ms)
         });
+        // Measured strictly before the film's end, so the player halting
+        // there is no shift.
         let film_shift_ms = written.first_host_s.and_then(|host| {
             let from = host - latency_s;
             let to = (from + written.samples.len() as f64 / f64::from(RECORD_RATE))
@@ -657,20 +659,31 @@ impl Recorder {
 
 /// Whether the take reached its stop: `tail_s` after the slot's end, or,
 /// when the film ends first, `tail_s` of host time after the film's end.
-/// Notes when the film reached its end (played to it, or halted near it).
+/// Notes when the film reached its end (played to it, or halted near it):
+/// by the mapping that played it there, not when the halt was seen.
 fn reached_stop(take: &mut Take, now: f64) -> bool {
     let Some(film) = take.clock.film_at(now) else {
         return false;
     };
     if take.film_ended_host_s.is_none() {
-        let tb = take.clock.history().timebase_at(now);
+        let history = take.clock.history();
+        let tb = history.timebase_at(now);
         let halted = tb.is_some_and(|tb| tb.rate == 0.0);
         let end = take.film_end_s;
         if film >= end || (halted && film >= end - END_TOLERANCE_S) {
-            let ended = tb.filter(|tb| tb.rate > 0.0).map_or(now, |tb| {
-                tb.host_anchor_s + (end - tb.film_anchor_s) / tb.rate
-            });
-            take.film_ended_host_s = Some(ended.min(now));
+            let reaches = |tb: Timebase, film_s: f64| {
+                (tb.rate > 0.0).then(|| tb.host_anchor_s + (film_s - tb.film_anchor_s) / tb.rate)
+            };
+            let ended = match tb {
+                Some(tb) if tb.rate > 0.0 => reaches(tb, end),
+                // Halted: when the mapping before the halt reached the
+                // frame the film halted at.
+                _ => history
+                    .entry_at(now)
+                    .and_then(|(halted_at, _)| history.timebase_before(halted_at))
+                    .and_then(|before| reaches(before, film.min(end))),
+            };
+            take.film_ended_host_s = Some(ended.unwrap_or(now).min(now));
         }
     }
     film >= take.plan.capture_stop_film_s

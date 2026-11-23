@@ -998,6 +998,33 @@ fn a_take_of_the_last_line_stops_after_the_films_end(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_halt_at_the_films_end_is_no_stall(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d, the last line
+    begin(cx, &f, 100.0); // film 6.0 at host 100.4; film 20.0 at 114.4
+    f.media.send(100.1, 758_400); // audio up to host 115.9
+    f.media.set_now(114.39);
+    frame(cx, f.window);
+    // The player halts at the film's end; the next frame, 12 ms after the
+    // end, sees it.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 20.0,
+        host_anchor_s: 114.4,
+    });
+    f.media.set_now(114.412);
+    frame(cx, f.window);
+    settle(cx, &f);
+    f.media.set_now(115.95);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let takes = recorded(&f.dir);
+    assert_eq!(takes[0].2.film_shift_ms, None);
+    let shown = message(cx, &f.view);
+    assert!(!shown.contains("stalled"), "{shown}");
+}
+
+#[gpui_kit::test]
 fn a_late_start_moves_the_take(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down", "down", "down"]); // d: start 8.0

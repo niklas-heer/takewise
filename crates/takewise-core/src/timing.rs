@@ -49,7 +49,19 @@ impl TimebaseHistory {
 
     /// The timebase valid at `host_s`; `None` before the first one.
     pub fn timebase_at(&self, host_s: f64) -> Option<Timebase> {
+        self.entry_at(host_s).map(|(_, tb)| tb)
+    }
+
+    /// The timebase valid at `host_s` and the host time it took effect.
+    pub fn entry_at(&self, host_s: f64) -> Option<(f64, Timebase)> {
         let idx = self.entries.partition_point(|(at, _)| *at <= host_s);
+        self.entries.get(idx.checked_sub(1)?).copied()
+    }
+
+    /// The timebase valid just before `host_s`: the one a change taking
+    /// effect at `host_s` ends.
+    pub fn timebase_before(&self, host_s: f64) -> Option<Timebase> {
+        let idx = self.entries.partition_point(|(at, _)| *at < host_s);
         self.entries.get(idx.checked_sub(1)?).map(|(_, tb)| *tb)
     }
 
@@ -80,19 +92,21 @@ pub fn sample_film_time(
 
 /// How far contiguous audio drifts from the film: the largest distance, in
 /// film seconds, between where `history` places host times in
-/// `from_host_s..=to_host_s` and where audio placed at `from_host_s` and
-/// running at rate 1 places them. Zero when the film played steadily (or
-/// before any timebase).
+/// `from_host_s..to_host_s` and where audio placed at `from_host_s` and
+/// running at rate 1 places them. A change taking effect at `to_host_s` or
+/// later is not counted, so measuring up to the film's end leaves out the
+/// player halting there. Zero when the film played steadily (or before any
+/// timebase).
 pub fn film_shift_s(history: &TimebaseHistory, from_host_s: f64, to_host_s: f64) -> f64 {
     let Some(start) = history.film_at(from_host_s) else {
         return 0.0;
     };
     let shift = |film: f64, host: f64| (film - (start + (host - from_host_s))).abs();
     let mut max = history
-        .film_at(to_host_s)
-        .map_or(0.0, |film| shift(film, to_host_s));
+        .timebase_before(to_host_s)
+        .map_or(0.0, |tb| shift(tb.film_at(to_host_s), to_host_s));
     for (idx, (at, tb)) in history.entries.iter().enumerate() {
-        if *at <= from_host_s || *at > to_host_s {
+        if *at <= from_host_s || *at >= to_host_s {
             continue;
         }
         // Both sides of the change: the new mapping, and the one it ends.
@@ -291,6 +305,31 @@ mod tests {
         );
         assert!(close(film_shift_s(&history, 1.0, 5.0), 0.2));
         assert!(close(film_shift_s(&TimebaseHistory::new(), 1.0, 5.0), 0.0));
+    }
+
+    #[test]
+    fn film_shift_ends_before_its_end() {
+        let mut history = TimebaseHistory::new();
+        history.record(f64::NEG_INFINITY, PLAYING_FROM_ZERO);
+        // Halted at film 20.0, seen 12 ms after the film reached it.
+        let halted = Timebase {
+            rate: 0.0,
+            film_anchor_s: 20.0,
+            host_anchor_s: 20.0,
+        };
+        history.record(20.012, halted);
+        assert!(
+            close(film_shift_s(&history, 1.0, 20.0), 0.0),
+            "up to the end"
+        );
+        assert!(
+            close(film_shift_s(&history, 1.0, 20.012), 0.0),
+            "the halt is left out"
+        );
+        assert!(close(film_shift_s(&history, 1.0, 20.1), 0.1));
+        assert_eq!(history.entry_at(20.05), Some((20.012, halted)));
+        assert_eq!(history.timebase_before(20.012), Some(PLAYING_FROM_ZERO));
+        assert_eq!(history.timebase_at(20.012), Some(halted));
     }
 
     #[test]
