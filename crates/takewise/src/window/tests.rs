@@ -936,6 +936,9 @@ fn the_take_follows_the_film_as_it_really_plays(cx: &mut TestAppContext) {
         close(film_s, 0.0) && close(host_s, 100.9),
         "{film_s} {host_s}"
     );
+    // A frame reads the film playing.
+    f.media.set_now(101.0);
+    frame(cx, f.window);
     // The film stalls at 5.0 (host 105.9) and stays there.
     f.media.0.borrow_mut().timebase = Some(Timebase {
         rate: 0.0,
@@ -1019,6 +1022,69 @@ fn a_late_start_moves_the_take(cx: &mut TestAppContext) {
         event.line_offset_s
     );
     assert_eq!(event.film_shift_ms, None, "nothing changed after the start");
+}
+
+#[gpui_kit::test]
+fn a_player_still_stopped_at_the_first_read_back_waits_for_it_to_play(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    begin(cx, &f, 100.0); // scheduled: film 6.0 at host 100.4
+    // The first read-back finds the player still stopped at film 6.0.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.45,
+    });
+    f.media.set_now(100.45);
+    frame(cx, f.window);
+    // Then it plays, 40 ms late.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.44,
+    });
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    f.media.set_now(100.9);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    let event = &takes[0].2;
+    assert!(
+        (event.line_offset_s - -2.44).abs() < 1e-6,
+        "placed 40 ms later: {}",
+        event.line_offset_s
+    );
+    assert_eq!(event.film_shift_ms, None, "no shift from the stopped read");
+    let shown = message(cx, &f.view);
+    assert!(!shown.contains("stalled"), "{shown}");
+}
+
+#[gpui_kit::test]
+fn a_player_that_never_plays_flags_the_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    begin(cx, &f, 100.0); // scheduled: film 6.0 at host 100.4
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.45,
+    });
+    f.media.set_now(100.45);
+    frame(cx, f.window);
+    f.media.set_now(100.7);
+    press(cx, f.window, &["space"]);
+    let takes = recorded(&f.dir);
+    let event = &takes[0].2;
+    assert!(
+        close(event.line_offset_s, -2.4),
+        "the scheduled mapping stays: {}",
+        event.line_offset_s
+    );
+    let shift = event.film_shift_ms.expect("flagged");
+    assert!(
+        (shift - 300.0).abs() < 1e-6,
+        "the lateness at stop: {shift}"
+    );
 }
 
 #[gpui_kit::test]

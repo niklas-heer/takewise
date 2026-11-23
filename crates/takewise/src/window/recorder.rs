@@ -343,6 +343,7 @@ impl Recorder {
             ..
         } = *take;
         let written = writer.finish();
+        let unplayed_s = clock.unplayed_lateness_s(media, media.host_now_s());
         media.film_pause();
         media.film_seek(self.park_s);
         self.level = None;
@@ -364,8 +365,10 @@ impl Recorder {
             let from = host - latency_s;
             let to = (from + written.samples.len() as f64 / f64::from(RECORD_RATE))
                 .min(film_ended_host_s.unwrap_or(f64::INFINITY));
-            let shift_ms = film_shift_s(clock.history(), from, to) * 1000.0;
-            (shift_ms > FILM_SHIFT_TOLERANCE_MS).then_some(shift_ms)
+            // A film that never played leaves the take on its schedule,
+            // off by how late the film was when the take stopped.
+            let ms = unplayed_s.unwrap_or_else(|| film_shift_s(clock.history(), from, to)) * 1000.0;
+            (ms > FILM_SHIFT_TOLERANCE_MS).then_some(ms)
         });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
         let shift_note = film_shift_ms.map(|ms| {

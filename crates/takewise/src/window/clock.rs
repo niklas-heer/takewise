@@ -6,11 +6,12 @@
 //! once the first buffer arrived, at least [`START_LEAD_S`] ahead, so a slow
 //! input device never eats into the pre-roll. Until the scheduled start the
 //! scheduled mapping holds (the count-in runs backwards from it); from then
-//! on the player's own timebase is read back. The first read replaces the
-//! scheduled mapping, count-in included, so a late start moves the whole
-//! take; every later departure (a stall, a rate change) is recorded from
-//! the moment it is seen. This history places the captured samples, for a
-//! take and for the calibration alike.
+//! on the player's own timebase is read back. The first read of a playing
+//! player replaces the scheduled mapping, count-in included, so a late start
+//! moves the whole take; a player still stopped is not read until it plays.
+//! Every later departure (a stall, a rate change) is recorded from the
+//! moment it is seen. This history places the captured samples, for a take
+//! and for the calibration alike.
 
 use takewise_core::{Timebase, TimebaseHistory};
 
@@ -34,7 +35,7 @@ pub struct FilmClock {
     start_host_s: Option<f64>,
     /// Host time from which the current start's scheduled mapping holds.
     scheduled_from_s: f64,
-    /// Whether the player's timebase was read since the current start.
+    /// Whether the player was read playing since the current start.
     read_back: bool,
 }
 
@@ -75,11 +76,12 @@ impl FilmClock {
     }
 
     /// Reads the player's timebase once the film plays and records it when
-    /// it departs from the mapping in effect. The first read after a start
-    /// replaces the scheduled mapping wherever it held (for the first start
-    /// also the count-in before it: contiguous audio follows the film as it
-    /// really started); later ones (stalls, rate changes) take effect from
-    /// now. Call once per frame.
+    /// it departs from the mapping in effect. The first read of a playing
+    /// player after a start replaces the scheduled mapping wherever it held
+    /// (for the first start also the count-in before it: contiguous audio
+    /// follows the film as it really started); a stopped one is ignored
+    /// until the player plays. Later reads (stalls, rate changes) take
+    /// effect from now. Call once per frame.
     pub fn track(&mut self, media: &dyn Media) {
         let Some(start) = self.start_host_s else {
             return;
@@ -89,6 +91,9 @@ impl FilmClock {
             return;
         }
         let actual = media.film_timebase();
+        if !self.read_back && actual.rate <= 0.0 {
+            return;
+        }
         let changed = self.history.timebase_at(now).is_none_or(|expected| {
             (actual.film_at(now) - expected.film_at(now)).abs() > POSITION_TOLERANCE_S
                 || (actual.rate - expected.rate).abs() > RATE_TOLERANCE
@@ -102,6 +107,19 @@ impl FilmClock {
             self.history.record(from, actual);
         }
         self.read_back = true;
+    }
+
+    /// How far the film is behind its schedule at `host_s` when the player
+    /// was never read playing since the current start, although it should
+    /// have been: the scheduled mapping then still places the take, off by
+    /// at least this much. `None` once it played, or before it was due.
+    pub fn unplayed_lateness_s(&self, media: &dyn Media, host_s: f64) -> Option<f64> {
+        let start = self.start_host_s?;
+        if self.read_back || host_s < start + READ_BACK_AFTER_S {
+            return None;
+        }
+        let scheduled = self.history.timebase_at(host_s)?;
+        Some((scheduled.film_at(host_s) - media.film_timebase().film_at(host_s)).abs())
     }
 
     /// Pauses the film and records the stop.
