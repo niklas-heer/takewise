@@ -59,6 +59,11 @@ pub const DEFAULT_MODELS_DIR: &str = ".local/share/takewise/models";
 pub const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `whisper-cli` may take to transcribe a take before it is stopped.
 pub const WHISPER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Runs the tools at lower priority, so a check never competes with
+/// recording or the film for the CPU.
+const NICE: &str = "/usr/bin/nice";
+/// The `nice` increment the tools run with.
+const TOOL_NICENESS: &str = "10";
 /// Searched after `$PATH`, since an app started from Finder gets a minimal one.
 const FALLBACK_TOOL_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 /// whisper.cpp's DTW alignment-head presets.
@@ -225,7 +230,7 @@ impl WhisperCli {
         let pcm = tmp.path().join("take.wav");
         let out = tmp.path().join("take");
         run_tool(
-            Command::new(&self.ffmpeg)
+            tool_command(&self.ffmpeg)
                 .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
                 .arg(wav)
                 .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
@@ -234,7 +239,7 @@ impl WhisperCli {
             self.ffmpeg_timeout,
         )?;
         run_tool(
-            Command::new(&self.whisper)
+            tool_command(&self.whisper)
                 .arg("-m")
                 .arg(&self.model)
                 .arg("-f")
@@ -287,10 +292,27 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// A command running `tool` through `nice` (when the system has it), which
+/// execs the tool, so a timeout still stops the tool itself.
+fn tool_command(tool: &Path) -> Command {
+    if !Path::new(NICE).is_file() {
+        return Command::new(tool);
+    }
+    let mut command = Command::new(NICE);
+    command.args(["-n", TOOL_NICENESS]).arg(tool);
+    command
+}
+
 /// Runs a tool to completion; a failure to start it, a nonzero exit or
 /// running longer than `timeout` (the tool is then killed) is an error naming
 /// the tool and quoting the end of its stderr.
 fn run_tool(command: &mut Command, tool: &Path, timeout: Duration) -> Result<(), String> {
+    if !is_executable(tool) {
+        return Err(format!(
+            "could not run {}: not an executable file",
+            tool.display()
+        ));
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -726,6 +748,32 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         cli.ffmpeg = tmp.path().join("no-such-ffmpeg");
         let message = failure(cli.transcribe(&tmp.path().join("take.wav")));
         assert!(message.contains("no-such-ffmpeg"), "{message}");
+    }
+
+    #[test]
+    fn tools_run_at_lower_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seen = tmp.path().join("nice.txt");
+        let record = format!(r#"ps -o nice= -p $$ >> "{}""#, seen.display());
+        let mut cli = cli(tmp.path(), fake_whisper(tmp.path(), &record));
+        cli.ffmpeg = script(
+            tmp.path(),
+            "ffmpeg",
+            &format!(r#"{record}; for a; do last=$a; done; : > "$last""#),
+        );
+        let _ = cli.transcribe(&tmp.path().join("t.wav"));
+        let out = std::process::Command::new("ps")
+            .args(["-o", "nice=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        let ours: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let expected = (ours + 10).min(20);
+        let seen: Vec<i32> = fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect();
+        assert_eq!(seen, vec![expected, expected], "ffmpeg, then whisper-cli");
     }
 
     #[test]
