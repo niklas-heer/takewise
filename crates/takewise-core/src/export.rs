@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::check::speech_onset;
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, rename_temp, write_temp};
-use crate::ledger::{EventKind, Ledger, Verdict, read};
+use crate::ledger::{Checked, EventKind, Ledger, Verdict, read};
 use crate::project::Project;
 use crate::script::{Line, validate};
 use crate::speech::analyze;
@@ -66,7 +67,9 @@ pub struct ManifestLine {
     /// Half-open sample range in `narration.wav`.
     pub dest_samples: [u64; 2],
     /// Detected speech start and end in film seconds, clamped to the film;
-    /// a `speech-cropped` warning gives the unclamped values.
+    /// a `speech-cropped` warning gives the unclamped values. The start is
+    /// where the check's early-start rule measures it, after a breath set
+    /// apart from the words.
     pub speech_film_s: [f64; 2],
     /// The transcribed words in film seconds, from the take's latest check
     /// against the line as it is now; absent when there is none.
@@ -311,8 +314,14 @@ fn place(
             "takes not recorded at the project's sample rate",
         ));
     }
-    let (speech_start, speech_end) = analyze(&samples, rate, project.config.record.preroll_s)
+    let analysis = analyze(&samples, rate, project.config.record.preroll_s);
+    let (_, speech_end) = analysis
         .speech
+        .ok_or(("no-speech", "chosen takes with no speech detected"))?;
+    // The speech starts where the check measured it: after a breath set
+    // apart from the words.
+    let check = current_check(project, ledger, line, take_no);
+    let speech_start = speech_onset(&analysis, check.and_then(|c| c.transcript.as_deref()))
         .ok_or(("no-speech", "chosen takes with no speech detected"))?;
 
     let film_len = seconds_to_samples(project.film_duration(), rate).max(0);
@@ -366,7 +375,7 @@ fn place(
             source_samples: [to_u64(src0), to_u64(src1)],
             dest_samples: [to_u64(dest0), to_u64(dest1)],
             speech_film_s: [clamped.0, clamped.1],
-            words_film_s: words_film_s(project, ledger, line, take_no, take_start_film),
+            words_film_s: check.and_then(|c| words_film_s(c, take_start_film)),
         },
         samples,
         src: src0,
@@ -377,17 +386,15 @@ fn place(
     })
 }
 
-/// The words of the take's latest check against the line as it is now, in
-/// film seconds; `None` without such a check or without a transcript.
-fn words_film_s(
+/// The take's latest check against the line as it is now.
+fn current_check<'a>(
     project: &Project,
-    ledger: &Ledger,
+    ledger: &'a Ledger,
     line: &Line,
     take: u32,
-    take_start_film: f64,
-) -> Option<Vec<ManifestWord>> {
+) -> Option<&'a Checked> {
     let current = project.snapshot(&line.id)?;
-    let checked = ledger
+    ledger
         .events
         .iter()
         .rev()
@@ -395,7 +402,11 @@ fn words_film_s(
         .find_map(|e| match &e.kind {
             EventKind::Checked(checked) if checked.snapshot.matches(&current) => Some(checked),
             _ => None,
-        })?;
+        })
+}
+
+/// The words of a check in film seconds; `None` without a transcript.
+fn words_film_s(checked: &Checked, take_start_film: f64) -> Option<Vec<ManifestWord>> {
     let words = checked.transcript.as_ref()?;
     Some(
         words
@@ -575,6 +586,11 @@ mod tests {
     /// Records a 5 s take with speech at `from..to` seconds into the take,
     /// captured from 2 s before the line's start.
     fn take(dir: &Path, line: &str, speech: Option<(f64, f64)>) -> TakeRef {
+        take_with(dir, line, speech.as_slice())
+    }
+
+    /// [`take`] with a sound at each of `bursts`.
+    fn take_with(dir: &Path, line: &str, bursts: &[(f64, f64)]) -> TakeRef {
         let project = Project::open(dir).unwrap();
         let input = RecordedInput {
             sample_rate: RATE,
@@ -587,11 +603,32 @@ mod tests {
         };
         let partial = begin_take(dir, line, &input).unwrap();
         let mut audio = noise(5.0);
-        if let Some((from, to)) = speech {
+        for &(from, to) in bursts {
             burst(&mut audio, from, to);
         }
         write_take_wav(&partial.wav, &audio, RATE).unwrap();
         commit_take(dir, partial).unwrap()
+    }
+
+    /// Hears "Hello there." from `start` seconds into the take.
+    struct HelloAt(f64);
+
+    impl crate::whisper::Transcriber for HelloAt {
+        fn transcribe(&self, _: &Path) -> crate::check::Transcript {
+            let word = |text: &str, start: f64| crate::ledger::Word {
+                text: text.to_owned(),
+                start,
+                end: start + 0.3,
+                confidence: Some(0.9),
+            };
+            crate::check::Transcript::Words(vec![
+                word("Hello", self.0),
+                word("there.", self.0 + 0.35),
+            ])
+        }
+        fn model(&self) -> String {
+            "ggml-fake.bin".to_owned()
+        }
     }
 
     fn choose(dir: &Path, take: &TakeRef) {
@@ -814,6 +851,31 @@ mod tests {
         );
         assert_eq!(report.lines, []);
         assert!(!dir.join("export/narration.wav").exists());
+    }
+
+    #[test]
+    fn a_breath_before_the_words_is_not_their_start() {
+        // "one" speaks at 10..11.9 s of film. "two" breathes at 11.8..11.95
+        // s, over the end of "one", then speaks from 12.2 s: its check
+        // measures the start after the breath, and so does the export.
+        let script = "[[line]]\nid = \"one\"\nstart = 10.0\ntext = \"A.\"\n\n[[line]]\nid = \"two\"\nstart = 12.0\ntext = \"Hello there.\"\n";
+        let (_tmp, dir) = setup(script);
+        let a = take(&dir, "one", Some((2.0, 3.9)));
+        let b = take_with(&dir, "two", &[(1.8, 1.95), (2.2, 3.0)]);
+        let checked = crate::run_check::check_take(&dir, &b, &HelloAt(2.25), "0.1.0").unwrap();
+        assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
+        choose(&dir, &a);
+        choose(&dir, &b);
+        let report = run(&dir, false);
+        assert_eq!(refused_codes(&report), Vec::<&str>::new(), "{report:?}");
+        let two = &report.lines[1];
+        assert!((two.speech_film_s[0] - 12.2).abs() < 0.02, "{two:?}");
+        // The breath is left out where the gap is split.
+        assert!(two.dest_samples[0] > samples_at(11.95), "{two:?}");
+    }
+
+    fn samples_at(film_s: f64) -> u64 {
+        u64::try_from(seconds_to_samples(film_s, RATE)).unwrap()
     }
 
     #[test]

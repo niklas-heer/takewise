@@ -188,8 +188,9 @@ pub fn rebuild_checked(
 }
 
 /// When the speech starts, in seconds from the take's first sample, for the
-/// early-start rule (see [`build_checked`]).
-fn speech_onset(analysis: &Analysis, heard: Option<&[Word]>) -> Option<f64> {
+/// early-start rule (see [`build_checked`]) and the export: after a breath
+/// or a noise set apart from the first word by a gap.
+pub(crate) fn speech_onset(analysis: &Analysis, heard: Option<&[Word]>) -> Option<f64> {
     let first_word = heard.and_then(|words| words.iter().map(|w| w.start).min_by(f64::total_cmp));
     let energy_start = analysis.speech.map(|(start, _)| start);
     match (energy_start, first_word) {
