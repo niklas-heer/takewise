@@ -168,21 +168,26 @@ fn load(dir: &Path) -> Result<Loaded, tw::Error> {
     })
 }
 
-/// What a check worker's checks depend on: the `checker` it records (the
-/// model's file name and the preprocessing) and the language.
+/// What a check worker's checks depend on: the model file it loads, the
+/// `checker` it records (the model's file name and the preprocessing) and
+/// the language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CheckKey {
+    model: PathBuf,
     checker: String,
     language: String,
 }
 
-fn check_key(project: &Project) -> CheckKey {
+/// The [`CheckKey`] of `project` with its models in `models_dir` (where
+/// [`WhisperCli::discover`] looks for a relative `whisper_model`).
+fn check_key(project: &Project, models_dir: &Path) -> CheckKey {
     let config = &project.config.check;
     let model = Path::new(&config.whisper_model).file_name().map_or_else(
         || config.whisper_model.clone(),
         |name| name.to_string_lossy().into_owned(),
     );
     CheckKey {
+        model: models_dir.join(&config.whisper_model),
         checker: tw::checker(env!("CARGO_PKG_VERSION"), &model),
         language: config.language.clone(),
     }
@@ -363,7 +368,8 @@ fn open_recording(dir: PathBuf, loaded: Loaded, cx: &mut App) -> Result<(), Stri
             let mut view =
                 RecordingWindow::new(dir, loaded, Box::new(media), watcher, checker, window, cx);
             view.defaults_path = start::settings_path();
-            view.model = model::prompt_for(&view.project.config.check, &tw::whisper::models_dir());
+            view.offers_model = true;
+            view.model = model::prompt_for(&view.project.config.check, &view.models_dir);
             view
         })
     })
@@ -432,6 +438,11 @@ pub struct RecordingWindow {
     /// The offer to install the speech model while it is missing; none in
     /// tests unless a test sets one.
     model: Option<model::ModelPrompt>,
+    /// Where a relative `[check] whisper_model` is found.
+    models_dir: PathBuf,
+    /// Whether the window offers to install a missing model (not in tests
+    /// unless a test says so).
+    offers_model: bool,
     /// The output the film was last set to play through; `None` is the
     /// system default (none chosen, or the chosen one could not be used).
     film_output: Option<String>,
@@ -470,7 +481,8 @@ impl RecordingWindow {
         open.0.retain(|(_, view, _)| view.upgrade().is_some());
         open.0.push((key, me, handle));
         let checks = Checks::new(dir.clone(), checker);
-        let checks_for = check_key(&loaded.project);
+        let models_dir = tw::whisper::models_dir();
+        let checks_for = check_key(&loaded.project, &models_dir);
         let loaded_unchecked = loaded.unchecked;
         let film_gain_db = loaded.project.config.record.film_gain_db;
         let monitor_db = loaded.project.config.monitor.volume_db;
@@ -525,6 +537,8 @@ impl RecordingWindow {
             setup: None,
             setup_offer: None,
             model: None,
+            models_dir,
+            offers_model: false,
             film_output: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
@@ -669,10 +683,17 @@ impl RecordingWindow {
     /// or the preprocessing changed since it was made, so no check runs
     /// with stale settings; dropping the old one cancels its check. The
     /// takes its checks no longer match are queued again by the reload.
+    /// A changed model also changes the install banner to the new one's.
     fn refresh_checks(&mut self) {
-        let key = check_key(&self.project);
+        let key = check_key(&self.project, &self.models_dir);
         if key == self.checks_for {
             return;
+        }
+        if key.model != self.checks_for.model && self.offers_model {
+            if let Some(old) = self.model.take() {
+                old.cancel();
+            }
+            self.model = model::prompt_for(&self.project.config.check, &self.models_dir);
         }
         self.replace_checks((self.make_checker)(&self.project));
     }
@@ -680,7 +701,7 @@ impl RecordingWindow {
     /// Starts a new check worker with `checker` in place of the old one.
     fn replace_checks(&mut self, checker: Checker) {
         self.checks = Checks::new(self.dir.clone(), checker);
-        self.checks_for = check_key(&self.project);
+        self.checks_for = check_key(&self.project, &self.models_dir);
         self.pause_checks_while_recording();
     }
 

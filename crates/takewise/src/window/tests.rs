@@ -2216,6 +2216,61 @@ fn changed_check_settings_start_a_new_worker(cx: &mut TestAppContext) {
     );
 }
 
+/// Logs the `[check] whisper_model` of each new check worker.
+fn log_new_workers(cx: &mut TestAppContext, f: &Fixture) -> Arc<Mutex<Vec<String>>> {
+    let made: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&made);
+    f.view.update(cx, |view, _| {
+        view.make_checker = Box::new(move |project: &Project| {
+            let model = project.config.check.whisper_model.clone();
+            log.lock().expect("made").push(model.clone());
+            Checker {
+                transcriber: Arc::new(tw::Unavailable {
+                    reason: "a new worker".to_owned(),
+                    model,
+                }),
+                tools: Vec::new(),
+                tag: worker_tag(),
+            }
+        });
+    });
+    made
+}
+
+#[gpui_kit::test]
+fn a_model_of_the_same_name_elsewhere_starts_a_new_worker(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    set_check(&f.dir, "a/model.bin", "en");
+    f.view.update(cx, |view, _| view.reload());
+    let made = log_new_workers(cx, &f);
+    set_check(&f.dir, "b/model.bin", "en");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(*made.lock().expect("made"), ["b/model.bin"]);
+}
+
+#[gpui_kit::test]
+fn the_model_banner_follows_a_model_change(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let models = tempfile::tempdir().expect("models");
+    f.view.update(cx, |view, _| {
+        view.models_dir = models.path().to_path_buf();
+        view.offers_model = true;
+    });
+    let pinned = tw::CheckConfig::default().whisper_model;
+    set_check(&f.dir, "ggml-base.bin", "en");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(banner(cx, &f), None, "no download for another model");
+
+    set_check(&f.dir, &pinned, "en");
+    f.view.update(cx, |view, _| view.reload());
+    let text = banner(cx, &f).expect("the pinned model is missing");
+    assert!(text.contains("Install the speech model"), "{text}");
+
+    set_check(&f.dir, "ggml-base.bin", "en");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(banner(cx, &f), None, "gone with the model");
+}
+
 #[gpui_kit::test]
 fn quitting_mid_check_kills_its_child_and_temporary_files(cx: &mut TestAppContext) {
     // Reads its held-open standard input first.
