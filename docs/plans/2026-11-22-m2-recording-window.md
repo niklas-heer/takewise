@@ -111,7 +111,7 @@
 - [ ] **Step 1: Write failing tests** with the fake media: `space_records_and_commits_a_take` (ledger gains one `recorded` with the expected `line_offset_s`), `enter_chooses_selected_take`, `mark_start_clamps`, `stale_edit_is_refused_and_reported`, `close_mid_take_commits`, `blocked_device_ignores_space`.
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Implement** the modules.
-- [ ] **Step 4: Run** `mise run check` → PASS; `mise run bundle`; open the Kindred project (`takewise init` a scratch project on `/Users/nheer/Projects/github.com/niklas-heer/kindred-promo/renders/kindred-promo-v2.mp4` with the eight lines from the Kindred narration) with `takewise record`; record one take on the built-in mic, choose it, export; screenshot the window for the report. Delete the scratch project afterwards.
+- [ ] **Step 4: Run** `mise run check` → PASS; `mise run bundle`; open the Kindred project (`takewise init` a scratch project on `~/Projects/kindred-promo/renders/kindred-promo-v2.mp4` with the eight lines from the Kindred narration) with `takewise record`; record one take on the built-in mic, choose it, export; screenshot the window for the report. Delete the scratch project afterwards.
 - [ ] **Step 5: Commit** `feat(app): add the recording window` (split into a few commits along the modules if it helps review).
 
 ### Task 5: Calibration

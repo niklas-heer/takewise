@@ -139,5 +139,5 @@
 - [ ] **Step 1: Write failing tests** `init_status_roundtrip_json`, `script_set_then_status`, `choose_then_export_writes_wav_and_manifest` (create takes through `begin_take`/`write_take_wav`/`commit_take` from the core in the test), `export_without_choice_exits_1_with_line_ids`, `judge_rejects_bad_score_exit_2`, `status_strict_exit_codes`, `unknown_project_exit_2`, `record_and_check_are_stubs_exit_2`.
 - [ ] **Step 2: Run** `cargo test -p takewise` → FAIL.
 - [ ] **Step 3: Implement** with clap derive; errors print to stderr (or as `{"ok":false,"error":{"code","message"}}` with `--json`); success JSON is `{"ok":true,"data":…}`.
-- [ ] **Step 4: Run** `mise run check` → PASS. Then a manual smoke run: `takewise init /tmp/tw-smoke.takewise --film /Users/nheer/Projects/github.com/niklas-heer/kindred-promo/renders/kindred-promo-v2.mp4 && takewise status /tmp/tw-smoke.takewise --json`, then remove the temp project.
+- [ ] **Step 4: Run** `mise run check` → PASS. Then a manual smoke run: `takewise init /tmp/tw-smoke.takewise --film ~/Projects/kindred-promo/renders/kindred-promo-v2.mp4 && takewise status /tmp/tw-smoke.takewise --json`, then remove the temp project.
 - [ ] **Step 5: Commit** `feat(cli): add the takewise command line` and `docs: document the CLI and the Resolve handoff` (README) as separate commits.

@@ -4,8 +4,8 @@
 //!
 //! Without `--ignored` (as in `mise run check`) every test is skipped. The
 //! harness is our own because AVPlayer needs the main thread, which libtest
-//! does not give its tests. The film defaults to the Kindred promo; set
-//! `TAKEWISE_SMOKE_FILM` to use another. Capture needs microphone access for
+//! does not give its tests. `plays_film_frames` plays the film named by
+//! `TAKEWISE_SMOKE_FILM`. Capture needs microphone access for
 //! the app that runs the test (the terminal or the agent host).
 
 use std::process::ExitCode;
@@ -97,19 +97,14 @@ fn lists_input_devices() -> Outcome {
     })
 }
 
-fn film_path() -> std::path::PathBuf {
-    std::env::var_os("TAKEWISE_SMOKE_FILM").map_or_else(
-        || {
-            std::path::PathBuf::from(
-                "/Users/nheer/Projects/github.com/niklas-heer/kindred-promo/renders/kindred-promo-v2.mp4",
-            )
-        },
-        Into::into,
-    )
+fn film_path() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("TAKEWISE_SMOKE_FILM")
+        .map(Into::into)
+        .ok_or_else(|| "set TAKEWISE_SMOKE_FILM to a film to play".to_owned())
 }
 
 fn plays_film_frames() -> Outcome {
-    let mut film = FilmPlayer::open(&film_path()).map_err(|e| e.to_string())?;
+    let mut film = FilmPlayer::open(&film_path()?).map_err(|e| e.to_string())?;
     let loading = Instant::now();
     while !film.is_ready() {
         ensure(loading.elapsed() < Duration::from_secs(10), || {

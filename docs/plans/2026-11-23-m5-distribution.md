@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.99.0; an HTTP client already in the dependency tree if any, else `ureq` (rustls) with minimal features; `sha2` (present).
 
-**Spec:** `docs/design.md` "Distribution". Reference: `/Users/nheer/Projects/github.com/niklas-heer/focal/{scripts,packaging,RELEASE.md}` and the hub's Mac app signing memory (Developer ID, the `keywink-notary` notary profile).
+**Spec:** `docs/design.md` "Distribution". Reference: `~/Projects/focal/{scripts,packaging,RELEASE.md}` and the hub's Mac app signing memory (Developer ID, the `keywink-notary` notary profile).
 
 ## Global Constraints
 
