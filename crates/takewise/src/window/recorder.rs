@@ -179,10 +179,10 @@ impl Recorder {
         }
     }
 
-    /// The text the take being recorded started with.
-    pub fn recording_text(&self) -> Option<&str> {
+    /// The line as the take being recorded started with it.
+    pub fn recording_snapshot(&self) -> Option<&Snapshot> {
         match &self.phase {
-            Phase::Recording(take) => Some(&take.snapshot.text),
+            Phase::Recording(take) => Some(&take.snapshot),
             _ => None,
         }
     }

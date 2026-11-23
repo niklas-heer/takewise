@@ -329,16 +329,28 @@ impl RecordingWindow {
         self.state.lines.iter().find(|line| line.id == id)
     }
 
-    /// The current line's text as the prompter shows it: while a take of
-    /// the line records, the text the take started with (a reload of the
-    /// script reaches the prompter once the take ends).
-    fn prompter_text(&self) -> Option<&str> {
+    /// The line the prompter shows: while a take records, the line as the
+    /// take started with it, whatever reloads change or select meanwhile
+    /// (they reach the prompter once the take ends); else the current line.
+    fn prompter_line(&self) -> Option<prompter::Reading<'_>> {
+        if let Some(snapshot) = self.recorder.recording_snapshot() {
+            return Some(prompter::Reading {
+                text: &snapshot.text,
+                start: snapshot.start,
+                end: snapshot.end,
+            });
+        }
         let line = self.line_state()?;
-        let recording = self
-            .recorder
-            .recording_text()
-            .filter(|_| self.recorder.recording_line() == Some(line.id.as_str()));
-        Some(recording.unwrap_or(&line.text))
+        Some(prompter::Reading {
+            text: &line.text,
+            start: line.start,
+            end: line.end,
+        })
+    }
+
+    #[cfg(test)]
+    fn prompter_text(&self) -> Option<&str> {
+        self.prompter_line().map(|reading| reading.text)
     }
 
     fn blocked(&self) -> Option<&str> {
@@ -475,12 +487,20 @@ impl RecordingWindow {
         self.show(update);
     }
 
-    /// Selects a committed take; returns the message saying so.
+    /// Selects a committed take; returns the message saying so. When its
+    /// line was removed or renamed meanwhile, the nearest line stays
+    /// selected and the film rests there.
     fn took(&mut self, committed: Option<TakeRef>) -> Option<String> {
         let taken = committed?;
         self.reload();
         if self.line_id() == Some(taken.line.as_str()) {
             self.take = Some(taken.take);
+        } else if self.project.script.position(&taken.line).is_none() {
+            self.park();
+            return Some(format!(
+                "Recorded {} take {}: the line you recorded was removed or renamed; the take was saved.",
+                taken.line, taken.take
+            ));
         }
         Some(format!("Recorded {} take {}.", taken.line, taken.take))
     }
@@ -760,8 +780,7 @@ impl Render for RecordingWindow {
         let line = script.lines.get(self.line);
         let prompter = prompter::Prompter {
             film_s,
-            line: self.line_state(),
-            text: self.prompter_text(),
+            reading: self.prompter_line(),
             note: line.and_then(|line| line.note.as_deref()),
             next: script
                 .lines

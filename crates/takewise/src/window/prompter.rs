@@ -7,19 +7,26 @@ use gpui_kit::{
     AnyElement, Entity, HighlightStyle, IntoElement, ParentElement as _, Styled as _, StyledText,
     div, prelude::FluentBuilder as _, px, relative, rgb,
 };
-use takewise_core::{LineState, pace_fill};
+use takewise_core::pace_fill;
 
 use super::colors;
 
 /// The level meter's floor.
 const METER_FLOOR_DB: f64 = -60.0;
 
+/// The line to read and its slot.
+#[derive(Debug, Clone, Copy)]
+pub struct Reading<'a> {
+    pub text: &'a str,
+    pub start: f64,
+    pub end: f64,
+}
+
 pub struct Prompter<'a> {
     pub film_s: f64,
-    pub line: Option<&'a LineState>,
-    /// The line's text to read: the text a take started with while it
-    /// records, else the line's.
-    pub text: Option<&'a str>,
+    /// The line as a take started with it while it records, else the
+    /// current line.
+    pub reading: Option<Reading<'a>>,
     pub note: Option<&'a str>,
     pub next: Option<&'a str>,
     pub level_dbfs: Option<f64>,
@@ -70,7 +77,7 @@ fn bar(fraction: f64, width: f32, color: u32) -> AnyElement {
 impl Prompter<'_> {
     /// Film time, the slot bar and the level meter.
     fn status(&self) -> AnyElement {
-        let slot = self.line.map(|line| {
+        let slot = self.reading.map(|line| {
             let span = line.end - line.start;
             let progress = if span > 0.0 {
                 (self.film_s - line.start) / span
@@ -120,10 +127,9 @@ impl Prompter<'_> {
 
     pub fn render(self) -> AnyElement {
         let status = self.status();
-        let (filled, text) = self.line.map_or((0, String::new()), |line| {
-            let text = self.text.unwrap_or(&line.text);
-            let chars = pace_fill(text, line.start, line.end, self.film_s);
-            (byte_index(text, chars), text.to_owned())
+        let (filled, text) = self.reading.map_or((0, String::new()), |line| {
+            let chars = pace_fill(line.text, line.start, line.end, self.film_s);
+            (byte_index(line.text, chars), line.text.to_owned())
         });
 
         let current = match self.editor {

@@ -1228,6 +1228,71 @@ fn the_prompter_keeps_the_takes_text_until_it_stops(cx: &mut TestAppContext) {
     assert_eq!(shown(cx).as_deref(), Some("Agent text."), "after the take");
 }
 
+/// Records line `c` while `change` rewrites the script (and the window
+/// reloads, as its watcher would); returns what the prompter showed during
+/// the take and after it, and the line selected after it.
+fn take_while_the_script_changes(
+    cx: &mut TestAppContext,
+    f: &Fixture,
+    change: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    press(cx, f.window, &["down", "down"]); // c: "Third line."
+    begin(cx, f, 100.0);
+    fs::write(f.dir.join("script.toml"), change).expect("script");
+    f.view.update(cx, |view, _| view.reload());
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    let during = f
+        .view
+        .read_with(cx, |view, _| view.prompter_text().map(str::to_owned));
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    f.view.read_with(cx, |view, _| {
+        (
+            during,
+            view.prompter_text().map(str::to_owned),
+            view.line_id().map(str::to_owned),
+        )
+    })
+}
+
+#[gpui_kit::test]
+fn a_line_removed_during_its_take_keeps_the_prompter_and_saves_the_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let without_c = SCRIPT.replace(
+        "[[line]]\nid = \"c\"\nstart = 1.5\ntext = \"Third line.\"\n\n",
+        "",
+    );
+    let (during, after, selected) = take_while_the_script_changes(cx, &f, &without_c);
+    assert_eq!(during.as_deref(), Some("Third line."), "during the take");
+    assert_eq!(selected.as_deref(), Some("d"), "the nearest line");
+    assert_eq!(after.as_deref(), Some("Fourth line."));
+    let takes = recorded(&f.dir);
+    assert_eq!((takes[0].0.as_str(), takes[0].1), ("c", 1), "saved");
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("the line you recorded was removed or renamed; the take was saved"),
+        "{shown}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_line_renamed_during_its_take_keeps_the_prompter(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let renamed = SCRIPT
+        .replace("id = \"c\"", "id = \"c2\"")
+        .replace("Third line.", "Third line, renamed.");
+    let (during, after, selected) = take_while_the_script_changes(cx, &f, &renamed);
+    assert_eq!(during.as_deref(), Some("Third line."), "during the take");
+    assert_eq!(selected.as_deref(), Some("c2"));
+    assert_eq!(after.as_deref(), Some("Third line, renamed."));
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("the line you recorded was removed or renamed; the take was saved"),
+        "{shown}"
+    );
+}
+
 #[gpui_kit::test]
 fn a_take_whose_finish_failed_stays_locked_until_saved(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
