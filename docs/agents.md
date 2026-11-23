@@ -168,7 +168,7 @@ takewise status promo.takewise --strict --json
 takewise export promo.takewise --json
 ```
 
-`export` writes `export/narration.wav` (or `.flac`): one mono file exactly as long as the film, starting at its first frame, with each line's chosen take placed where it was recorded against the picture. The project's `[export]` settings choose the format and processing; new projects export `clean` (high-pass, noise reduction from the setup check's room tone, −16 LUFS). It refuses (exit 1) with the line ids when a line has no chosen take, a take has no speech, or two lines' speech overlaps; `--use-proposed` fills unchosen lines with their proposed take. The command reports the files, the settings and loudness it used, the lines and any warnings:
+`export` writes `export/narration.wav` (or `.flac`): one mono file exactly as long as the film, starting at its first frame, with each line's chosen take placed where it was recorded against the picture. The project's `[export]` settings choose the format and processing; new projects export `clean` (high-pass, noise reduction from the setup check's room tone, −16 LUFS). It refuses (exit 1) with the line ids when a line has no chosen take, a take has no speech, or two lines' speech overlaps; `--use-proposed` fills unchosen lines with their proposed take. It also refuses when the film is missing (`film-missing`) or changed since the project measured it (`film-changed`): check the line timings against the new cut, then run `takewise status --refresh-film` and export again. `state-changed` means the script or ledger changed twice while it rendered; export again. The command reports the files, the settings and loudness it used, the lines and any warnings:
 
 <!-- output of: takewise export promo.takewise --json -->
 ```json
@@ -183,6 +183,14 @@ takewise export promo.takewise --json
   }
 }
 ```
+
+Warnings mean the file was written but is worth a look; the same list is the manifest's top-level `warnings`. Each has a `code`, a `message` and, unless it is about the whole narration, the `line`:
+
+- `recorded-against-old-text`: the take was recorded before the line's text changed.
+- `speech-cropped`: part of the take's speech lies outside the film.
+- `tight-gap`: two lines' speech is less than 20 ms apart.
+- `noise-reduction-skipped` (`clean`): no room tone matches the take (none on its input, channel and day, or the gain changed), or the take or the room tone is digital silence. Run the setup check's room step, then export again.
+- `loudness-target-missed` (`clean`, no `line`): the limiter's 6 dB cap kept the narration below −16 LUFS (`loudness_target_reached: false`).
 
 `export/manifest.json` describes the narration file for whatever places it:
 
