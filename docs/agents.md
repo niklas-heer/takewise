@@ -1,8 +1,8 @@
 # Takewise for agents
 
-Takewise splits narration work between a person and an agent. The narrator reads the lines in the recording window; you, the agent, write the script, read the checks of every take, judge and choose takes, export the narration and place it in the film's edit. Everything goes through the `takewise` command and plain files, so you never need the window.
+Takewise splits narration work between a person and an agent. The narrator reads the lines in the recording window; you, the agent, write the script, read the checks of every take, judge and choose takes when the narrator hands that over, export the narration and, with your own editor tools, place it in the film's edit. Everything goes through the `takewise` command and plain files, so you never need the window.
 
-This guide walks one project through the whole loop. Every command in it is run by a test (`crates/takewise/tests/agents_doc.rs`) against a scratch project, and every JSON example below is checked against the real output, so they stay true.
+This guide walks one project through the whole loop. A test (`crates/takewise/tests/agents_doc.rs`) runs its commands in order against a scratch project, recording fixture takes in place of the narrator's `takewise record`, and checks that every JSON example below has the shape of the real output (every key it shows is there), so they stay true.
 
 ## Rules
 
@@ -28,7 +28,7 @@ takewise doctor --json
 takewise init promo.takewise --film renders/promo.mp4 --json
 ```
 
-`init` measures the film with `ffprobe` and writes `project.toml` and an empty `script.toml`. To time the lines you need your own view of the cut: Takewise doesn't show you the film, so pull frames with `ffmpeg` (for example one every second, or at scene changes) or read the editor's timeline with your own tools. Rough starts are fine; the narrator can move a line's start with M while a take plays. Write the lines: an `id` (lowercase letters, digits and `-`, unique), the `start` in seconds of film time, an optional `end` (otherwise the slot runs to the next line's start or the film's end), the `text` and an optional `note` for the narrator.
+`init` measures the film with `ffprobe` and writes `project.toml` and an empty `script.toml`. To time the lines you need your own view of the cut: Takewise doesn't show you the film, so pull frames with `ffmpeg` (for example one every second, or at scene changes) or read the editor's timeline with your own tools. Rough starts are fine; the narrator can move a line's start with M while the film plays (during a take or P). Write the lines: an `id` (lowercase letters, digits and `-`, unique), the `start` in seconds of film time, an optional `end` (otherwise the slot runs to the next line's start or the film's end), the `text` and an optional `note` for the narrator.
 
 <!-- file: promo.takewise/script.toml -->
 ```toml
@@ -169,7 +169,7 @@ takewise status promo.takewise --strict --json
 takewise export promo.takewise --json
 ```
 
-`export` writes `export/narration.wav` (or `.flac`): one mono file exactly as long as the film, starting at its first frame, with each line's chosen take placed where it was recorded against the picture. The project's `[export]` settings choose the format and processing; new projects export `clean` (high-pass, noise reduction from the setup check's room tone, −16 LUFS). It refuses (exit 1) with the line ids when a line has no chosen take, a take has no speech, or two lines' speech overlaps; `--use-proposed` fills unchosen lines with their proposed take. It also refuses when the film is missing (`film-missing`) or changed since the project measured it (`film-changed`): check the line timings against the new cut, then run `takewise status --refresh-film` and export again. `film-probe-timeout` means `ffprobe` stalled reading the film and was stopped; export again. `state-changed` means the script or ledger changed twice while it rendered; export again. The command reports the files, the settings and loudness it used, the lines and any warnings:
+`export` writes `export/narration.wav` (or `.flac`): one mono file exactly as long as the film, starting at its first frame, with each line's chosen take placed at the line's current start plus the offset the take was recorded at, trimmed to its detected speech. The project's `[export]` settings choose the format and processing; new projects export `clean` (high-pass, noise reduction from the setup check's room tone, −16 LUFS, a common level for spoken word, with true peaks below −1 dBTP). It refuses (exit 1) with the line ids when a line has no chosen take, a take has no speech, or two lines' speech overlaps; `--use-proposed` fills unchosen lines with their proposed take, and still refuses a line whose proposed take is marked `retake` (`no-acceptable-take`). It also refuses when the film is missing (`film-missing`) or changed since the project measured it (`film-changed`): check the line timings against the new cut, then run `takewise status --refresh-film` and export again. `film-probe-timeout` means `ffprobe` stalled reading the film and was stopped; export again. `state-changed` means the script or ledger changed twice while it rendered; export again. The command reports the files, the settings and loudness it used, the lines and any warnings:
 
 <!-- output of: takewise export promo.takewise --json -->
 ```json
