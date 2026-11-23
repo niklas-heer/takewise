@@ -1357,6 +1357,51 @@ fn a_line_renamed_during_its_take_keeps_the_prompter(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_note_and_next_line_keep_the_takes_until_it_stops(cx: &mut TestAppContext) {
+    let with_note = SCRIPT.replace(
+        "text = \"Third line.\"\n",
+        "text = \"Third line.\"\nnote = \"Slowly.\"\n",
+    );
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        fs::write(dir.join("script.toml"), &with_note).expect("script");
+    });
+    // An agent removes the recorded line c meanwhile and rewrites d.
+    let changed = SCRIPT
+        .replace(
+            "[[line]]\nid = \"c\"\nstart = 1.5\ntext = \"Third line.\"\n\n",
+            "",
+        )
+        .replace(
+            "text = \"Fourth line.\"",
+            "text = \"Fourth, rewritten.\"\nnote = \"Loud.\"",
+        );
+    press(cx, f.window, &["down", "down"]); // c
+    begin(cx, &f, 100.0);
+    fs::write(f.dir.join("script.toml"), changed).expect("script");
+    f.view.update(cx, |view, _| view.reload());
+    f.media.set_now(100.3);
+    frame(cx, f.window);
+    let cues = |cx: &mut TestAppContext| {
+        f.view.read_with(cx, |view, _| {
+            let (note, next) = view.prompter_cues();
+            (note.map(str::to_owned), next.map(str::to_owned))
+        })
+    };
+    assert_eq!(
+        cues(cx),
+        (Some("Slowly.".to_owned()), Some("Fourth line.".to_owned())),
+        "while recording"
+    );
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    assert_eq!(
+        cues(cx),
+        (Some("Loud.".to_owned()), None),
+        "after the take: line d is selected"
+    );
+}
+
+#[gpui_kit::test]
 fn a_take_whose_finish_failed_stays_locked_until_saved(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     begin(cx, &f, 100.0); // begun on disk, streaming into the partial WAV

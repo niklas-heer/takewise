@@ -348,6 +348,19 @@ impl RecordingWindow {
         })
     }
 
+    /// The note and the next line's text the prompter shows: while a take
+    /// records, those the take started with, like its text.
+    fn prompter_cues(&self) -> (Option<&str>, Option<&str>) {
+        if let Some(cues) = self.recorder.recording_cues() {
+            return cues;
+        }
+        let lines = &self.project.script.lines;
+        (
+            lines.get(self.line).and_then(|line| line.note.as_deref()),
+            lines.get(self.line + 1).map(|line| line.text.as_str()),
+        )
+    }
+
     #[cfg(test)]
     fn prompter_text(&self) -> Option<&str> {
         self.prompter_line().map(|reading| reading.text)
@@ -785,16 +798,12 @@ impl Render for RecordingWindow {
         let recording = self.recorder.is_recording();
         let frame = self.media.latest_frame();
 
-        let script = &self.project.script;
-        let line = script.lines.get(self.line);
+        let (note, next) = self.prompter_cues();
         let prompter = prompter::Prompter {
             film_s,
             reading: self.prompter_line(),
-            note: line.and_then(|line| line.note.as_deref()),
-            next: script
-                .lines
-                .get(self.line + 1)
-                .map(|line| line.text.as_str()),
+            note,
+            next,
             level_dbfs: level,
             recording,
             blocked: self.blocked(),

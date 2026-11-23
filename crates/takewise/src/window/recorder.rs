@@ -90,6 +90,10 @@ struct Take {
     line: String,
     line_start: f64,
     snapshot: Snapshot,
+    /// The line's note and the next line's text when the take started: the
+    /// prompter keeps them, like the text, until the take stops.
+    note: Option<String>,
+    next: Option<String>,
     device: String,
     channel: u16,
     latency_s: f64,
@@ -185,6 +189,15 @@ impl Recorder {
     pub fn recording_snapshot(&self) -> Option<&Snapshot> {
         match &self.phase {
             Phase::Recording(take) => Some(&take.snapshot),
+            _ => None,
+        }
+    }
+
+    /// The line's note and the next line's text as the take being recorded
+    /// started with them.
+    pub fn recording_cues(&self) -> Option<(Option<&str>, Option<&str>)> {
+        match &self.phase {
+            Phase::Recording(take) => Some((take.note.as_deref(), take.next.as_deref())),
             _ => None,
         }
     }
@@ -311,6 +324,12 @@ impl Recorder {
             line: line.id.clone(),
             line_start: line.start,
             snapshot,
+            note: line.note.clone(),
+            next: project
+                .script
+                .lines
+                .get(idx + 1)
+                .map(|next| next.text.clone()),
             device,
             channel: input.channel,
             latency_s,
