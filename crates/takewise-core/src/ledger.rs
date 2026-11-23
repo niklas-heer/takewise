@@ -97,6 +97,13 @@ pub struct Checked {
     pub word_diffs: Vec<WordDiff>,
     /// Speech start and end in seconds from the take's first sample.
     pub speech: Option<(f64, f64)>,
+    /// Where the words start, in seconds from the take's first sample, as
+    /// the early-start rule and export measure it: after a breath or a
+    /// noise set apart from the first word by a gap, otherwise the energy
+    /// speech start. Absent without speech and on checks from before it
+    /// was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_onset_s: Option<f64>,
     pub overrun_s: Option<f64>,
     pub peak_dbfs: f64,
     pub clipped_samples: u64,
@@ -368,6 +375,7 @@ mod tests {
                     at: Some(1.5),
                 }],
                 speech: Some((2.0, 3.5)),
+                speech_onset_s: Some(2.25),
                 overrun_s: None,
                 peak_dbfs: -6.0,
                 clipped_samples: 0,
@@ -384,8 +392,17 @@ mod tests {
         assert_eq!(json["kind"], "checked");
         assert_eq!(json["word_diffs"][0]["kind"], "missing");
         assert_eq!(json["speech"], serde_json::json!([2.0, 3.5]));
-        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(json["speech_onset_s"], 2.25);
+        let back: Event = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, checked);
+        // A check from before the onset was stored still reads.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("speech_onset_s");
+        let back: Event = serde_json::from_value(old).unwrap();
+        let EventKind::Checked(back) = back.kind else {
+            unreachable!()
+        };
+        assert_eq!(back.speech_onset_s, None);
 
         let chosen = Event::new(
             "hook",

@@ -66,7 +66,8 @@ pub fn build_checked(
         .unwrap_or_default();
     let slot = snapshot.end - snapshot.start;
     let overrun_s = analysis.speech.map(|(_, end)| line_offset_s + end - slot);
-    let early_s = speech_onset(analysis, heard.as_deref()).map(|start| -(line_offset_s + start));
+    let onset = speech_onset(analysis, heard.as_deref());
+    let early_s = onset.map(|start| -(line_offset_s + start));
 
     let mut reasons = Vec::new();
     let mut verdict = None;
@@ -144,6 +145,7 @@ pub fn build_checked(
         transcript: heard,
         word_diffs,
         speech: analysis.speech,
+        speech_onset_s: analysis.speech.and(onset),
         overrun_s,
         peak_dbfs: analysis.peak_dbfs,
         clipped_samples: analysis.clipped_samples,
@@ -456,6 +458,11 @@ mod tests {
         assert_eq!(checked.verdict, Verdict::Retake, "{:?}", checked.reasons);
         assert_eq!(codes(&checked), ["early-start"]);
         assert!(checked.reasons[0].message.contains("0.40 s"));
+        // The check stores that start, so status places the speech as
+        // export does.
+        assert_eq!(checked.speech, Some((0.2, 3.5)));
+        let onset = checked.speech_onset_s.unwrap();
+        assert!((onset - 0.6).abs() < 0.011, "{onset}");
 
         // Two breaths: the sound after the last gap before the words counts.
         let analysis = voiced(&[(0.1, 0.2), (0.4, 0.5), (0.8, 3.5)]);

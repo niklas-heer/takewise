@@ -62,6 +62,10 @@ pub struct TakeState {
     pub stale_check: bool,
     /// Speech start and end in seconds from the take's first sample.
     pub speech: Option<(f64, f64)>,
+    /// Where the words start in seconds from the take's first sample, after
+    /// a breath set apart from them, as export places them; `None` when
+    /// the latest check did not store it (the speech start stands in).
+    pub speech_onset: Option<f64>,
     /// The take's WAV is not on disk.
     pub missing: bool,
     /// The take was recorded against different text than the line has now.
@@ -190,6 +194,7 @@ fn fold_take(
         reason,
         stale_check,
         speech: latest_checked.and_then(|c| c.speech),
+        speech_onset: latest_checked.and_then(|c| c.speech_onset_s),
         clipped: latest_checked.map(|c| c.clipped_samples > 0),
         missing: !project.dir.join(&rec.file).is_file(),
         recorded_against_old_text: rec.snapshot.text != current.text,
@@ -358,14 +363,16 @@ fn take_findings(
 
 /// Chosen takes of two lines whose speech (from their latest checks)
 /// overlaps in the film, which export refuses: a notice naming both, so the
-/// narrator learns before exporting.
+/// narrator learns before exporting. Like export, the speech starts at the
+/// words' onset, after a breath set apart from them.
 fn speech_overlaps(lines: &[LineState], notices: &mut Vec<Problem>) {
     let spans: Vec<(&str, f64, f64)> = lines
         .iter()
         .filter_map(|line| {
             let (chosen, _) = line.chosen.as_ref()?;
             let take = line.takes.iter().find(|t| t.take == *chosen)?;
-            let (start, end) = take.speech?;
+            let (energy_start, end) = take.speech?;
+            let start = take.speech_onset.unwrap_or(energy_start);
             let at = line.start + take.line_offset_s;
             Some((line.id.as_str(), at + start, at + end))
         })
@@ -542,6 +549,24 @@ text = "Today we start."
         append(&project.dir, &event).unwrap();
     }
 
+    /// A `keep` check of take 1 with speech at 2..3 s of the take.
+    fn check_of(project: &Project, line: &str) -> Checked {
+        Checked {
+            snapshot: snap(project, line),
+            transcript: None,
+            word_diffs: Vec::new(),
+            speech: Some((2.0, 3.0)),
+            speech_onset_s: None,
+            overrun_s: None,
+            peak_dbfs: -6.0,
+            clipped_samples: 0,
+            noise_floor_dbfs: -70.0,
+            verdict: Verdict::Keep,
+            reasons: Vec::new(),
+            checker: "test".to_owned(),
+        }
+    }
+
     fn checked(
         project: &Project,
         line: &str,
@@ -564,6 +589,7 @@ text = "Today we start."
                 transcript: None,
                 word_diffs: vec![diff; diffs],
                 speech: Some((2.0, 3.0)),
+                speech_onset_s: None,
                 overrun_s: overrun,
                 peak_dbfs: -6.0,
                 clipped_samples: 0,
@@ -743,6 +769,7 @@ text = "Today we start."
                 transcript: Some(Vec::new()),
                 word_diffs: Vec::new(),
                 speech: Some((2.0, 3.0)),
+                speech_onset_s: None,
                 overrun_s: Some(0.4),
                 peak_dbfs: -6.0,
                 clipped_samples: 0,
@@ -946,6 +973,36 @@ text = "Today we start."
             chosen(&project, line, 1, "narrator");
         }
         assert_eq!(overlaps(&fold_now(&project)), []);
+    }
+
+    #[test]
+    fn speech_overlap_starts_after_a_breath_as_export_does() {
+        // Line two's energy speech runs from 10.5 s, but its words start
+        // after a breath at 11.1 s, after line one's speech ended at 11 s:
+        // export accepts the pair, so status names no overlap.
+        let script = "[[line]]\nid = \"one\"\nstart = 10.0\ntext = \"A.\"\n\n[[line]]\nid = \"two\"\nstart = 10.5\ntext = \"B.\"\n";
+        let (_tmp, project) = setup(script);
+        for line in ["one", "two"] {
+            recorded(&project, line, 1);
+            chosen(&project, line, 1, "narrator");
+        }
+        checked(&project, "one", 1, Verdict::Keep, 0, None);
+        let event = Event::new(
+            "two",
+            1,
+            EventKind::Checked(Checked {
+                speech_onset_s: Some(2.6),
+                ..check_of(&project, "two")
+            }),
+        );
+        append(&project.dir, &event).unwrap();
+        let state = fold_now(&project);
+        assert!(
+            !state.notices.iter().any(|n| n.code == "speech-overlap"),
+            "{:?}",
+            state.notices
+        );
+        assert_eq!(line(&state, "two").takes[0].speech_onset, Some(2.6));
     }
 
     #[test]
