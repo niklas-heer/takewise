@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::check::{Transcript, build_checked};
 use crate::error::{Error, Result};
-use crate::ledger::{self, Checked, Event, EventKind, Ledger, Snapshot};
+use crate::ledger::{self, Checked, Event, EventKind, Ledger};
 use crate::project::Project;
 use crate::speech::analyze;
 use crate::takes::{TakeRef, read_take_wav};
@@ -65,17 +65,19 @@ pub fn check_take(
     Ok(checked)
 }
 
-/// A take whose effective check is missing.
+/// A take without a current check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Unchecked {
     pub take: TakeRef,
-    /// It was checked before, against another text or slot.
+    /// It was checked before, against another text or slot only.
     pub stale: bool,
 }
 
-/// The takes of the script's lines that have no `checked` event matching
-/// the line as it is now, in script and take order. Takes whose file is
-/// missing are left out: there is nothing to check.
+/// The takes of the script's lines without a current check, in script and
+/// take order: a `checked` event matching the line as it is now whose words
+/// were checked. One whose transcription failed (`words-not-checked`) is not
+/// current, so the take is checked again. Takes whose file is missing are
+/// left out: there is nothing to check.
 pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
     let mut found = Vec::new();
     for line in &project.script.lines {
@@ -97,16 +99,18 @@ pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
             if !project.dir.join(file).is_file() {
                 continue;
             }
-            let checks: Vec<&Snapshot> = ledger
+            let checks: Vec<&Checked> = ledger
                 .events
                 .iter()
                 .filter(|e| e.line == line.id && e.take == take)
                 .filter_map(|e| match &e.kind {
-                    EventKind::Checked(checked) => Some(&checked.snapshot),
+                    EventKind::Checked(checked) => Some(checked),
                     _ => None,
                 })
                 .collect();
-            if checks.iter().any(|snapshot| snapshot.matches(&current)) {
+            let matching = || checks.iter().filter(|c| c.snapshot.matches(&current));
+            // A failed transcription leaves `transcript` empty.
+            if matching().any(|c| c.transcript.is_some()) {
                 continue;
             }
             found.push(Unchecked {
@@ -114,7 +118,7 @@ pub fn unchecked_takes(project: &Project, ledger: &Ledger) -> Vec<Unchecked> {
                     line: line.id.clone(),
                     take,
                 },
-                stale: !checks.is_empty(),
+                stale: !checks.is_empty() && matching().next().is_none(),
             });
         }
     }
@@ -269,6 +273,18 @@ mod tests {
         assert_eq!(checked.verdict, Verdict::Listen);
         assert_eq!(checked.reasons[0].code, "words-not-checked");
         assert!(checked.reasons[0].message.contains("status 1"));
+
+        // Such a check is not current: the take is checked again.
+        let project = Project::open(&dir).unwrap();
+        assert_eq!(
+            unchecked_takes(&project, &read(&dir).unwrap()),
+            vec![Unchecked {
+                take: t.clone(),
+                stale: false
+            }]
+        );
+        check_take(&dir, &t, &Fake::new(), "0.1.0").unwrap();
+        assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);
     }
 
     #[test]
