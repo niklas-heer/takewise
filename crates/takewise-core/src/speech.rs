@@ -36,6 +36,45 @@ pub struct Analysis {
     pub clipped_samples: u64,
     /// The 20th percentile of 10 ms frame levels in the pre-roll.
     pub noise_floor_dbfs: f64,
+    /// The frame levels the speech was found in, for later questions about
+    /// the take's sound; not part of the JSON.
+    #[serde(skip)]
+    pub frames: Frames,
+}
+
+/// A take's frame levels and the level above which a frame is sound.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Frames {
+    /// The RMS level of each frame in dBFS, from the take's first sample.
+    pub levels_dbfs: Vec<f64>,
+    /// A frame above this level is sound, at or below it silence.
+    pub threshold_dbfs: f64,
+    /// The length of one frame in seconds.
+    pub frame_s: f64,
+}
+
+impl Frames {
+    /// The longest run of silent frames lying wholly between `from` and `to`
+    /// seconds, in seconds; 0 when there are none or no frames at all.
+    pub fn longest_silence_s(&self, from: f64, to: f64) -> f64 {
+        if self.frame_s <= 0.0 || to <= from {
+            return 0.0;
+        }
+        // Allow for rounding at the frame edges.
+        let first = to_index((from / self.frame_s - 1e-6).ceil());
+        let end = to_index((to / self.frame_s + 1e-6).floor()).min(self.levels_dbfs.len());
+        let mut longest = 0_usize;
+        let mut run = 0_usize;
+        for &level in self.levels_dbfs.get(first..end).unwrap_or_default() {
+            run = if level > self.threshold_dbfs {
+                0
+            } else {
+                run + 1
+            };
+            longest = longest.max(run);
+        }
+        longest as f64 * self.frame_s
+    }
 }
 
 fn dbfs(amplitude: f64) -> f64 {
@@ -90,6 +129,11 @@ pub fn analyze(samples: &[i32], sample_rate: u32, preroll_s: f64) -> Analysis {
         peak_dbfs: dbfs(f64::from(peak)),
         clipped_samples: clipped as u64,
         noise_floor_dbfs: noise_floor,
+        frames: Frames {
+            levels_dbfs: levels,
+            threshold_dbfs: threshold,
+            frame_s: frame_len as f64 / f64::from(sample_rate),
+        },
     }
 }
 
@@ -355,6 +399,25 @@ mod tests {
         burst(&mut take, 0.5, 0.7);
         let analysis = analyze(&take, RATE, 5.0);
         assert!(analysis.speech.is_some(), "{analysis:?}");
+    }
+
+    #[test]
+    fn measures_the_longest_silence_between_two_times() {
+        // A breath at 0.5-0.7 s, 200 ms of silence, then words from 0.9 s.
+        let mut take = noise(3.0);
+        burst_at(&mut take, 0.5, 0.7, -30.0);
+        burst(&mut take, 0.9, 2.0);
+        let analysis = analyze(&take, RATE, 0.4);
+        let frames = &analysis.frames;
+        let gap = frames.longest_silence_s(0.5, 1.0);
+        assert!((gap - 0.2).abs() <= 0.02, "gap {gap}");
+        // Only frames wholly inside the range count.
+        let gap = frames.longest_silence_s(0.75, 1.0);
+        assert!((gap - 0.15).abs() <= 0.02, "gap {gap}");
+        assert!(frames.longest_silence_s(1.0, 1.9) < 0.02);
+        assert_eq!(frames.longest_silence_s(1.0, 0.5), 0.0);
+        // Without frames there is no silence to find.
+        assert_eq!(Frames::default().longest_silence_s(0.0, 1.0), 0.0);
     }
 
     #[test]

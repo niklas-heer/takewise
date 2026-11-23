@@ -14,7 +14,8 @@
 //! pre-roll, and drift by seconds after it, so early-start checks would be
 //! wrong. The DTW times (`t_dtw`, in centiseconds) move exactly with the
 //! pre-roll, stay in order, and land 0.1 to 0.4 s after each word's real
-//! onset, so a measured early start reads a little late, never early. DTW
+//! onset on those takes (0.08 to 0.20 s on real narration), so a measured
+//! early start reads a little late, never early. DTW
 //! needs the model's alignment-head preset (`-dtw large.v3.turbo`, from the
 //! model file name) and is silently disabled with flash attention, so `-nfa`
 //! is required; it costs about 0.2 s on a 6 s take. When a word token comes

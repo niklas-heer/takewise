@@ -26,10 +26,10 @@ use crate::words::{align, is_annotation, normalize};
 pub const OVERRUN_TOLERANCE_S: f64 = 0.25;
 /// Speech may start this long before the line before it is an early start.
 pub const EARLY_START_TOLERANCE_S: f64 = 0.3;
-/// An energy speech start at most this long before the first transcribed
-/// word is that word's onset (DTW places words 0.08 to 0.20 s late); an
-/// earlier one is a breath before the words.
-pub const ONSET_LEAD_S: f64 = 0.25;
+/// Silence at least this long between the energy speech start and the first
+/// transcribed word means the sound before it is a breath or a noise, not
+/// the first word.
+pub const BREATH_GAP_S: f64 = 0.12;
 /// A reason names at most this many words, then says how many more.
 const NAMED_WORDS: usize = 6;
 
@@ -45,9 +45,10 @@ pub enum Transcript {
 /// Applies the verdict rules. `line_offset_s` is the film time of the take's
 /// first sample minus the line's start (from the `recorded` event), so a time
 /// `t` in the take is `line_offset_s + t` in line time. Early start is
-/// measured from the energy speech start, unless it lies more than
-/// [`ONSET_LEAD_S`] before the first transcribed word (a breath before the
-/// words), then from that word; overrun always from the energy speech end.
+/// measured from the energy speech start, unless silence of at least
+/// [`BREATH_GAP_S`] lies between it and the first transcribed word (a breath
+/// or a noise before the words), then from that word; overrun always from
+/// the energy speech end.
 /// `speech` and the transcript's times stay in seconds from the take's first
 /// sample; `overrun_s` is signed (negative when speech ends inside the slot).
 pub fn build_checked(
@@ -161,7 +162,11 @@ fn speech_onset(analysis: &Analysis, heard: Option<&[Word]>) -> Option<f64> {
     let first_word = heard.and_then(|words| words.iter().map(|w| w.start).min_by(f64::total_cmp));
     let energy_start = analysis.speech.map(|(start, _)| start);
     match (energy_start, first_word) {
-        (Some(energy), Some(word)) if word - energy > ONSET_LEAD_S => Some(word),
+        (Some(energy), Some(word))
+            if analysis.frames.longest_silence_s(energy, word) >= BREATH_GAP_S - 1e-9 =>
+        {
+            Some(word)
+        }
         (Some(energy), _) => Some(energy),
         (None, word) => word,
     }
@@ -230,6 +235,7 @@ fn named(diffs: &[WordDiff], kind: WordDiffKind) -> Option<String> {
 mod tests {
     use super::*;
     use crate::ledger::WordDiffKind;
+    use crate::speech::Frames;
 
     const CHECKER: &str = "takewise 0.0.0 whisper ggml-large-v3-turbo.bin";
     const LINE: &str = "Nobody misses a birthday.";
@@ -247,11 +253,32 @@ mod tests {
 
     /// Speech from 1.0 s to 3.5 s of the take: 0.0 to 2.5 s of the line.
     fn analysis() -> Analysis {
+        voiced(&[(1.0, 3.5)])
+    }
+
+    /// Sound in the given ranges of a 5 s take, silence elsewhere; the
+    /// speech runs from the first range's start to the last one's end.
+    fn voiced(ranges: &[(f64, f64)]) -> Analysis {
+        let levels = (0..500)
+            .map(|i| {
+                let t = f64::from(i) / 100.0 + 0.005;
+                if ranges.iter().any(|&(a, b)| (a..b).contains(&t)) {
+                    -20.0
+                } else {
+                    -70.0
+                }
+            })
+            .collect();
         Analysis {
-            speech: Some((1.0, 3.5)),
+            speech: Some((ranges[0].0, ranges[ranges.len() - 1].1)),
             peak_dbfs: -6.0,
             clipped_samples: 0,
             noise_floor_dbfs: -70.0,
+            frames: Frames {
+                levels_dbfs: levels,
+                threshold_dbfs: -55.0,
+                frame_s: 0.01,
+            },
         }
     }
 
@@ -357,12 +384,9 @@ mod tests {
 
     #[test]
     fn rule_early_start_from_first_word_not_breath() {
-        // A breath starts the energy speech 0.5 s before the line; the first
-        // word is on time.
-        let analysis = Analysis {
-            speech: Some((0.5, 3.5)),
-            ..analysis()
-        };
+        // A breath starts the energy speech 0.5 s before the line, 250 ms of
+        // silence before the words; the first word is on time.
+        let analysis = voiced(&[(0.5, 0.7), (0.95, 3.5)]);
         let checked = check(&analysis, &words(LINE));
         assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
 
@@ -383,14 +407,28 @@ mod tests {
         // DTW puts a word 0.08 to 0.20 s after its real onset: the energy
         // start 0.5 s early with the first word 0.22 s after it (0.28 s
         // early, within the tolerance on its own) is the real start.
-        let analysis = Analysis {
-            speech: Some((0.5, 3.5)),
-            ..analysis()
-        };
+        let analysis = voiced(&[(0.5, 3.5)]);
         let checked = check(&analysis, &words_from(LINE, 0.72));
         assert_eq!(checked.verdict, Verdict::Retake, "{:?}", checked.reasons);
         assert_eq!(codes(&checked), ["early-start"]);
         assert!(checked.reasons[0].message.contains("0.50 s"));
+    }
+
+    #[test]
+    fn rule_early_start_needs_a_silent_gap_before_the_words() {
+        // Sound 0.5 s early with only 100 ms of silence before the words is
+        // part of the speech, however late the first word is placed.
+        let analysis = voiced(&[(0.5, 0.7), (0.8, 3.5)]);
+        let checked = check(&analysis, &words(LINE));
+        assert_eq!(checked.verdict, Verdict::Retake, "{:?}", checked.reasons);
+        assert_eq!(codes(&checked), ["early-start"]);
+        assert!(checked.reasons[0].message.contains("0.50 s"));
+
+        // A click 140 ms before the words is not the start, even when the
+        // first word follows within 0.25 s.
+        let analysis = voiced(&[(0.5, 0.56), (0.7, 3.5)]);
+        let checked = check(&analysis, &words_from(LINE, 0.74));
+        assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
     }
 
     #[test]
