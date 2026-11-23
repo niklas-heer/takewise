@@ -1090,14 +1090,6 @@ fn run_in_bundle(args: &[&std::ffi::OsStr]) -> Result<PathBuf, CliError> {
     Ok(bundle)
 }
 
-/// Today's date (UTC) as `YYYY-MM-DD`.
-fn today() -> String {
-    jiff::tz::Offset::UTC
-        .to_datetime(jiff::Timestamp::now())
-        .date()
-        .to_string()
-}
-
 /// Makes the beep film, measures inside Takewise.app, reports the placement
 /// error and with `--write` stores the offset that cancels it.
 fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, CliError> {
@@ -1171,7 +1163,7 @@ fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, C
             input: measurement.input.clone(),
             output: measurement.output.clone(),
             buffer_frames: measurement.buffer_frames,
-            date: today(),
+            date: calibrate::today(),
         };
         tw::set_calibration(&dir, offset, &info)?;
         let _ = write!(

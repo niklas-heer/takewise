@@ -432,6 +432,17 @@ impl Run {
     }
 }
 
+/// Today's local date as `YYYY-MM-DD`, the date a calibration is stamped
+/// with, in the window and the CLI alike.
+pub fn today() -> String {
+    date_in(jiff::Timestamp::now(), jiff::tz::TimeZone::system())
+}
+
+/// The date of `instant` in `zone` as `YYYY-MM-DD`.
+fn date_in(instant: jiff::Timestamp, zone: jiff::tz::TimeZone) -> String {
+    instant.to_zoned_datetime(zone).date().to_string()
+}
+
 /// The offset a measurement supports, or why it supports none: too few
 /// beeps, or beeps too far from the mean error for one fixed offset.
 pub fn judge(measurement: &Measurement) -> Result<i32, String> {
@@ -506,6 +517,15 @@ mod tests {
     use super::*;
 
     const RATE: u32 = 48_000;
+
+    #[test]
+    fn calibration_dates_are_local() {
+        // 23:30 UTC is already the next day two hours east.
+        let instant: jiff::Timestamp = "2026-01-01T23:30:00Z".parse().unwrap();
+        let east = jiff::tz::TimeZone::fixed(jiff::tz::offset(2));
+        assert_eq!(date_in(instant, east), "2026-01-02");
+        assert_eq!(date_in(instant, jiff::tz::TimeZone::UTC), "2026-01-01");
+    }
 
     /// Low noise (about −60 dBFS) with 1 kHz beeps starting at `beeps`.
     fn recording(seconds: f64, beeps: &[f64]) -> Vec<i32> {

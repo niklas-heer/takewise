@@ -142,7 +142,7 @@ impl RecordingWindow {
             input: measurement.input.clone(),
             output: measurement.output.clone(),
             buffer_frames: measurement.buffer_frames,
-            date: jiff::ZonedDateTime::now().date().to_string(),
+            date: crate::calibrate::today(),
         };
         tw::set_calibration(&self.dir, offset, &info)
             .map_err(|err| format!("{placed}, but it could not be saved: {err}"))?;
