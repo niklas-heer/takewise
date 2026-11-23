@@ -29,8 +29,9 @@
 //! words on one side against their concatenation on the other ("every day"
 //! and "everyday", "every one" and "everyone") are one substitution, a
 //! possible mishearing, since they often mean different things. Diffs name
-//! normalized tokens, such as `kindred` or `link's`, not the original
-//! spelling.
+//! the words as written in the script or said in the transcript, lowercased
+//! and without punctuation: `second` (not `2nd`), `1,867`, `eighteen
+//! sixty-eight`, `link's`.
 
 use crate::ledger::{Word, WordDiff, WordDiffKind};
 
@@ -80,6 +81,9 @@ pub struct Token {
     /// Punctuation such as a comma stands between this token and the one
     /// before it, so the two are never one number.
     after_break: bool,
+    /// The words as written or said, lowercased and without punctuation,
+    /// which diffs name: `second`, `1,867`, `eighteen sixty-eight`, `$5`.
+    written: String,
 }
 
 impl Token {
@@ -88,14 +92,17 @@ impl Token {
     }
 
     fn new(text: impl Into<String>, apostrophe: Apostrophe) -> Token {
-        Token {
+        let mut token = Token {
             text: text.into(),
             apostrophe,
             after_break: false,
-        }
+            written: String::new(),
+        };
+        token.written = token.display();
+        token
     }
 
-    /// The token as diffs name it: `link's`, `niklas'`, `kindred`.
+    /// The normalized token: `link's`, `niklas'`, `kindred`, `1867`.
     pub fn display(&self) -> String {
         match self.apostrophe {
             Apostrophe::None => self.text.clone(),
@@ -285,9 +292,23 @@ fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
             let last = items
                 .get(next.saturating_sub(1))
                 .map_or(lexed.part, |l| l.part);
-            out.extend(tokens.into_iter().map(|token| {
+            let mut written = String::new();
+            for (n, said) in items.get(k..next).unwrap_or_default().iter().enumerate() {
+                if n > 0 {
+                    written.push(if said.sep == Sep::Hyphen { '-' } else { ' ' });
+                }
+                written.push_str(&said.raw);
+            }
+            // A currency's unit token keeps its own name.
+            out.extend(tokens.into_iter().enumerate().map(|(n, token)| {
+                let written = if n == 0 {
+                    written.clone()
+                } else {
+                    token.written
+                };
                 let token = Token {
                     after_break,
+                    written,
                     ..token
                 };
                 (token, lexed.part, last)
@@ -351,6 +372,8 @@ struct Lexed {
     item: Item,
     part: usize,
     sep: Sep,
+    /// As written: `1,500`, `$5`, `twenty`, `link's`.
+    raw: String,
 }
 
 /// A raw token before numbers are read.
@@ -695,21 +718,35 @@ fn lex(raw: &str, part: usize, sep: Sep, items: &mut Vec<Lexed>) {
     if bare.is_empty() {
         return;
     }
-    let mut push = |item: Item, sep: Sep| items.push(Lexed { item, part, sep });
+    let mut push = |item: Item, sep: Sep, raw: String| {
+        items.push(Lexed {
+            item,
+            part,
+            sep,
+            raw,
+        });
+    };
     if bare.contains(':') && clock(bare).is_none() {
         for (n, piece) in bare.split(':').enumerate() {
             lex(piece, part, if n == 0 { sep } else { Sep::Break }, items);
         }
     } else if bare.chars().any(|c| c.is_ascii_digit()) {
         let item = lex_number(bare).map_or_else(|| Item::Other(Token::plain(bare)), Item::Number);
-        push(item, sep);
+        push(item, sep, bare.to_owned());
     } else if bare.len() < token.len() {
-        push(Item::Word(Token::new(bare, Apostrophe::Trailing)), sep);
+        let token = Token::new(bare, Apostrophe::Trailing);
+        let raw = token.written.clone();
+        push(Item::Word(token), sep, raw);
     } else {
         let mut tokens = Vec::new();
         expand_contraction(bare, &mut tokens);
         for (n, token) in tokens.into_iter().enumerate() {
-            push(Item::Word(token), if n == 0 { sep } else { Sep::Space });
+            let raw = token.written.clone();
+            push(
+                Item::Word(token),
+                if n == 0 { sep } else { Sep::Space },
+                raw,
+            );
         }
     }
 }
@@ -1019,10 +1056,10 @@ impl Alignment<'_> {
                         kind: WordDiffKind::Substituted,
                         expected: Some(format!(
                             "{} {}",
-                            expected[i - 2].display(),
-                            expected[i - 1].display()
+                            expected[i - 2].written,
+                            expected[i - 1].written
                         )),
-                        heard: Some(heard[j - 1].token.display()),
+                        heard: Some(heard[j - 1].token.written.clone()),
                         at: Some(heard[j - 1].start),
                     });
                 }
@@ -1036,11 +1073,11 @@ impl Alignment<'_> {
                 if join == Join::Compound {
                     diffs.push(WordDiff {
                         kind: WordDiffKind::Substituted,
-                        expected: Some(expected[i - 1].display()),
+                        expected: Some(expected[i - 1].written.clone()),
                         heard: Some(format!(
                             "{} {}",
-                            heard[j - 2].token.display(),
-                            heard[j - 1].token.display()
+                            heard[j - 2].token.written,
+                            heard[j - 1].token.written
                         )),
                         at: Some(heard[j - 2].start),
                     });
@@ -1055,8 +1092,8 @@ impl Alignment<'_> {
                     if !matches {
                         diffs.push(WordDiff {
                             kind: WordDiffKind::Substituted,
-                            expected: Some(expected[i - 1].display()),
-                            heard: Some(heard[j - 1].token.display()),
+                            expected: Some(expected[i - 1].written.clone()),
+                            heard: Some(heard[j - 1].token.written.clone()),
                             at: Some(heard[j - 1].start),
                         });
                     }
@@ -1072,7 +1109,7 @@ impl Alignment<'_> {
                 };
                 diffs.push(WordDiff {
                     kind: WordDiffKind::Missing,
-                    expected: Some(expected[i - 1].display()),
+                    expected: Some(expected[i - 1].written.clone()),
                     heard: None,
                     at,
                 });
@@ -1081,7 +1118,7 @@ impl Alignment<'_> {
                 diffs.push(WordDiff {
                     kind: WordDiffKind::Extra,
                     expected: None,
-                    heard: Some(heard[j - 1].token.display()),
+                    heard: Some(heard[j - 1].token.written.clone()),
                     at: Some(heard[j - 1].start),
                 });
                 j -= 1;
@@ -1236,8 +1273,8 @@ mod tests {
         }
         let diffs = align(&normalize("$5"), &heard("six dollars"));
         assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].expected.as_deref(), Some("5"));
-        assert_eq!(diffs[0].heard.as_deref(), Some("6"));
+        assert_eq!(diffs[0].expected.as_deref(), Some("$5"));
+        assert_eq!(diffs[0].heard.as_deref(), Some("six"));
     }
 
     #[test]
@@ -1316,6 +1353,40 @@ mod tests {
                 "{said} / {script}"
             );
         }
+    }
+
+    #[test]
+    fn diffs_name_words_as_written() {
+        let named = |script: &str, said: &str| -> Vec<(Option<String>, Option<String>)> {
+            align(&normalize(script), &heard(said))
+                .into_iter()
+                .map(|d| (d.expected, d.heard))
+                .collect()
+        };
+        let pair = |e: &str, h: &str| (Some(e.to_owned()), Some(h.to_owned()));
+        assert_eq!(
+            named("the second day", "the 3rd day"),
+            [pair("second", "3rd")]
+        );
+        assert_eq!(
+            named("the 2nd day", "the third day"),
+            [pair("2nd", "third")]
+        );
+        assert_eq!(
+            named("in 1,867", "in eighteen sixty-eight"),
+            [pair("1,867", "eighteen sixty-eight")]
+        );
+        assert_eq!(named("$5", "six dollars"), [pair("$5", "six")]);
+        assert_eq!(
+            named("3.50%", "three point six percent"),
+            [pair("3.50", "three point six")]
+        );
+        assert_eq!(
+            named("Niklas's link's below", "Niklas lynx below"),
+            [pair("link's", "lynx")]
+        );
+        let missing = align(&normalize("the twenty-first day"), &heard("the day"));
+        assert_eq!(missing[0].expected.as_deref(), Some("twenty-first"));
     }
 
     #[test]
@@ -1576,7 +1647,7 @@ mod tests {
         // A substituted number is placed at its first word.
         let diffs = align(&normalize("in 1867"), &heard("in eighteen sixty eight"));
         assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].heard.as_deref(), Some("1868"));
+        assert_eq!(diffs[0].heard.as_deref(), Some("eighteen sixty eight"));
         assert_eq!(diffs[0].at, Some(1.0));
     }
 
