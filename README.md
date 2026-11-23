@@ -65,7 +65,7 @@ With Rust (pinned in `rust-toolchain.toml`) and [mise](https://mise.jdx.dev): `m
 
 ### The start window
 
-Opening `Takewise.app` from the Dock or Finder shows the start window. **Open project…** (⌘O) opens a `.takewise` folder; any other folder asks for the finished film and starts a project there (in a new `<film>.takewise` folder inside it, unless the folder is empty or named `….takewise`). If that `<film>.takewise` project exists already, it opens. Recent projects are listed below; a project that is already open comes to the front instead of opening twice.
+Opening `Takewise.app` from the Dock or Finder shows the start window. **Open project…** (⌘O) opens a `.takewise` folder; any other folder asks for the finished film and starts a project there (in a new `<film>.takewise` folder inside it, unless the folder is empty or named `….takewise`). If that `<film>.takewise` project exists already for this film, it opens; if it belongs to another film of the same name, the new project is named after the film's full file name (`Promo.mov.takewise`). Recent projects are listed below; a project that is already open comes to the front instead of opening twice.
 
 ## Agents
 

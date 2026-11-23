@@ -341,6 +341,23 @@ fn focus_open(dir: &Path, cx: &mut App) -> bool {
     })
 }
 
+/// Shows `message` in the recording window open on `dir`, if there is one.
+fn tell_open(dir: &Path, message: String, cx: &mut App) {
+    let key = folder_key(dir);
+    let view = cx.try_global::<OpenProjects>().and_then(|open| {
+        open.0
+            .iter()
+            .find(|(folder, _, _)| *folder == key)
+            .and_then(|(_, view, _)| view.upgrade())
+    });
+    if let Some(view) = view {
+        view.update(cx, |view, cx| {
+            view.message = Some(message);
+            cx.notify();
+        });
+    }
+}
+
 /// Opens a recording window on the loaded project in `dir`, inside the
 /// running app.
 fn open_recording(dir: PathBuf, loaded: Loaded, cx: &mut App) -> Result<(), String> {

@@ -3502,3 +3502,11 @@ fn opening_a_project_already_open_focuses_its_window(cx: &mut TestAppContext) {
         "remembered resolved, in the test's own settings"
     );
 }
+
+#[gpui_kit::test]
+fn a_note_for_an_open_project_shows_in_its_window(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let note = "Promo.takewise is the project of Promo.mp4".to_owned();
+    cx.update(|cx| super::tell_open(&f.dir.join("takes/.."), note.clone(), cx));
+    assert_eq!(message(cx, &f.view), note);
+}

@@ -3,7 +3,8 @@
 //! new one from a finished film, lists the projects opened recently, and
 //! installs the command line tool. A project already open is brought to
 //! the front instead of opening twice, and a film whose project was
-//! started before opens that project.
+//! started before opens that project; a film whose usual project folder
+//! belongs to another film of the same name gets its own.
 //!
 //! The recent projects are a convenience kept beside the app's settings
 //! (`recent.json` next to `settings.toml`); failing to read or write them
@@ -18,7 +19,7 @@ use gpui_kit::{
 };
 use takewise_core as tw;
 
-use super::{InstallCommand, colors, focus_open, open_recording, prepare};
+use super::{InstallCommand, colors, focus_open, open_recording, prepare, tell_open};
 
 gpui_kit::actions!(takewise_start, [OpenProject]);
 
@@ -63,11 +64,98 @@ pub fn new_project_dir(folder: &Path, film: &Path) -> PathBuf {
     folder.join(format!("{stem}.takewise"))
 }
 
+/// What starting a project for `film` in `folder` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// Open the project already started for this film.
+    Open(PathBuf),
+    /// Start a project in `dir`; `note` says why it is not the usual
+    /// `<film name>.takewise`.
+    Start { dir: PathBuf, note: Option<String> },
+    /// Neither project folder is free for this film.
+    Taken(String),
+}
+
+/// Whose project folder `dir` is.
+enum Owner {
+    /// It is no project.
+    Free,
+    /// A project whose `project.toml` cannot be read.
+    Unreadable,
+    /// The project of this film.
+    Film(PathBuf),
+}
+
+fn owner(dir: &Path) -> Owner {
+    if !matches!(classify(dir), Picked::Project(_)) {
+        return Owner::Free;
+    }
+    match tw::project::read_config(dir) {
+        Ok(config) if config.film.is_absolute() => Owner::Film(config.film),
+        Ok(config) => Owner::Film(dir.join(config.film)),
+        Err(_) => Owner::Unreadable,
+    }
+}
+
+/// Whether the project in `dir` belongs to `film` (one it cannot read is
+/// taken as its own, so opening it says what is wrong).
+fn belongs_to(dir: &Path, film: &Path) -> bool {
+    match owner(dir) {
+        Owner::Free => false,
+        Owner::Unreadable => true,
+        Owner::Film(own) => resolved(&own) == resolved(film),
+    }
+}
+
 /// What starting a project for `film` in `folder` does: open the project
-/// already at [`new_project_dir`] (the film's `<film>.takewise` made
-/// before), or start one there.
-pub fn start_target(folder: &Path, film: &Path) -> Picked {
-    classify(&new_project_dir(folder, film))
+/// at [`new_project_dir`] when it was started for this film, or start one
+/// there. When that folder is another film's project (`Promo.mp4` beside
+/// `Promo.mov`), the project is `<film file name>.takewise` instead
+/// (`Promo.mov.takewise`).
+pub fn start_target(folder: &Path, film: &Path) -> Target {
+    let dir = new_project_dir(folder, film);
+    if matches!(owner(&dir), Owner::Free) {
+        return Target::Start { dir, note: None };
+    }
+    if belongs_to(&dir, film) {
+        return Target::Open(dir);
+    }
+    let name = |path: &Path| {
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    };
+    let film_name = name(film);
+    let other = match owner(&dir) {
+        Owner::Film(other) => name(&other),
+        Owner::Free | Owner::Unreadable => String::new(),
+    };
+    let parent = if dir == folder {
+        folder.parent().unwrap_or(folder)
+    } else {
+        folder
+    };
+    let own = parent.join(format!("{film_name}.takewise"));
+    if matches!(owner(&own), Owner::Free) {
+        let note = format!(
+            "{} is the project of {other}, so {film_name} got its own project, {}.",
+            name(&dir),
+            name(&own)
+        );
+        return Target::Start {
+            dir: own,
+            note: Some(note),
+        };
+    }
+    if belongs_to(&own, film) {
+        return Target::Open(own);
+    }
+    Target::Taken(format!(
+        "{} and {} are projects of other films; open a folder of its own to start one for {film_name}.",
+        name(&dir),
+        name(&own)
+    ))
 }
 
 /// The settings file the app reads and writes: [`tw::settings_path`]; in
@@ -305,12 +393,22 @@ impl StartWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dir = match start_target(folder, film) {
-            Picked::Project(dir) => return self.open_project(&dir, window, cx),
-            Picked::New(dir) => dir,
+        let (dir, note) = match start_target(folder, film) {
+            Target::Open(dir) => return self.open_project(&dir, window, cx),
+            Target::Start { dir, note } => (dir, note),
+            Target::Taken(why) => {
+                self.message = Some(why);
+                cx.notify();
+                return;
+            }
         };
         match crate::cli::init(&dir, film) {
-            Ok(_) => self.open_project(&dir, window, cx),
+            Ok(_) => {
+                self.open_project(&dir, window, cx);
+                if let Some(note) = note {
+                    tell_open(&dir, note, cx);
+                }
+            }
             Err(err) => {
                 self.message = Some(format!("Could not start a project: {err}"));
                 cx.notify();
@@ -515,6 +613,16 @@ mod tests {
         );
     }
 
+    /// A project started for `film` in `dir`.
+    fn project_for(dir: &Path, film: &Path) {
+        let info = tw::FilmInfo {
+            duration_s: 10.0,
+            size: 1,
+            modified: "2026-11-23T00:00:00Z".to_owned(),
+        };
+        tw::Project::init(dir, film, info).expect("project");
+    }
+
     #[test]
     fn a_film_whose_project_exists_opens_it() {
         let tmp = tempfile::tempdir().expect("dir");
@@ -523,9 +631,43 @@ mod tests {
         let film = films.join("Kindred Promo.mov");
         std::fs::write(&film, b"").expect("film");
         let project = films.join("Kindred Promo.takewise");
-        assert_eq!(start_target(&films, &film), Picked::New(project.clone()));
-        project_at(&project);
-        assert_eq!(start_target(&films, &film), Picked::Project(project));
+        assert_eq!(
+            start_target(&films, &film),
+            Target::Start {
+                dir: project.clone(),
+                note: None
+            }
+        );
+        project_for(&project, &film);
+        assert_eq!(start_target(&films, &film), Target::Open(project));
+    }
+
+    #[test]
+    fn a_film_of_the_same_name_gets_its_own_project() {
+        let tmp = tempfile::tempdir().expect("dir");
+        let films = tmp.path().join("Films");
+        std::fs::create_dir(&films).expect("dir");
+        let (mp4, mov) = (films.join("Promo.mp4"), films.join("Promo.mov"));
+        std::fs::write(&mp4, b"").expect("film");
+        std::fs::write(&mov, b"").expect("film");
+        project_for(&films.join("Promo.takewise"), &mp4);
+        let Target::Start { dir, note } = start_target(&films, &mov) else {
+            panic!("a new project for Promo.mov");
+        };
+        assert_eq!(dir, films.join("Promo.mov.takewise"));
+        let note = note.expect("says why");
+        assert!(
+            note.contains("Promo.takewise is the project of Promo.mp4")
+                && note.contains("Promo.mov.takewise"),
+            "{note}"
+        );
+        // Started once, it opens next time.
+        project_for(&dir, &mov);
+        assert_eq!(start_target(&films, &mov), Target::Open(dir));
+        assert_eq!(
+            start_target(&films, &mp4),
+            Target::Open(films.join("Promo.takewise"))
+        );
     }
 
     #[test]
