@@ -11,6 +11,11 @@
 //! The tools are this process's direct children whose arguments name them
 //! (`pkill -P … -f`): the transcriber in `takewise-core` starts them, and
 //! nothing else in the recording window runs them.
+//!
+//! A crash or force-quit during a take leaves them stopped for good, so the
+//! window and `takewise check` first kill the tools an earlier Takewise left
+//! behind: orphans whose arguments name the transcriber's temporary
+//! directory ([`reap_orphaned_tools`]).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -210,6 +215,98 @@ fn escape_regex(text: &str) -> String {
     escaped
 }
 
+/// A process as `ps` lists it.
+#[derive(Debug)]
+struct Process {
+    pid: u32,
+    ppid: u32,
+    command: String,
+}
+
+/// Kills the tools (whisper-cli, ffmpeg) that a Takewise which crashed or
+/// was force-quit left behind, maybe stopped: continued, then killed.
+/// Returns how many there were.
+pub fn reap_orphaned_tools(tools: &[PathBuf]) -> usize {
+    let Ok(out) = Command::new("/bin/ps")
+        .args(["-axww", "-o", "pid=,ppid=,command="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return 0;
+    };
+    if !out.status.success() {
+        return 0;
+    }
+    let processes = parse_ps(&String::from_utf8_lossy(&out.stdout));
+    reap(&processes, tools, |signal, pids| {
+        let _ = Command::new("/bin/kill")
+            .arg(format!("-{signal}"))
+            .args(pids.iter().map(u32::to_string))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    })
+}
+
+/// Sends the orphaned tools among `processes` `CONT` (a stopped one would
+/// otherwise only die once continued), then `KILL`; returns how many.
+fn reap(
+    processes: &[Process],
+    tools: &[PathBuf],
+    mut send: impl FnMut(&'static str, &[u32]),
+) -> usize {
+    let pids = orphaned_tools(processes, tools);
+    if !pids.is_empty() {
+        send("CONT", &pids);
+        send("KILL", &pids);
+    }
+    pids.len()
+}
+
+/// The processes that run one of `tools` (by path, or by name when it was
+/// found elsewhere then) on a file in the transcriber's temporary directory,
+/// and whose parent is gone (adopted by launchd, or no longer listed).
+fn orphaned_tools(processes: &[Process], tools: &[PathBuf]) -> Vec<u32> {
+    let marker = format!("/{}", tw::whisper::TEMP_PREFIX);
+    processes
+        .iter()
+        .filter(|p| p.ppid == 1 || !processes.iter().any(|q| q.pid == p.ppid))
+        .filter(|p| p.command.contains(&marker) && runs_tool(&p.command, tools))
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// Whether `command` (as `ps` shows it) runs one of `tools`.
+fn runs_tool(command: &str, tools: &[PathBuf]) -> bool {
+    let program = command.split_whitespace().next().map(Path::new);
+    tools.iter().any(|tool| {
+        let path = tool.to_string_lossy();
+        command
+            .strip_prefix(path.as_ref())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+            || tool
+                .file_name()
+                .is_some_and(|name| program.and_then(Path::file_name) == Some(name))
+    })
+}
+
+/// The lines of `ps -o pid=,ppid=,command=`.
+fn parse_ps(out: &str) -> Vec<Process> {
+    out.lines()
+        .filter_map(|line| {
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (parent, command) = rest.trim_start().split_once(char::is_whitespace)?;
+            Some(Process {
+                pid: pid.parse().ok()?,
+                ppid: parent.parse().ok()?,
+                command: command.trim_start().to_owned(),
+            })
+        })
+        .collect()
+}
+
 pub struct Checks {
     /// `None` when the worker could not be started.
     jobs: Option<Sender<TakeRef>>,
@@ -359,5 +456,140 @@ impl Drop for Checks {
     /// window.
     fn drop(&mut self) {
         self.control.update(|flags| flags.cancelled = true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WHISPER: &str = "/opt/homebrew/bin/whisper-cli";
+    const FFMPEG: &str = "/opt/homebrew/bin/ffmpeg";
+    const TMP: &str = "/var/folders/xy/T/takewise-whisper-a1B2c3";
+
+    fn tools() -> Vec<PathBuf> {
+        vec![PathBuf::from(WHISPER), PathBuf::from(FFMPEG)]
+    }
+
+    fn process(pid: u32, parent: u32, command: &str) -> Process {
+        Process {
+            pid,
+            ppid: parent,
+            command: command.to_owned(),
+        }
+    }
+
+    fn whisper_of(dir: &str) -> String {
+        format!(
+            "{WHISPER} -m /models/ggml-base.bin -f {dir}/take.wav -l en -ojf -of {dir}/take -np"
+        )
+    }
+
+    fn ffmpeg_of(dir: &str) -> String {
+        format!(
+            "{FFMPEG} -nostdin -y -loglevel error -i /p/takes/a/001.wav -ar 16000 -ac 1 -c:a pcm_s16le {dir}/take.wav"
+        )
+    }
+
+    #[test]
+    fn orphaned_tools_of_a_takewise_check_are_found() {
+        let list = vec![
+            process(1, 0, "/sbin/launchd"),
+            process(500, 1, &whisper_of(TMP)),
+            process(501, 1, &ffmpeg_of(TMP)),
+        ];
+        assert_eq!(orphaned_tools(&list, &tools()), vec![500, 501]);
+    }
+
+    #[test]
+    fn a_parent_missing_from_the_list_is_gone() {
+        let list = vec![process(500, 777, &whisper_of(TMP))];
+        assert_eq!(orphaned_tools(&list, &tools()), vec![500]);
+    }
+
+    #[test]
+    fn tools_of_a_running_takewise_are_left_alone() {
+        let list = vec![
+            process(
+                400,
+                1,
+                "/Applications/Takewise.app/Contents/MacOS/takewise record x",
+            ),
+            process(500, 400, &whisper_of(TMP)),
+        ];
+        assert_eq!(orphaned_tools(&list, &tools()), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn tools_without_the_takewise_temporary_directory_are_left_alone() {
+        let list = vec![
+            process(500, 1, &ffmpeg_of("/Users/me/Movies/export")),
+            process(501, 1, &whisper_of("/tmp/other-app-1234")),
+        ];
+        assert_eq!(orphaned_tools(&list, &tools()), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn other_programs_naming_the_directory_are_left_alone() {
+        let list = vec![
+            process(500, 1, &format!("/bin/rm -rf {TMP}")),
+            process(501, 1, &format!("/usr/bin/tail -f {TMP}/take.json")),
+        ];
+        assert_eq!(orphaned_tools(&list, &tools()), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_tool_found_elsewhere_now_is_still_matched_by_name() {
+        let list = vec![process(
+            500,
+            1,
+            &whisper_of(TMP).replace(WHISPER, "/usr/local/bin/whisper-cli"),
+        )];
+        assert_eq!(orphaned_tools(&list, &tools()), vec![500]);
+    }
+
+    #[test]
+    fn a_tool_path_with_spaces_is_matched() {
+        let tool = "/Users/me/my tools/whisper-cli";
+        let list = vec![process(500, 1, &whisper_of(TMP).replace(WHISPER, tool))];
+        assert_eq!(orphaned_tools(&list, &[PathBuf::from(tool)]), vec![500]);
+    }
+
+    #[test]
+    fn ps_output_is_parsed() {
+        let out = format!(
+            "    1     0 /sbin/launchd\n  500     1 {}\n garbage\n\n",
+            whisper_of(TMP)
+        );
+        let list = parse_ps(&out);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[1].pid, list[1].ppid), (500, 1));
+        assert_eq!(list[1].command, whisper_of(TMP));
+    }
+
+    #[test]
+    fn reaping_continues_then_kills_each_orphan() {
+        let list = vec![
+            process(500, 1, &whisper_of(TMP)),
+            process(600, 1, "/usr/bin/vim notes.txt"),
+            process(501, 1, &ffmpeg_of(TMP)),
+        ];
+        let mut sent = Vec::new();
+        let reaped = reap(&list, &tools(), |signal, pids| {
+            sent.push((signal, pids.to_vec()));
+        });
+        assert_eq!(reaped, 2);
+        assert_eq!(
+            sent,
+            vec![("CONT", vec![500, 501]), ("KILL", vec![500, 501])]
+        );
+    }
+
+    #[test]
+    fn nothing_to_reap_sends_nothing() {
+        let list = vec![process(600, 1, "/usr/bin/vim notes.txt")];
+        let mut sent = 0;
+        assert_eq!(reap(&list, &tools(), |_, _| sent += 1), 0);
+        assert_eq!(sent, 0);
     }
 }

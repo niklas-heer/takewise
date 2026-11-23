@@ -692,6 +692,8 @@ fn check(
     }
     let config = Project::open(dir)?.config.check;
     let transcriber = tw::WhisperCli::discover(&config).map_err(CliError::Whisper)?;
+    // A Takewise that crashed or was force-quit mid-check left its tools.
+    crate::window::reap_orphaned_tools(&[transcriber.whisper.clone(), transcriber.ffmpeg.clone()]);
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for take in &takes {

@@ -70,6 +70,9 @@ pub const WHISPER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Runs the tools at lower priority, so a check never competes with
 /// recording or the film for the CPU.
 const NICE: &str = "/usr/bin/nice";
+/// The name prefix of the temporary directory a transcription works in.
+/// Both tools name a file in it, which tags them as Takewise's in `ps`.
+pub const TEMP_PREFIX: &str = "takewise-whisper-";
 /// The `nice` increment the tools run with.
 const TOOL_NICENESS: &str = "10";
 /// Searched after `$PATH`, since an app started from Finder gets a minimal one.
@@ -229,7 +232,7 @@ impl WhisperCli {
 
     fn run(&self, wav: &Path) -> Result<Vec<Word>, String> {
         let tmp = tempfile::Builder::new()
-            .prefix("takewise-whisper-")
+            .prefix(TEMP_PREFIX)
             .tempdir()
             .map_err(|err| format!("could not create a temporary directory: {err}"))?;
         let pcm = tmp.path().join("take.wav");

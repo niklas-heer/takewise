@@ -41,6 +41,7 @@ use takewise_core::{
     Unavailable, Unchecked, WhisperCli, check_input, clamp_mark, plan_take,
 };
 
+pub use checks::reap_orphaned_tools;
 use checks::{Checker, Checks};
 pub use clock::FilmClock;
 pub use media::{Media, RealMedia};
@@ -146,14 +147,18 @@ fn load(dir: &Path) -> Result<Loaded, tw::Error> {
 
 /// whisper-cli with the project's model and the tools it runs, or, when it
 /// cannot be set up, a stand-in that leaves every take's words unchecked
-/// with the reason.
+/// with the reason. Kills the tools an earlier Takewise left behind.
 fn checker(project: &Project) -> Checker {
     let config = &project.config.check;
     match WhisperCli::discover(config) {
-        Ok(whisper) => Checker {
-            tools: vec![whisper.whisper.clone(), whisper.ffmpeg.clone()],
-            transcriber: Arc::new(whisper),
-        },
+        Ok(whisper) => {
+            let tools = vec![whisper.whisper.clone(), whisper.ffmpeg.clone()];
+            reap_orphaned_tools(&tools);
+            Checker {
+                tools,
+                transcriber: Arc::new(whisper),
+            }
+        }
         Err(err) => Checker {
             transcriber: Arc::new(Unavailable {
                 reason: err.to_string(),
