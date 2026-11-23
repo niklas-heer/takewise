@@ -15,7 +15,8 @@
 //! joins them against the amount with cents ("five dollars twenty" and
 //! "$5.20"); a sign is kept, so "-5", "minus five" and
 //! "negative five" are `-5`, never `5`, and "-$5" and "minus five dollars"
-//! are `-5 dollars`. A lone whole one stays the word `one`, since
+//! are `-5 dollars`; after a number, "minus" and a free-standing dash are
+//! the word `minus` ("ten minus five" and "10 - 5" are `10 minus 5`). A lone whole one stays the word `one`, since
 //! it is often not a number ("every one"), and "first" and "second" are
 //! ordinals only when attached ("twenty-first"), never in "a sixty second
 //! timer". A number said over
@@ -390,11 +391,41 @@ pub fn normalize(text: &str) -> Vec<Token> {
 fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
     let mut items: Vec<Lexed> = Vec::new();
     let mut pending = Sep::Space;
+    // The part of a free-standing dash just read.
+    let mut dash: Option<usize> = None;
     for (index, part) in parts.iter().enumerate() {
         let (raws, trailing) = raw_tokens(part);
         for (raw, sep) in raws {
-            lex(&raw, index, pending.max(sep), &mut items);
+            let sep = pending.max(sep);
+            if raw == "-" {
+                // Dropped unless it stands between two numbers; what stood
+                // before it carries on to the next token.
+                dash = Some(index);
+                pending = sep;
+                continue;
+            }
             pending = Sep::Space;
+            let first = items.len();
+            let after_number = items.last().is_some_and(is_number_item);
+            lex(&raw, index, sep, &mut items);
+            // "10 - 5" is "ten minus five".
+            if let Some(part) = dash.take()
+                && after_number
+                && items
+                    .get(first)
+                    .is_some_and(|l| l.sep == Sep::Space && is_number_item(l))
+            {
+                let minus = Token::plain("minus");
+                items.insert(
+                    first,
+                    Lexed {
+                        item: Item::Word(minus),
+                        part,
+                        sep: Sep::Space,
+                        raw: "-".to_owned(),
+                    },
+                );
+            }
         }
         pending = pending.max(trailing);
     }
@@ -448,6 +479,20 @@ fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
         k += 1;
     }
     out
+}
+
+/// Whether an item is a number, in digits or a number word ("first" and
+/// "second" alone are words, see [`number_words`]).
+fn is_number_item(lexed: &Lexed) -> bool {
+    match &lexed.item {
+        Item::Number(_) => true,
+        Item::Word(token) => {
+            token.apostrophe == Apostrophe::None
+                && !matches!(token.text.as_str(), "first" | "second")
+                && number_word(&token.text).is_some()
+        }
+        Item::Other(_) => false,
+    }
 }
 
 /// The plain words that may be part of a number, by item. "first" and
@@ -798,8 +843,16 @@ fn cardinal(words: &[Option<&str>], i: usize) -> Option<(u64, Form, usize)> {
 /// The canonical tokens of a number starting at item `k` and the index after
 /// it, or `None` when no number starts there.
 fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(Vec<Token>, usize)> {
-    // "minus five" and "negative five" are `-5`.
-    if matches!(word_at(words, k), Some("minus" | "negative"))
+    // "minus five" and "negative five" are `-5`; after a number, "minus" is
+    // the word ("ten minus five").
+    let after_number = k
+        .checked_sub(1)
+        .and_then(|before| items.get(before))
+        .is_some_and(is_number_item)
+        && items.get(k).is_some_and(|l| l.sep != Sep::Break);
+    let operator = after_number && word_at(words, k) == Some("minus");
+    if !operator
+        && matches!(word_at(words, k), Some("minus" | "negative"))
         && items.get(k + 1).is_some_and(|l| l.sep != Sep::Break)
         && let Some((mut tokens, next)) = number_phrase(items, words, k + 1)
         && let Some(first) = tokens.first_mut()
@@ -1046,6 +1099,12 @@ fn raw_tokens(text: &str) -> (Vec<(String, Sep)>, Sep) {
                 && after.is_some_and(|a| a.is_alphanumeric()) =>
             {
                 sep = sep.max(Sep::Hyphen);
+            }
+            // A free-standing dash, which may be a minus: "10 - 5".
+            '-' if before.is_none_or(|b| b.is_whitespace())
+                && after.is_none_or(|a| a.is_whitespace()) =>
+            {
+                current.push('-');
             }
             c if c.is_whitespace() || c == '-' => {}
             _ => sep = Sep::Break,
@@ -1920,6 +1979,35 @@ mod tests {
             []
         );
         assert_ne!(align(&normalize("at 10:30"), &heard("at 10")), []);
+    }
+
+    #[test]
+    fn minus_between_two_numbers_is_a_word() {
+        assert_eq!(shown("ten minus five"), tokens("10 minus 5"));
+        assert_eq!(shown("10 - 5"), tokens("10 minus 5"));
+        assert_eq!(shown("10 − 5"), tokens("10 minus 5"));
+        // Still a sign elsewhere, and a hyphen between numbers is a range.
+        assert_eq!(shown("from ten to minus five"), tokens("from 10 to -5"));
+        assert_eq!(shown("ten, minus five"), tokens("10 -5"));
+        assert_eq!(shown("pages 10-15"), tokens("pages 10 15"));
+        assert_eq!(shown("ten - well"), tokens("10 well"));
+        for (script, said) in [
+            ("Ten minus five is five.", "10 - 5 is 5."),
+            ("Ten minus five is five.", "10 minus 5 is 5."),
+            ("10 - 5 is 5.", "ten minus five is five"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        assert_ne!(align(&normalize("Ten minus five"), &heard("10 5")), []);
     }
 
     #[test]

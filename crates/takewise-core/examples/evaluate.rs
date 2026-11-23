@@ -242,6 +242,8 @@ const SPELLINGS: &[(&str, &str, Verdict)] = &[
     ("It was -5 degrees.", "It was 5 degrees.", Verdict::Listen),
     ("It lost -$5.", "It lost minus five dollars.", Verdict::Keep),
     ("It lost -$5.", "It lost $5.", Verdict::Listen),
+    ("Ten minus five is five.", "10 - 5 is 5.", Verdict::Keep),
+    ("Ten minus five is five.", "10 minus 5 is 5.", Verdict::Keep),
     // Annotations over several words: a sound, no leaked words.
     (
         "Nobody misses a birthday.",
