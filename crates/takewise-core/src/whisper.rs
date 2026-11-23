@@ -28,7 +28,8 @@
 //! duration of its tokens' offsets (durations are sound even where the
 //! offsets' positions are not), or at the next word's start, whichever is
 //! first. Confidence is the lowest token probability in the word.
-//! Annotations such as `[BLANK_AUDIO]` or `(sighs)` are dropped.
+//! Annotations such as `[BLANK_AUDIO]` or `(sighs)` become words of their
+//! own; the checks flag one inside the speech and ignore the rest.
 //!
 //! Every failure is soft (a [`Transcript::Failed`]): a tool that does not
 //! finish within its timeout is killed, token text is read as bytes so a
@@ -49,7 +50,7 @@ use serde::Deserialize;
 use crate::check::Transcript;
 use crate::ledger::Word;
 use crate::project::CheckConfig;
-use crate::words::drop_annotations;
+use crate::words::isolate_annotations;
 
 /// Words this far outside the energy speech range are dropped as
 /// hallucinations (whisper likes to hear "Thank you." in silence).
@@ -535,7 +536,7 @@ pub fn parse_full_json(json: impl AsRef<[u8]>) -> Result<Vec<Word>, String> {
             }
         })
         .collect();
-    let words = drop_annotations(words);
+    let words = isolate_annotations(words);
     if let Some(pair) = words.windows(2).find(|pair| pair[1].start < pair[0].start) {
         return Err(format!(
             "whisper-cli gave word times out of order ({:.2} s after {:.2} s)",
@@ -684,7 +685,7 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
     }
 
     #[test]
-    fn parses_without_annotations() {
+    fn parses_annotations_as_words_of_their_own() {
         let json = r#"{"transcription": [{"tokens": [
             {"text": " [", "offsets": {"from": 0, "to": 10}, "p": 0.5, "t_dtw": 10},
             {"text": "BL", "offsets": {"from": 10, "to": 20}, "p": 0.5, "t_dtw": 12},
@@ -701,8 +702,8 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         ]}]}"#;
         let words = parse_full_json(json).unwrap();
         let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
-        assert_eq!(text, ["Nobody", "misses"]);
-        assert!((words[0].start - 1.10).abs() < 1e-9, "{:?}", words[0]);
+        assert_eq!(text, ["[BLANK_AUDIO]", "Nobody", "(sighs)", "misses"]);
+        assert!((words[1].start - 1.10).abs() < 1e-9, "{:?}", words[1]);
     }
 
     #[test]

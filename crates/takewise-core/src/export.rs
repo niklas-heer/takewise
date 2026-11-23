@@ -639,6 +639,8 @@ mod tests {
                 };
                 crate::check::Transcript::Words(vec![
                     word("Hello", 2.1, 2.4),
+                    // A sound annotation is not a word of the line.
+                    word("(coughs)", 2.42, 2.48),
                     word("there.", 2.5, 2.9),
                 ])
             }
