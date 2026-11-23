@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use takewise_core::{self as tw, Snapshot, TakeRef, Transcriber};
+use takewise_core::{self as tw, Project, Snapshot, TakeRef, Transcriber};
 
 /// A transcriber the worker thread can own.
 pub type SharedTranscriber = Arc<dyn Transcriber + Send + Sync>;
@@ -18,6 +18,9 @@ pub type SharedTranscriber = Arc<dyn Transcriber + Send + Sync>;
 /// A finished check: its verdict, or why the take could not be checked.
 pub struct Done {
     pub take: TakeRef,
+    /// The line as the check took it when it began (`None` when the line
+    /// could not be read).
+    pub snapshot: Option<Snapshot>,
     pub result: Result<tw::Verdict, String>,
 }
 
@@ -51,9 +54,9 @@ pub struct Checks {
     jobs: Option<Sender<TakeRef>>,
     gate: Arc<Gate>,
     done: Receiver<Done>,
-    /// Queued or running, once per queuing.
+    /// Queued or running, each take once.
     pending: Vec<TakeRef>,
-    /// Every take queued this session with the line it was queued against,
+    /// Every take checked this session with the line as its check took it,
     /// so a take that cannot be checked is not queued again and again.
     tried: Vec<(TakeRef, Snapshot)>,
 }
@@ -71,11 +74,21 @@ impl Checks {
             .spawn(move || {
                 for take in jobs_rx {
                     worker_gate.wait_open();
-                    let result =
-                        tw::check_take(&dir, &take, &*transcriber, env!("CARGO_PKG_VERSION"))
-                            .map(|checked| checked.verdict)
-                            .map_err(|err| err.to_string());
-                    if done_tx.send(Done { take, result }).is_err() {
+                    let dequeued = Project::open(&dir)
+                        .ok()
+                        .and_then(|project| project.snapshot(&take.line));
+                    let checked =
+                        tw::check_take(&dir, &take, &*transcriber, env!("CARGO_PKG_VERSION"));
+                    let (snapshot, result) = match checked {
+                        Ok(checked) => (Some(checked.snapshot), Ok(checked.verdict)),
+                        Err(err) => (dequeued, Err(err.to_string())),
+                    };
+                    let done = Done {
+                        take,
+                        snapshot,
+                        result,
+                    };
+                    if done_tx.send(done).is_err() {
                         break;
                     }
                 }
@@ -95,13 +108,16 @@ impl Checks {
         self.gate.set(paused);
     }
 
-    /// Queues a check of `take` against the line as `snapshot` has it,
-    /// unless it was queued against that line before.
+    /// Queues a check of `take`, whose line `snapshot` has now, unless it
+    /// is queued or running (its check takes the line as it is when it
+    /// begins; one that turns out stale is queued again once done) or was
+    /// checked against that line before.
     pub fn queue(&mut self, take: &TakeRef, snapshot: &Snapshot) {
-        if self
-            .tried
-            .iter()
-            .any(|(t, s)| t == take && s.matches(snapshot))
+        if self.pending.contains(take)
+            || self
+                .tried
+                .iter()
+                .any(|(t, s)| t == take && s.matches(snapshot))
         {
             return;
         }
@@ -110,7 +126,6 @@ impl Checks {
         };
         if jobs.send(take.clone()).is_ok() {
             self.pending.push(take.clone());
-            self.tried.push((take.clone(), snapshot.clone()));
         }
     }
 
@@ -132,8 +147,9 @@ impl Checks {
     pub fn poll(&mut self) -> Vec<Done> {
         let done: Vec<Done> = self.done.try_iter().collect();
         for d in &done {
-            if let Some(at) = self.pending.iter().position(|t| *t == d.take) {
-                self.pending.remove(at);
+            self.pending.retain(|t| *t != d.take);
+            if let Some(snapshot) = &d.snapshot {
+                self.tried.push((d.take.clone(), snapshot.clone()));
             }
         }
         done

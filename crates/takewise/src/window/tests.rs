@@ -1684,3 +1684,71 @@ fn a_reload_queues_a_take_whose_check_went_stale(cx: &mut TestAppContext) {
     f.view
         .read_with(cx, |view, _| assert!(view.checks.is_pending(&take)));
 }
+
+/// Sets line `a`'s text outside the window and reloads, as the watcher
+/// would.
+fn set_text_a(cx: &mut TestAppContext, f: &Fixture, text: &str) {
+    tw::set_line_field(&f.dir, "a", Field::Text(text.to_owned()), None).expect("edit");
+    f.view.update(cx, |view, _| view.reload());
+}
+
+fn pending_a(cx: &mut TestAppContext, f: &Fixture) -> Vec<u32> {
+    f.view.read_with(cx, |view, _| view.checks.pending_of("a"))
+}
+
+#[gpui_kit::test]
+fn the_check_queue_follows_what_was_checked(cx: &mut TestAppContext) {
+    let (release, gate) = channel();
+    let gated = Arc::new(Gated {
+        gate: Mutex::new(gate),
+        heard: Mutex::new(Vec::new()),
+    });
+    let f = open_checked(cx, &[(DEVICE, 48_000)], |_| {}, gated.clone());
+    record_take(cx, &f); // a take 1: checked against A, waits in the transcriber
+    wait_heard(cx, &f, &gated, |n| n == 1);
+    begin(cx, &f, 200.0);
+    f.media.set_now(200.5);
+    press(cx, f.window, &["space"]); // a take 2: queued
+    assert_eq!(pending_a(cx, &f), vec![1, 2]);
+
+    // A → B while both are queued or running: neither is queued again.
+    set_text_a(cx, &f, "Changed line.");
+    assert_eq!(pending_a(cx, &f), vec![1, 2], "never queued twice");
+
+    // Take 1 finishes against A, take 2 starts against B; take 1 is stale
+    // and queued again.
+    release.send(()).expect("the check waits");
+    wait_heard(cx, &f, &gated, |n| n == 2);
+    frame(cx, f.window);
+    let mut pending = pending_a(cx, &f);
+    pending.sort_unstable();
+    assert_eq!(pending, vec![1, 2]);
+
+    // B → A while take 2 runs against B: it finishes stale and, since A
+    // was never checked for it, is queued again.
+    set_text_a(cx, &f, "First line.");
+    release.send(()).expect("the check waits");
+    wait_heard(cx, &f, &gated, |n| n == 3);
+    frame(cx, f.window);
+    let take2 = tw::TakeRef {
+        line: "a".to_owned(),
+        take: 2,
+    };
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.checks.is_pending(&take2)),
+        "take 2 is checked against A"
+    );
+    drop(release);
+    for _ in 0..2000 {
+        frame(cx, f.window);
+        if pending_a(cx, &f).is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    f.view.read_with(cx, |view, _| {
+        let state = view.line_state().expect("line a");
+        assert!(state.takes.iter().all(|t| !t.stale_check), "{state:?}");
+    });
+}
