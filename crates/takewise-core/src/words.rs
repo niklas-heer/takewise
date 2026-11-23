@@ -2,18 +2,22 @@
 //!
 //! Both the script line and the transcript go through [`normalize`], so that
 //! spoken and written forms compare equal: case, punctuation and hyphens are
-//! dropped, contractions expand to one canonical form ("there's" and "there
-//! is" both become `there is`; a possessive "link's" becomes `link is` on both
-//! sides, which still aligns), and numbers become words. Four-digit numbers
-//! from 1100 to 1999 and from 2010 to 2099 written without a thousands
-//! separator are read as years, in pairs ("1867" is `eighteen sixty seven`,
-//! "1905" `nineteen oh five`, "1900" `nineteen hundred`); 2000 to 2009 are
-//! read as "two thousand five", as people say them.
+//! dropped, contractions expand ("don't" is `do not`), and numbers become
+//! words. Four-digit numbers from 1100 to 1999 and from 2010 to 2099 written
+//! without a thousands separator are read as years, in pairs ("1867" is
+//! `eighteen sixty seven`, "1905" `nineteen oh five`, "1900" `nineteen
+//! hundred`); 2000 to 2009 are read as "two thousand five", as people say
+//! them.
 //!
-//! [`align`] reports differences between normalized tokens, so a diff names a
-//! token such as `kindred`, not the original spelling. It also accepts a heard
-//! `links` for an expected `link is` (and the reverse), since a contracted
-//! "is" sounds like a plural and whisper writes it as one.
+//! An `'s` or a trailing apostrophe is kept as a mark on its [`Token`], since
+//! it changes what the token may be heard as. [`align`] accepts a heard
+//! `links`, `link is` or `link's` for a script `link's`, `families` for
+//! `family's`, and `Niklas` for `Niklas's` or `Niklas'`; a plain script word
+//! only accepts its own spelling (with or without a heard apostrophe), so
+//! "the light is below" heard as "the lights below" is a difference. Two
+//! words on one side match their concatenation on the other ("every day" and
+//! "everyday"). Diffs name normalized tokens, such as `kindred` or `link's`,
+//! not the original spelling.
 
 use crate::ledger::{Word, WordDiff, WordDiffKind};
 
@@ -43,22 +47,137 @@ const TENS: [&str; 10] = [
     "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
 ];
 
+/// How a token ended before normalization: a script's `link's` keeps that
+/// it had an apostrophe, which allows heard forms a plain `links` does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Apostrophe {
+    /// No apostrophe: `links`.
+    None,
+    /// An `'s` ending, the text without it: `link's` is `link`.
+    S,
+    /// A trailing apostrophe, the text without it: `Niklas'` is `niklas`.
+    Trailing,
+}
+
+/// One normalized word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub text: String,
+    pub apostrophe: Apostrophe,
+}
+
+impl Token {
+    fn plain(text: impl Into<String>) -> Token {
+        Token {
+            text: text.into(),
+            apostrophe: Apostrophe::None,
+        }
+    }
+
+    /// The token as diffs name it: `link's`, `niklas'`, `kindred`.
+    pub fn display(&self) -> String {
+        match self.apostrophe {
+            Apostrophe::None => self.text.clone(),
+            Apostrophe::S => format!("{}'s", self.text),
+            Apostrophe::Trailing => format!("{}'", self.text),
+        }
+    }
+
+    fn is_plain(&self, text: &str) -> bool {
+        self.apostrophe == Apostrophe::None && self.text == text
+    }
+
+    fn is_plain_word(&self) -> bool {
+        self.apostrophe == Apostrophe::None && self.text.chars().all(char::is_alphabetic)
+    }
+}
+
+/// The plural of a stem ending in a consonant and `y`: `family` is
+/// `families`.
+fn ies_plural(stem: &str) -> Option<String> {
+    let base = stem.strip_suffix('y')?;
+    let before = base.chars().last()?;
+    (!"aeiou".contains(before)).then(|| format!("{base}ies"))
+}
+
+/// Whether a heard token stands for an expected one. Beyond equal tokens, a
+/// script token with an apostrophe accepts what it sounds like: `link's` the
+/// heard `links`, `family's` `families`, `Niklas's` and `Niklas'` the heard
+/// `Niklas`. A plain script token accepts only a heard token spelled the
+/// same without its apostrophe (`links` the heard `link's`), never a plural
+/// for a separate "is".
+fn same(expected: &Token, heard: &Token) -> bool {
+    use Apostrophe::{None, S, Trailing};
+    let stem = expected.text.as_str();
+    match (expected.apostrophe, heard.apostrophe) {
+        (a, b) if a == b => expected.text == heard.text,
+        (None, S) => expected.text == format!("{}s", heard.text),
+        (None | S, Trailing) | (Trailing, None | S) => expected.text == heard.text,
+        (S, None) => {
+            heard.text == format!("{stem}s")
+                || (stem.ends_with('s') && heard.text == stem)
+                || ies_plural(stem).is_some_and(|plural| heard.text == plural)
+        }
+        _ => false,
+    }
+}
+
+/// Two adjacent tokens heard or written as one: a compound (`every day` and
+/// `everyday`), or a contracted "is" (`link is` and `link's`).
+fn pair_is_one(first: &Token, second: &Token, one: &Token) -> bool {
+    let contracted =
+        one.apostrophe == Apostrophe::S && first.is_plain(&one.text) && second.is_plain("is");
+    let compound = first.is_plain_word()
+        && second.is_plain_word()
+        && one.is_plain_word()
+        && one.text.len() == first.text.len() + second.text.len()
+        && one.text.starts_with(&first.text)
+        && one.text.ends_with(&second.text);
+    contracted || compound
+}
+
 /// Lowercase words with punctuation removed, contractions expanded and
 /// numbers spelled out.
-pub fn normalize(text: &str) -> Vec<String> {
+pub fn normalize(text: &str) -> Vec<Token> {
+    normalize_parts(&[text])
+        .into_iter()
+        .map(|(token, _, _)| token)
+        .collect()
+}
+
+/// [`normalize`] over the consecutive parts of one text (the heard words),
+/// each token with the first and last part it came from.
+fn normalize_parts(parts: &[&str]) -> Vec<(Token, usize, usize)> {
     let mut out = Vec::new();
-    for raw in raw_tokens(text) {
-        let token = raw.trim_matches('\'');
-        if token.is_empty() {
-            continue;
-        }
-        if token.chars().any(|c| c.is_ascii_digit()) {
-            numeric(token, &mut out);
-        } else {
-            expand_contraction(token, &mut out);
+    for (index, part) in parts.iter().enumerate() {
+        for raw in raw_tokens(part) {
+            let mut tokens = Vec::new();
+            word_tokens(&raw, &mut tokens);
+            out.extend(tokens.into_iter().map(|token| (token, index, index)));
         }
     }
     out
+}
+
+/// One raw token as normalized tokens.
+fn word_tokens(raw: &str, out: &mut Vec<Token>) {
+    let token = raw.trim_start_matches('\'');
+    let bare = token.trim_end_matches('\'');
+    if bare.is_empty() {
+        return;
+    }
+    if bare.chars().any(|c| c.is_ascii_digit()) {
+        let mut words = Vec::new();
+        numeric(bare, &mut words);
+        out.extend(words.into_iter().map(Token::plain));
+    } else if bare.len() < token.len() {
+        out.push(Token {
+            text: bare.to_owned(),
+            apostrophe: Apostrophe::Trailing,
+        });
+    } else {
+        expand_contraction(bare, out);
+    }
 }
 
 /// Splits lowercased text into runs of letters, digits and apostrophes;
@@ -100,18 +219,18 @@ fn raw_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Contraction endings and the word each stands for.
-const SUFFIXES: [(&str, &str); 7] = [
+/// Contraction endings and the word each stands for. An `'s` is kept as a
+/// mark instead, since it may be a possessive.
+const SUFFIXES: [(&str, &str); 6] = [
     ("n't", "not"),
     ("'re", "are"),
     ("'ve", "have"),
     ("'ll", "will"),
     ("'m", "am"),
     ("'d", "would"),
-    ("'s", "is"),
 ];
 
-fn expand_contraction(token: &str, out: &mut Vec<String>) {
+fn expand_contraction(token: &str, out: &mut Vec<Token>) {
     let special: Option<&[&str]> = match token {
         "can't" | "cannot" => Some(&["can", "not"]),
         "won't" => Some(&["will", "not"]),
@@ -120,19 +239,28 @@ fn expand_contraction(token: &str, out: &mut Vec<String>) {
         _ => None,
     };
     if let Some(words) = special {
-        out.extend(words.iter().map(|w| (*w).to_owned()));
+        out.extend(words.iter().map(|w| Token::plain(*w)));
         return;
     }
     for (suffix, word) in SUFFIXES {
         if let Some(stem) = token.strip_suffix(suffix)
             && !stem.is_empty()
         {
-            out.push(stem.to_owned());
-            out.push(word.to_owned());
+            out.push(Token::plain(stem));
+            out.push(Token::plain(word));
             return;
         }
     }
-    out.push(token.to_owned());
+    if let Some(stem) = token.strip_suffix("'s")
+        && !stem.is_empty()
+    {
+        out.push(Token {
+            text: stem.to_owned(),
+            apostrophe: Apostrophe::S,
+        });
+        return;
+    }
+    out.push(Token::plain(token));
 }
 
 /// A token containing a digit: an integer, a decimal, an ordinal such as
@@ -265,46 +393,41 @@ fn ordinal(word: &str) -> String {
     }
 }
 
-/// True when `expected[..i]` ends in `<stem> is` and `token` is `<stem>s`:
-/// a contracted "is" ("link's", "it's") sounds like a plural, and whisper
-/// writes it as one ("links", "its").
-fn is_split_s(expected: &[String], i: usize, token: &str) -> bool {
-    i >= 2 && expected[i - 1] == "is" && token.strip_suffix('s') == Some(expected[i - 2].as_str())
-}
-
-/// [`is_split_s`] the other way round: `heard[..j]` ends in `<stem> is` and
-/// the expected token is `<stem>s`.
-fn heard_split_s(heard: &[Heard], j: usize, token: &str) -> bool {
-    j >= 2
-        && heard[j - 1].text == "is"
-        && token.strip_suffix('s') == Some(heard[j - 2].text.as_str())
-}
-
-/// A normalized heard token with the times of the word it came from.
+/// A normalized heard token with the times of the words it came from.
 struct Heard {
-    text: String,
+    token: Token,
     start: f64,
     end: f64,
 }
 
 /// Aligns normalized expected tokens with the heard words by minimum edit
 /// distance (a substitution costs 1, a missing or extra token 1 each, so a
-/// substitution always beats a missing+extra pair). `at` is the heard word's
-/// start for extra and substituted tokens; for a missing token it is the end
-/// of the heard word before it, or the start of the first heard word when
-/// nothing was heard before it, or `None` when nothing was heard at all.
-pub fn align(expected: &[String], heard: &[Word]) -> Vec<WordDiff> {
-    let heard: Vec<Heard> = heard
-        .iter()
-        .flat_map(|word| {
-            normalize(&word.text).into_iter().map(|text| Heard {
-                text,
-                start: word.start,
-                end: word.end,
+/// substitution always beats a missing+extra pair; two tokens matching one
+/// on the other side cost nothing). `at` is the heard word's start for extra
+/// and substituted tokens; for a missing token it is the end of the heard
+/// word before it, or the start of the first heard word when nothing was
+/// heard before it, or `None` when nothing was heard at all.
+pub fn align(expected: &[Token], heard: &[Word]) -> Vec<WordDiff> {
+    let texts: Vec<&str> = heard.iter().map(|word| word.text.as_str()).collect();
+    let heard: Vec<Heard> = normalize_parts(&texts)
+        .into_iter()
+        .filter_map(|(token, first, last)| {
+            Some(Heard {
+                token,
+                start: heard.get(first)?.start,
+                end: heard.get(last)?.end,
             })
         })
         .collect();
     let (n, m) = (expected.len(), heard.len());
+    // Two expected tokens heard as one, ending at expected[i - 1] and
+    // heard[j - 1].
+    let two_heard_as_one = |i: usize, j: usize| {
+        i >= 2 && j >= 1 && pair_is_one(&expected[i - 2], &expected[i - 1], &heard[j - 1].token)
+    };
+    let one_heard_as_two = |i: usize, j: usize| {
+        i >= 1 && j >= 2 && pair_is_one(&heard[j - 2].token, &heard[j - 1].token, &expected[i - 1])
+    };
     // cost[i][j]: distance between expected[..i] and heard[..j].
     let mut cost = vec![vec![0_usize; m + 1]; n + 1];
     for (i, row) in cost.iter_mut().enumerate() {
@@ -315,14 +438,14 @@ pub fn align(expected: &[String], heard: &[Word]) -> Vec<WordDiff> {
     }
     for i in 1..=n {
         for j in 1..=m {
-            let same = usize::from(expected[i - 1] != heard[j - 1].text);
-            let mut best = (cost[i - 1][j - 1] + same)
+            let differs = usize::from(!same(&expected[i - 1], &heard[j - 1].token));
+            let mut best = (cost[i - 1][j - 1] + differs)
                 .min(cost[i - 1][j] + 1)
                 .min(cost[i][j - 1] + 1);
-            if is_split_s(expected, i, &heard[j - 1].text) {
+            if two_heard_as_one(i, j) {
                 best = best.min(cost[i - 2][j - 1]);
             }
-            if heard_split_s(&heard, j, &expected[i - 1]) {
+            if one_heard_as_two(i, j) {
                 best = best.min(cost[i - 1][j - 2]);
             }
             cost[i][j] = best;
@@ -332,25 +455,24 @@ pub fn align(expected: &[String], heard: &[Word]) -> Vec<WordDiff> {
     let mut diffs = Vec::new();
     let (mut i, mut j) = (n, m);
     while i > 0 || j > 0 {
-        if j > 0 && is_split_s(expected, i, &heard[j - 1].text) && cost[i][j] == cost[i - 2][j - 1]
-        {
+        if two_heard_as_one(i, j) && cost[i][j] == cost[i - 2][j - 1] {
             i -= 2;
             j -= 1;
             continue;
         }
-        if i > 0 && heard_split_s(&heard, j, &expected[i - 1]) && cost[i][j] == cost[i - 1][j - 2] {
+        if one_heard_as_two(i, j) && cost[i][j] == cost[i - 1][j - 2] {
             i -= 1;
             j -= 2;
             continue;
         }
         if i > 0 && j > 0 {
-            let same = expected[i - 1] == heard[j - 1].text;
-            if cost[i][j] == cost[i - 1][j - 1] + usize::from(!same) {
-                if !same {
+            let matches = same(&expected[i - 1], &heard[j - 1].token);
+            if cost[i][j] == cost[i - 1][j - 1] + usize::from(!matches) {
+                if !matches {
                     diffs.push(WordDiff {
                         kind: WordDiffKind::Substituted,
-                        expected: Some(expected[i - 1].clone()),
-                        heard: Some(heard[j - 1].text.clone()),
+                        expected: Some(expected[i - 1].display()),
+                        heard: Some(heard[j - 1].token.display()),
                         at: Some(heard[j - 1].start),
                     });
                 }
@@ -366,7 +488,7 @@ pub fn align(expected: &[String], heard: &[Word]) -> Vec<WordDiff> {
             };
             diffs.push(WordDiff {
                 kind: WordDiffKind::Missing,
-                expected: Some(expected[i - 1].clone()),
+                expected: Some(expected[i - 1].display()),
                 heard: None,
                 at,
             });
@@ -375,7 +497,7 @@ pub fn align(expected: &[String], heard: &[Word]) -> Vec<WordDiff> {
             diffs.push(WordDiff {
                 kind: WordDiffKind::Extra,
                 expected: None,
-                heard: Some(heard[j - 1].text.clone()),
+                heard: Some(heard[j - 1].token.display()),
                 at: Some(heard[j - 1].start),
             });
             j -= 1;
@@ -394,6 +516,11 @@ mod tests {
         text.split_whitespace().map(str::to_owned).collect()
     }
 
+    /// The normalized tokens as diffs name them.
+    fn shown(text: &str) -> Vec<String> {
+        normalize(text).iter().map(Token::display).collect()
+    }
+
     /// Heard words one per second: word i spans i..i+0.5.
     fn heard(text: &str) -> Vec<Word> {
         text.split_whitespace()
@@ -409,64 +536,62 @@ mod tests {
 
     #[test]
     fn normalizes_contractions() {
-        assert_eq!(normalize("There's a link's"), tokens("there is a link is"));
+        assert_eq!(shown("There's a link's"), tokens("there's a link's"));
+        assert_eq!(shown("there's a link's"), shown("There’s a link’s"));
+        assert_eq!(shown("Niklas' dogs'"), tokens("niklas' dogs'"));
         assert_eq!(
-            normalize("there is a link is"),
-            normalize("There’s a link’s")
-        );
-        assert_eq!(
-            normalize("I can't, won't, don't"),
+            shown("I can't, won't, don't"),
             tokens("i can not will not do not")
         );
         assert_eq!(
-            normalize("We're, they've, you'll, I'm, she'd"),
+            shown("We're, they've, you'll, I'm, she'd"),
             tokens("we are they have you will i am she would")
         );
-        assert_eq!(normalize("Let's go"), tokens("let us go"));
-        assert_eq!(normalize("cannot"), tokens("can not"));
+        assert_eq!(shown("Let's go"), tokens("let us go"));
+        assert_eq!(shown("cannot"), tokens("can not"));
     }
 
     #[test]
     fn normalizes_numbers_and_years() {
-        assert_eq!(normalize("1867"), tokens("eighteen sixty seven"));
-        assert_eq!(normalize("in 1900"), tokens("in nineteen hundred"));
-        assert_eq!(normalize("1905"), tokens("nineteen oh five"));
-        assert_eq!(normalize("2024"), tokens("twenty twenty four"));
-        assert_eq!(normalize("2005"), tokens("two thousand five"));
-        assert_eq!(normalize("0"), tokens("zero"));
-        assert_eq!(normalize("7 days"), tokens("seven days"));
-        assert_eq!(normalize("42"), tokens("forty two"));
-        assert_eq!(normalize("100"), tokens("one hundred"));
-        assert_eq!(normalize("305"), tokens("three hundred five"));
-        assert_eq!(normalize("1,000"), tokens("one thousand"));
+        assert_eq!(shown("1867"), tokens("eighteen sixty seven"));
+        assert_eq!(shown("in 1900"), tokens("in nineteen hundred"));
+        assert_eq!(shown("1905"), tokens("nineteen oh five"));
+        assert_eq!(shown("2024"), tokens("twenty twenty four"));
+        assert_eq!(shown("2005"), tokens("two thousand five"));
+        assert_eq!(shown("0"), tokens("zero"));
+        assert_eq!(shown("7 days"), tokens("seven days"));
+        assert_eq!(shown("42"), tokens("forty two"));
+        assert_eq!(shown("100"), tokens("one hundred"));
+        assert_eq!(shown("305"), tokens("three hundred five"));
+        assert_eq!(shown("1,000"), tokens("one thousand"));
         assert_eq!(
-            normalize("9999"),
+            shown("9999"),
             tokens("nine thousand nine hundred ninety nine")
         );
-        assert_eq!(normalize("3.5"), tokens("three point five"));
+        assert_eq!(shown("3.5"), tokens("three point five"));
         assert_eq!(
-            normalize("1st 2nd 3rd 21st"),
+            shown("1st 2nd 3rd 21st"),
             tokens("first second third twenty first")
         );
-        assert_eq!(normalize("50%"), tokens("fifty percent"));
+        assert_eq!(shown("50%"), tokens("fifty percent"));
         // Spoken and written forms agree.
-        assert_eq!(normalize("eighteen sixty-seven"), normalize("1867"));
+        assert_eq!(shown("eighteen sixty-seven"), shown("1867"));
     }
 
     #[test]
     fn normalizes_punctuation_and_hyphens() {
-        assert_eq!(normalize("Open-source, free!"), tokens("open source free"));
+        assert_eq!(shown("Open-source, free!"), tokens("open source free"));
         assert_eq!(
-            normalize("“Hello” — he said... (twice)"),
+            shown("“Hello” — he said... (twice)"),
             tokens("hello he said twice")
         );
-        assert_eq!(normalize("'quoted' dogs'"), tokens("quoted dogs"));
+        assert_eq!(shown("'quoted' dogs"), tokens("quoted' dogs"));
         assert_eq!(
-            normalize("A daily quiz; made from records."),
+            shown("A daily quiz; made from records."),
             tokens("a daily quiz made from records")
         );
-        assert_eq!(normalize("Rock & roll"), tokens("rock and roll"));
-        assert_eq!(normalize("  "), Vec::<String>::new());
+        assert_eq!(shown("Rock & roll"), tokens("rock and roll"));
+        assert_eq!(shown("  "), Vec::<String>::new());
     }
 
     #[test]
@@ -552,14 +677,80 @@ mod tests {
             align(&expected, &heard("Try the demo, the links below")),
             []
         );
+        assert_eq!(
+            align(&expected, &heard("Try the demo, the link's below")),
+            []
+        );
         let expected = normalize("It's free.");
         assert_eq!(align(&expected, &heard("Its free")), []);
-        // And the other way round.
+        // A heard contraction stands for a written "is".
+        let expected = normalize("There is a little fun.");
+        assert_eq!(align(&expected, &heard("There's a little fun")), []);
+        // A heard apostrophe on a plural that sounds the same.
         let expected = normalize("The links below.");
         assert_eq!(align(&expected, &heard("The link's below")), []);
         // A different word is still a difference.
         let expected = normalize("the link's below");
         let diffs = align(&expected, &heard("the lynx below"));
+        assert_ne!(diffs, []);
+    }
+
+    #[test]
+    fn align_accepts_possessive_forms_only_for_apostrophes() {
+        let ok = |script: &str, said: &str| {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+        };
+        ok("the family's tree", "the families tree");
+        ok("the family's tree", "the family's tree");
+        ok("Niklas's demo", "Niklas demo");
+        ok("Niklas's demo", "Niklas' demo");
+        ok("Niklas' demo", "Niklas demo");
+        ok("Niklas' demo", "Niklas's demo");
+        ok("Niklas demo", "Niklas' demo");
+        ok("the link's below", "the links below");
+        ok("the link's below", "the link is below");
+
+        // Without an apostrophe in the script, a plural is not a separate
+        // "is", nor the reverse.
+        let diffs = align(&normalize("the light is below"), &heard("the lights below"));
+        assert_ne!(diffs, []);
+        let diffs = align(&normalize("the links below"), &heard("the link is below"));
+        assert_ne!(diffs, []);
+        let diffs = align(&normalize("the family tree"), &heard("the families tree"));
+        assert_ne!(diffs, []);
+        let diffs = align(&normalize("the link below"), &heard("the links below"));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].expected.as_deref(), Some("link"));
+    }
+
+    #[test]
+    fn align_matches_compounds_both_ways() {
+        for (script, said) in [
+            ("every day", "everyday"),
+            ("every one", "everyone"),
+            ("open source", "opensource"),
+            (
+                "Kindred is free and open-source.",
+                "Kindred is free and opensource",
+            ),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        // Only the two words that make it up.
+        let diffs = align(&normalize("every day"), &heard("everyone"));
         assert_ne!(diffs, []);
     }
 
