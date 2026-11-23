@@ -282,14 +282,14 @@ speech_to_noise_db = 46.0
 
 1. *Devices:* input, channel and output, as in the panel. Bluetooth output and the built-in speakers are flagged ("film sound from speakers will leak into your takes; use wired headphones").
 2. *Voice:* the narrator reads a test sentence shown on screen. Reports peak and average speech level and any clipping, and suggests a gain change in dB on the interface so peaks land near −10 dBFS; after the narrator changes the gain, the sentence is read again until the level fits, so step 3 compares against the final gain. Hints, not verdicts: plosives (bursts of energy below 80 Hz, "turn the mic slightly off-axis or add a pop filter") and boom (much more energy below 200 Hz than in 200 Hz–4 kHz, "if you sound boomy, move a little further from the mic"; tuned on Niklas's voice at known distances).
-3. *Room:* five seconds of silence. Reports the room's noise floor and the speech-to-noise ratio against step 2's speech level: 40 dB or more is good, 30–40 dB acceptable, below 30 dB noisy, with tips. Mains hum is flagged when narrow peaks at 50 or 60 Hz *and* at least two harmonics stand clearly above neighbouring frequencies for the whole recording. The recording is kept as the session's room tone (`takes/.room.wav`) for noise reduction.
+3. *Room:* five seconds of silence. Reports the room's noise floor and the speech-to-noise ratio against step 2's speech level: 40 dB or more is good, 30–40 dB acceptable, below 30 dB noisy, with tips. Mains hum is flagged when narrow peaks at 50 or 60 Hz *and* at least two harmonics stand clearly above neighbouring frequencies for the whole recording. The recording is kept as room tone in `takes/.room/<timestamp>.wav` with the devices and gain level it was recorded at. Noise reduction uses the newest room tone recorded on the same devices on the same day; when there is none, `clean` skips noise reduction and the window suggests running the room step again.
 4. *Latency (optional):* the loopback calibration, offered when `[calibration]` does not match the current device pair.
 
 Results are saved in `[setup]`.
 
-**Noise per take.** `checked` gains `speech_level_dbfs` (RMS over the energy speech range). A new verdict rule after rule 6: a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
+**Noise per take.** `checked` gains `speech_level_dbfs` (RMS over the energy speech range). A new verdict rule between rules 7 and 8 (after the sound rule, before `keep`): a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
 
-**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed.
+**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed. The `checker` string's preprocessing tag changes from `pre=none` to `pre=hp80+norm`, so takes checked before are transcribed again.
 
 ### Export cleanup and formats (milestone 4b)
 
@@ -297,13 +297,23 @@ Takes are always recorded as 48 kHz, 24-bit WAV, the lossless original, and are 
 
 `clean` works in this order, all at 48 kHz until the last step:
 
-1. Each used take, whole, through a high-pass at 80 Hz and gentle noise reduction (`afftdn`, fixed reduction of 10 dB, noise floor from the session's room tone). Noise reduction is skipped when there is no room tone or the room tone is digital silence (a gated interface). A click fixture proves the filters add no delay, or the delay is measured and compensated, so `clean` places speech exactly where `raw` does.
+1. Each used take, whole, through a high-pass at 80 Hz and gentle noise reduction (`afftdn`, fixed reduction of 10 dB, noise floor from the room tone chosen as described in the setup check's room step). Noise reduction is skipped when there is no room tone or the room tone is digital silence (a gated interface). A click fixture proves the filters add no delay, or the delay is measured and compensated, so `clean` places speech exactly where `raw` does.
 2. Placement, fades and cropping in Rust, as for `raw`.
 3. Loudness: measure integrated loudness and true peak of the assembled narration (`ebur128`), then apply one static gain: the smaller of the gain to reach −16 LUFS and the gain that keeps true peak at −1 dBTP. No dynamic normalization.
 4. Resampling to 44.1 kHz (once, for the whole narration) and dither when writing 16-bit.
 5. Verification: integrated loudness and true peak are measured again on the final encoded file and recorded in the manifest. If resampling or dither pushed the true peak above −1 dBTP, the gain is lowered by the excess and steps 3–5 run once more; the manifest records the final values.
 
 `raw` skips steps 1 and 3 and needs no `ffmpeg` unless resampling or FLAC is requested; `doctor` checks `ffmpeg`. The manifest states `sample_rate` of the export file and `source_sample_rate` (48000) of the takes: source ranges stay in take samples at 48 kHz, destination ranges are in export samples (`round(n × rate / 48000)`), and film seconds are authoritative.
+
+## Distribution
+
+Added 2026-11-23 after council round 5.
+
+- **Install:** a Homebrew cask in Niklas's tap (`niklas-heer/tap/takewise`) installs the Developer ID signed and notarized `Takewise.app` and links its `takewise` binary onto PATH (`binary` stanza). The cask depends on the `whisper-cpp` and `ffmpeg` formulae. Without Homebrew, the app's menu offers "Install Command Line Tool", which links `~/.local/bin/takewise` to the binary inside the bundle (as Focal does).
+- **Without the tools:** recording, choosing and `raw` WAV export at 48 kHz work without `whisper-cli` and `ffmpeg`; checks then give `listen` with `words-not-checked`, and `doctor` and the window say how to install them.
+- **The speech model:** not bundled (1.5 GB). On first launch, and whenever it is missing, the window shows "Install the speech model (1.5 GB)"; `takewise models install` does the same from the command line. Both download `ggml-large-v3-turbo.bin` from the whisper.cpp model repository on Hugging Face into `~/.local/share/takewise/models`, show progress, verify its SHA-256 against a value pinned in the source, and resume an interrupted download. Until it is installed, checks run without words.
+- **Microphone permission** belongs to `Takewise.app`; the first take triggers the macOS prompt. `doctor` and the window explain how to grant it in System Settings when it was denied.
+- **Docs:** the README covers install, a first session, the keys, the Resolve recipe and agent use; `AGENTS.md` in the repo covers contributors. A short agent guide (`docs/agents.md`) shows an agent's full loop: `init`, writing `script.toml`, `status --json`, `check`, `judge`, `choose`, `export`, and placing the result in Resolve.
 
 ## Milestones
 
@@ -312,7 +322,7 @@ Takes are always recorded as 48 kHz, 24-bit WAV, the lossless original, and are 
 2. **Recording window:** the screen above on the spike's media path: record, play in context, choose, mark start, edit text, level meter. After this milestone Niklas can narrate a film; agents can judge takes from the folder.
 3. **Checks:** whisper-cli integration, alignment, verdict rules, ranking, `check`; thresholds tuned on real takes; verdicts in the window.
 4. **Setup and sound** (section "Setup and sound"): 4a the audio panel, monitoring, meters and scrolling; 4b the setup check, the noise rule, export cleanup and formats. 4a starts with a short spike proving monitoring on the RØDECaster with wired headphones.
-5. **Ship:** app bundle, README with the Resolve recipe, agent instructions.
+5. **Ship** (section "Distribution").
 
 ## Constraints
 
