@@ -10,6 +10,10 @@
 
 <sub>Two takes of one line at twice their speed. The first comes back `retake · missing “home”`, the second `keep`. The hollow star marks the best checked take that isn't a `retake`; Enter chooses a take and fills it. Demo film: NASA's public-domain "Earth Views from the International Space Station"; takes spoken by macOS `say` and checked by Takewise.</sub>
 
+**[Watch the 59-second film](https://youtu.be/6kujiHjqDhg)** on YouTube: record voiceover to picture on a Mac, every take checked.
+
+[![A thumbnail for the film on YouTube: "Every take, checked" over the recording window mid-take on the left and the take list with retake, listen and keep rows on the right, with a "Watch the film · 0:59" button.](docs/images/video.webp)](https://youtu.be/6kujiHjqDhg)
+
 ## Why
 
 Narration over a finished cut usually goes into a recorder app, Audition or a phone: one long file, no picture in front of you, the script on another screen. Afterwards you scrub through it for the good take of each line and spot each one onto the timeline by hand. Recording inside the editor gives you the picture, but the script and the retakes still have nowhere to go. Either way the mistakes surface late: a wrong word you only hear while cutting, a line that runs into the next shot, a peak that clipped.
