@@ -175,7 +175,7 @@ All local, run after each take and by `takewise check`. Recording and choosing w
   8. Speech less than 30 dB above the take's own pre-roll floor → `listen` (`background-noise`, "background noise only 24 dB below your voice"); skipped when the pre-roll is digital silence (a gated interface). See "Noise per take".
   9. Otherwise → `keep`.
   Thresholds are tuned on real takes (the Kindred narration recorded on 2026-11-22), not only on synthetic `say` fixtures.
-- **Re-checks:** when only a line's slot moved since a take's check (the same text), checking it again recomputes the verdict from that check's words and a fresh energy analysis, without running whisper; the sound finding of rule 7 carries over. The `checked` event's `checker` names the whisper model and how the audio is prepared before transcription (`pre=none` for now; a high-pass filter would be, say, `pre=hp80+norm`); a check by another model or preprocessing is transcribed again, as is a take whose current check is re-run explicitly.
+- **Re-checks:** when only a line's slot moved since a take's check (the same text), checking it again recomputes the verdict from that check's words and a fresh energy analysis, without running whisper; the sound finding of rule 7 carries over. The `checked` event's `checker` names the whisper model and how the audio is prepared before transcription (`pre=hp60+norm` since milestone 4b; checks without the tag were made with `pre=none`); a check by another model or preprocessing is transcribed again, as is a take whose current check is re-run explicitly.
 - **Ranking** among a line's takes, using effective verdicts: takes whose file is missing rank last and are never proposed; then `keep` before `listen` and `unchecked` (equal) before `retake`; then fewer word differences; then smaller overrun; then outside `score`; then newest. The top take is proposed, never chosen automatically.
 
 ## CLI
@@ -291,7 +291,7 @@ Results are saved in `[setup]`.
 
 **Noise per take.** `checked` gains `speech_level_dbfs` (RMS over the energy speech range). A new verdict rule between rules 7 and 8 (after the sound rule, before `keep`): a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
 
-**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 80 Hz and normalized, which helps Whisper. The take file is never changed. The `checker` string's preprocessing tag changes from `pre=none` to `pre=hp80+norm`, so takes checked before are transcribed again.
+**Cleaner audio for the checks.** Before transcription, the take is converted with a high-pass at 60 Hz and its peak normalized to −3 dBFS (no loudness normalization), so rumble and a quiet take do not confuse Whisper. The take file is never changed. The `checker` string's preprocessing tag changes from `pre=none` to `pre=hp60+norm`, so takes checked before are transcribed again. The high-pass is lower than the export's 80 Hz on evidence: at 80 Hz and at 100 Hz, Whisper heard "build" for "built" in one of the eight Kindred lines; at 60 Hz, as without a filter, all eight stay `keep`.
 
 ### Export cleanup and formats (milestone 4b)
 

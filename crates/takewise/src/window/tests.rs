@@ -1765,7 +1765,7 @@ fn verdict_appears_after_commit(cx: &mut TestAppContext) {
     assert_eq!(
         checked[0].checker,
         format!(
-            "takewise {} whisper ggml-gated.bin pre=none",
+            "takewise {} whisper ggml-gated.bin pre=hp60+norm",
             env!("CARGO_PKG_VERSION")
         )
     );

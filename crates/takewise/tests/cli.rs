@@ -574,7 +574,17 @@ fn fake_whisper(tmp: &Path) -> (PathBuf, PathBuf) {
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&models).unwrap();
     fs::write(models.join("ggml-large-v3-turbo.bin"), b"").unwrap();
-    script(&bin, "ffmpeg", r#"for a; do last=$a; done; : > "$last""#);
+    // ffmpeg's conversion: a short float WAV whisper's copy is made from.
+    let converted = tmp.join("converted.wav");
+    write_take_wav(&converted, &[0; 160], 16_000).unwrap();
+    script(
+        &bin,
+        "ffmpeg",
+        &format!(
+            r#"for a; do last=$a; done; cp "{}" "$last""#,
+            converted.display()
+        ),
+    );
     let json = r#"{"transcription":[{"tokens":[
         {"text":" Hello","offsets":{"from":2100,"to":2400},"p":0.9,"t_dtw":210},
         {"text":" there","offsets":{"from":2500,"to":2800},"p":0.9,"t_dtw":250},
@@ -623,7 +633,7 @@ fn cli_check_reports_verdicts_json() {
     assert_eq!(
         first["checker"],
         format!(
-            "takewise {} whisper ggml-large-v3-turbo.bin pre=none",
+            "takewise {} whisper ggml-large-v3-turbo.bin pre=hp60+norm",
             env!("CARGO_PKG_VERSION")
         )
     );

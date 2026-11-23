@@ -27,7 +27,7 @@ use crate::whisper::{PREPROCESSING, Transcriber, WhisperCli, keep_within};
 /// The `checker` field of a `checked` event: the Takewise version, the
 /// whisper model and how the audio is prepared before transcription (see
 /// [`PREPROCESSING`]), such as `takewise 0.1.0 whisper
-/// ggml-large-v3-turbo.bin pre=none`.
+/// ggml-large-v3-turbo.bin pre=hp60+norm`.
 pub fn checker(version: &str, model: &str) -> String {
     format!("takewise {version} whisper {model} pre={PREPROCESSING}")
 }
@@ -370,6 +370,20 @@ mod tests {
     }
 
     #[test]
+    fn checker_tag_is_hp60_norm() {
+        // Whisper hears a high-passed, normalized copy; checks made before
+        // (`pre=none`) are transcribed again.
+        assert_eq!(
+            checker("0.1.0", "ggml-large-v3-turbo.bin"),
+            "takewise 0.1.0 whisper ggml-large-v3-turbo.bin pre=hp60+norm"
+        );
+        assert_ne!(
+            transcription_key(&checker("0.1.0", "ggml-a.bin")),
+            transcription_key("takewise 0.1.0 whisper ggml-a.bin pre=none")
+        );
+    }
+
+    #[test]
     fn check_appends_checked_event() {
         let (_tmp, dir) = setup();
         let t = take(&dir);
@@ -379,7 +393,7 @@ mod tests {
         assert_eq!(checked.transcript.as_ref().map(Vec::len), Some(4));
         assert_eq!(
             checked.checker,
-            "takewise 0.1.0 whisper ggml-fake.bin pre=none"
+            "takewise 0.1.0 whisper ggml-fake.bin pre=hp60+norm"
         );
         assert_eq!(checked.snapshot.text, "Nobody misses a birthday.");
         let (start, end) = checked.speech.unwrap();
@@ -591,7 +605,7 @@ mod tests {
         assert_eq!(checked.transcript.as_ref().map(Vec::len), Some(4));
         assert_eq!(
             checked.checker,
-            "takewise 0.1.1 whisper ggml-fake.bin pre=none"
+            "takewise 0.1.1 whisper ggml-fake.bin pre=hp60+norm"
         );
         let project = Project::open(&dir).unwrap();
         assert_eq!(unchecked_takes(&project, &read(&dir).unwrap()), []);

@@ -56,11 +56,22 @@ use crate::words::isolate_annotations;
 /// hallucinations (whisper likes to hear "Thank you." in silence).
 pub const SPEECH_MARGIN_S: f64 = 0.3;
 /// How a take's audio is prepared before transcription, named in the
-/// `checked` event's `checker` field as `pre=none` (or, say,
-/// `pre=hp80+norm`; a checker without one means `none`). A transcript is
+/// `checked` event's `checker` field as `pre=hp60+norm` (a high-pass at
+/// 60 Hz, then the peak normalized to −3 dBFS; a checker without one means
+/// `none`). A transcript is
 /// reused for a moved slot only while this is unchanged, so change it with
 /// anything that changes what whisper hears.
-pub const PREPROCESSING: &str = "none";
+pub const PREPROCESSING: &str = "hp60+norm";
+/// The high-pass filter whisper's copy goes through, removing rumble. At
+/// 80 Hz (the export's high-pass) whisper heard "build" for "built" in one
+/// of Niklas's Kindred lines, at 100 Hz too; at 60 Hz all eight stay
+/// `keep`, as without a filter.
+pub const HIGHPASS: &str = "highpass=f=60";
+/// Whisper's copy is scaled so its peak lands here (no loudness
+/// normalization, which would change the dynamics).
+pub const NORMALIZE_PEAK_DBFS: f64 = -3.0;
+/// The sample rate whisper.cpp expects.
+const WHISPER_RATE: u32 = 16_000;
 /// The models directory used when `$TAKEWISE_MODELS` is not set, under `$HOME`.
 pub const DEFAULT_MODELS_DIR: &str = ".local/share/takewise/models";
 /// How long `ffmpeg` may take to convert a take before it is stopped.
@@ -235,17 +246,20 @@ impl WhisperCli {
             .prefix(TEMP_PREFIX)
             .tempdir()
             .map_err(|err| format!("could not create a temporary directory: {err}"))?;
+        let filtered = tmp.path().join("filtered.wav");
         let pcm = tmp.path().join("take.wav");
         let out = tmp.path().join("take");
         run_tool(
             tool_command(&self.ffmpeg)
                 .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
                 .arg(wav)
-                .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
-                .arg(&pcm),
+                .args(["-af", HIGHPASS, "-ar", "16000", "-ac", "1"])
+                .args(["-c:a", "pcm_f32le"])
+                .arg(&filtered),
             &self.ffmpeg,
             self.ffmpeg_timeout,
         )?;
+        normalize_peak(&filtered, &pcm, NORMALIZE_PEAK_DBFS)?;
         run_tool(
             tool_command(&self.whisper)
                 .arg("-m")
@@ -281,6 +295,54 @@ impl Transcriber for WhisperCli {
     fn model(&self) -> String {
         self.model_name()
     }
+}
+
+/// Reads `src` (any WAV hound reads), scales it so its peak lands at
+/// `peak_dbfs` and writes it to `dst` as 16-bit PCM at 16 kHz mono, the
+/// copy whisper hears. Digital silence stays silent.
+fn normalize_peak(src: &Path, dst: &Path, peak_dbfs: f64) -> Result<(), String> {
+    let read_error =
+        |err: hound::Error| format!("could not read the converted take {}: {err}", src.display());
+    let reader = hound::WavReader::open(src).map_err(read_error)?;
+    let spec = reader.spec();
+    let samples: Vec<f64> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .map(|s| s.map(f64::from))
+            .collect::<Result<_, _>>()
+            .map_err(read_error)?,
+        hound::SampleFormat::Int => {
+            let scale = f64::from(1_u32 << (spec.bits_per_sample.clamp(1, 32) - 1));
+            reader
+                .into_samples::<i32>()
+                .map(|s| s.map(|v| f64::from(v) / scale))
+                .collect::<Result<_, _>>()
+                .map_err(read_error)?
+        }
+    };
+    let peak = samples.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let gain = if peak > 0.0 {
+        10f64.powf(peak_dbfs / 20.0) / peak
+    } else {
+        1.0
+    };
+    let write_error =
+        |err: hound::Error| format!("could not write whisper's copy {}: {err}", dst.display());
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: WHISPER_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(dst, spec).map_err(write_error)?;
+    for v in samples {
+        #[allow(clippy::cast_possible_truncation)]
+        let s = (v * gain * f64::from(i16::MAX))
+            .round()
+            .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
+        writer.write_sample(s).map_err(write_error)?;
+    }
+    writer.finalize().map_err(write_error)
 }
 
 /// Where tools are looked for: the directories of `path` (a `$PATH` value),
@@ -596,9 +658,46 @@ mod tests {
         path
     }
 
-    /// A fake ffmpeg that creates its last argument, the output file.
+    /// A float WAV at 16 kHz with a quiet 440 Hz tone (peak 0.1), as
+    /// ffmpeg's conversion writes it.
+    fn converted_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("converted-fixture.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..1600 {
+            let t = f64::from(i) / 16_000.0;
+            #[allow(clippy::cast_possible_truncation)]
+            writer
+                .write_sample((0.1 * (std::f64::consts::TAU * 440.0 * t).sin()) as f32)
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    /// The body of a fake ffmpeg that copies a converted fixture to its last
+    /// argument, the output file.
+    fn ffmpeg_body(dir: &Path) -> String {
+        format!(
+            r#"for a; do last=$a; done; cp "{}" "$last""#,
+            converted_fixture(dir).display()
+        )
+    }
+
+    /// A fake ffmpeg that records its arguments in `ffmpeg-args.txt` and
+    /// writes a converted fixture to its output.
     fn fake_ffmpeg(dir: &Path) -> PathBuf {
-        script(dir, "ffmpeg", r#"for a; do last=$a; done; : > "$last""#)
+        let body = format!(
+            r#"echo "$@" > "{}"; {}"#,
+            dir.join("ffmpeg-args.txt").display(),
+            ffmpeg_body(dir)
+        );
+        script(dir, "ffmpeg", &body)
     }
 
     /// A fake whisper-cli that records its arguments in `args.txt` and runs
@@ -765,6 +864,52 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
     }
 
     #[test]
+    fn conversion_args_include_highpass() {
+        let tmp = tempfile::tempdir().unwrap();
+        // whisper-cli keeps the copy it was given.
+        let heard = tmp.path().join("heard.wav");
+        let whisper = fake_whisper(
+            tmp.path(),
+            &format!(
+                r#"cp "$(dirname "$out")/take.wav" "{}"; cp "{FIXTURE}" "$out.json""#,
+                heard.display()
+            ),
+        );
+        let cli = cli(tmp.path(), whisper);
+        assert!(matches!(
+            cli.transcribe(&tmp.path().join("take.wav")),
+            Transcript::Words(_)
+        ));
+        let args = fs::read_to_string(tmp.path().join("ffmpeg-args.txt")).unwrap();
+        assert!(args.contains("-af highpass=f=60 "), "{args}");
+        assert!(!args.contains("loudnorm"), "{args}");
+        assert!(args.contains("-ar 16000 -ac 1"), "{args}");
+
+        // The copy whisper hears peaks at −3 dBFS, as 16-bit PCM at 16 kHz.
+        let mut reader = hound::WavReader::open(&heard).unwrap();
+        let spec = reader.spec();
+        assert_eq!((spec.sample_rate, spec.bits_per_sample), (16_000, 16));
+        let peak = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap().unsigned_abs())
+            .max()
+            .unwrap();
+        let peak_dbfs = 20.0 * (f64::from(peak) / f64::from(i16::MAX)).log10();
+        assert!((peak_dbfs + 3.0).abs() < 0.05, "{peak_dbfs}");
+    }
+
+    #[test]
+    fn normalizing_silence_keeps_it_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("silent.wav");
+        crate::takes::write_take_wav(&src, &[0; 480], 48_000).unwrap();
+        let dst = tmp.path().join("out.wav");
+        normalize_peak(&src, &dst, -3.0).unwrap();
+        let mut reader = hound::WavReader::open(&dst).unwrap();
+        assert!(reader.samples::<i16>().all(|s| s.unwrap() == 0));
+    }
+
+    #[test]
     fn missing_binary_fails_soft() {
         let tmp = tempfile::tempdir().unwrap();
         let cli = cli(tmp.path(), tmp.path().join("no-such-whisper-cli"));
@@ -787,7 +932,7 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         cli.ffmpeg = script(
             tmp.path(),
             "ffmpeg",
-            &format!(r#"{record}; for a; do last=$a; done; : > "$last""#),
+            &format!("{record}; {}", ffmpeg_body(tmp.path())),
         );
         let _ = cli.transcribe(&tmp.path().join("t.wav"));
         let out = std::process::Command::new("ps")
