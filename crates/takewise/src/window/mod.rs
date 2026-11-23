@@ -3,7 +3,9 @@
 //!
 //! All writes go through `takewise-core`; the project lock is only held for
 //! those short writes, never while recording. The microphone is never
-//! monitored: capture feeds the take and the level meter only. Takes are
+//! monitored: capture feeds the take and the meters only (monitoring waits
+//! behind the `Media` seam for its hardware spike). The audio panel (A)
+//! picks devices between takes and sets the film and monitor volume. Takes are
 //! checked on a worker thread after each commit and whenever a reload finds
 //! takes without a current check.
 
@@ -11,6 +13,8 @@ mod checks;
 mod clock;
 mod lines;
 mod media;
+mod meter;
+mod panel;
 mod prompter;
 mod recorder;
 mod takes;
@@ -20,9 +24,11 @@ mod video;
 mod watch;
 mod writer;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::input::{InputEvent, InputState};
+use gpui_kit::base::slider::SliderEvent;
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _,
     IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render, Styled as _, Subscription,
@@ -55,6 +61,13 @@ gpui_kit::actions!(
         PrevTake,
         NextTake,
         CancelEdit,
+        TogglePanel,
+        ToggleMonitor,
+        ClearClip,
+        FilmQuieter,
+        FilmLouder,
+        MonitorQuieter,
+        MonitorLouder,
         Quit,
     ]
 );
@@ -92,6 +105,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", NextLine, Some(CONTEXT)),
         KeyBinding::new("left", PrevTake, Some(CONTEXT)),
         KeyBinding::new("right", NextTake, Some(CONTEXT)),
+        KeyBinding::new("a", TogglePanel, Some(CONTEXT)),
+        KeyBinding::new("h", ToggleMonitor, Some(CONTEXT)),
+        KeyBinding::new("k", ClearClip, Some(CONTEXT)),
+        // Typed characters, so they work on QWERTY (shift-= types +) and
+        // QWERTZ (+ has its own key) alike.
+        KeyBinding::new("-", FilmQuieter, Some(CONTEXT)),
+        KeyBinding::new("+", FilmLouder, Some(CONTEXT)),
+        KeyBinding::new(",", MonitorQuieter, Some(CONTEXT)),
+        KeyBinding::new(".", MonitorLouder, Some(CONTEXT)),
         KeyBinding::new("escape", CancelEdit, Some(EDITING)),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", Quit, None),
@@ -182,7 +204,17 @@ pub fn run(dir: &Path) -> Result<(), String> {
         };
         let opened = gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                RecordingWindow::new(dir, loaded, Box::new(media), watcher, checker, window, cx)
+                let mut view = RecordingWindow::new(
+                    dir,
+                    loaded,
+                    Box::new(media),
+                    watcher,
+                    checker,
+                    window,
+                    cx,
+                );
+                view.defaults_path = tw::settings_path();
+                view
             })
         });
         if let Err(err) = opened {
@@ -225,6 +257,21 @@ pub struct RecordingWindow {
     checks: Checks,
     focus: FocusHandle,
     subscriptions: Vec<Subscription>,
+    /// The connected inputs as last checked.
+    inputs: Vec<AvailableInput>,
+    panel: panel::Panel,
+    /// The film and monitor volume in dB as set now, and when they last
+    /// changed while not yet written to `project.toml`.
+    film_gain_db: f64,
+    monitor_db: f64,
+    volumes_changed_at: Option<f64>,
+    peak_meter: meter::PeakMeter,
+    /// Peaks of takes committed in this session, for the "clipped" mark
+    /// until their check says.
+    take_peaks: HashMap<(String, u32), f64>,
+    /// Where device choices are saved as defaults for new projects; none in
+    /// tests.
+    defaults_path: Option<PathBuf>,
 }
 
 impl RecordingWindow {
@@ -251,6 +298,26 @@ impl RecordingWindow {
         });
         let checks = Checks::new(dir.clone(), checker);
         let loaded_unchecked = loaded.unchecked;
+        let film_gain_db = loaded.project.config.record.film_gain_db;
+        let monitor_db = loaded.project.config.monitor.volume_db;
+        let panel = panel::Panel::new(film_gain_db, monitor_db, cx);
+        let mut subscriptions = vec![on_quit];
+        for (slider, film) in [(&panel.film_slider, true), (&panel.monitor_slider, false)] {
+            subscriptions.push(cx.subscribe_in(
+                slider,
+                window,
+                move |view: &mut Self, _, event: &SliderEvent, _, cx| {
+                    let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
+                    let db = f64::from(value.end());
+                    if film {
+                        view.set_volumes(db, view.monitor_db);
+                    } else {
+                        view.set_volumes(view.film_gain_db, db);
+                    }
+                    cx.notify();
+                },
+            ));
+        }
         let mut view = Self {
             dir,
             media,
@@ -268,12 +335,21 @@ impl RecordingWindow {
             watcher,
             checks,
             focus,
-            subscriptions: vec![on_quit],
+            subscriptions,
+            inputs: Vec::new(),
+            panel,
+            film_gain_db,
+            monitor_db,
+            volumes_changed_at: None,
+            peak_meter: meter::PeakMeter::default(),
+            take_peaks: HashMap::new(),
+            defaults_path: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
         view.recover();
         view.check_inputs();
+        view.apply_output();
         view.park();
         view
     }
@@ -314,6 +390,8 @@ impl RecordingWindow {
         }
         self.recorder.stop_playback(&mut *self.media);
         self.recorder.keep_meter(&mut *self.media, None);
+        self.media.stop_channel_meter();
+        self.save_volumes(true);
         self.checks.cancel();
     }
 
@@ -381,6 +459,7 @@ impl RecordingWindow {
                 self.project = loaded.project;
                 self.version = loaded.version;
                 self.state = loaded.state;
+                self.sync_volumes();
                 self.after_reload(current.as_deref());
                 self.queue_checks(&loaded.unchecked);
             }
@@ -463,8 +542,11 @@ impl RecordingWindow {
 
     fn check_inputs(&mut self) {
         let inputs: Vec<AvailableInput> = self.media.inputs();
-        self.input_problem =
-            check_input(self.project.config.input.device.as_deref(), &inputs).err();
+        let configured = self.project.config.input.device.clone();
+        self.input_problem = check_input(configured.as_deref(), &inputs).err();
+        self.note_issue(panel::input_issue(configured.as_deref(), &inputs));
+        self.inputs = inputs;
+        self.panel.calibration = tw::calibration_stale(&self.project.config, &self.current_route());
         self.inputs_checked_at = Some(self.media.host_now_s());
     }
 
@@ -488,6 +570,8 @@ impl RecordingWindow {
             return;
         }
         self.message = None;
+        self.peak_meter.clear();
+        self.panel.picker = None;
         if let Err(err) = self
             .recorder
             .start_take(&mut *self.media, &self.project, self.line)
@@ -557,12 +641,42 @@ impl RecordingWindow {
         let update = self.recorder.tick(&mut *self.media, &self.dir);
         self.show(update);
         self.pause_checks_while_recording();
+        self.tick_panel(now);
+        self.save_volumes(false);
+        let level = self.recorder.level_dbfs(&*self.media);
+        self.peak_meter.feed(
+            level,
+            self.recorder.clip_peak_dbfs(),
+            self.media.host_now_s(),
+        );
+    }
+
+    /// The current line's takes marked "clipped": by their latest check,
+    /// or before it by the peak recorded in this session.
+    fn clipped_takes(&self) -> Vec<u32> {
+        let Some(line) = self.line_state() else {
+            return Vec::new();
+        };
+        line.takes
+            .iter()
+            .filter(|take| {
+                take.clipped.unwrap_or_else(|| {
+                    self.take_peaks
+                        .get(&(line.id.clone(), take.take))
+                        .is_some_and(|peak| *peak >= meter::CLIPPED_DBFS)
+                })
+            })
+            .map(|take| take.take)
+            .collect()
     }
 
     /// Shows what the recorder reports and selects a committed take. An
     /// interruption or error is shown together with the success, never
     /// replaced by it.
     fn show(&mut self, update: recorder::Update) {
+        if let (Some(take), Some(peak)) = (&update.committed, update.peak_dbfs) {
+            self.take_peaks.insert((take.line.clone(), take.take), peak);
+        }
         let success = self.took(update.committed);
         if let Some(message) = recorder::join(success, update.message) {
             self.message = Some(message);
@@ -787,6 +901,39 @@ impl RecordingWindow {
     }
 }
 
+/// The audio keys: the panel (A), monitoring (H), the clipping light (K)
+/// and the film and monitor volume.
+fn audio_actions(
+    root: gpui_kit::Stateful<gpui_kit::Div>,
+    cx: &mut Context<RecordingWindow>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    root.on_action(cx.listener(|view, _: &TogglePanel, _, cx| {
+        view.panel.open = !view.panel.open;
+        view.panel.picker = None;
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &ToggleMonitor, _, cx| {
+        view.toggle_monitor();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &ClearClip, _, cx| {
+        view.peak_meter.clear();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &FilmQuieter, window, cx| {
+        view.step_volume(-panel::STEP_DB, 0.0, window, cx);
+    }))
+    .on_action(cx.listener(|view, _: &FilmLouder, window, cx| {
+        view.step_volume(panel::STEP_DB, 0.0, window, cx);
+    }))
+    .on_action(cx.listener(|view, _: &MonitorQuieter, window, cx| {
+        view.step_volume(0.0, -panel::STEP_DB, window, cx);
+    }))
+    .on_action(cx.listener(|view, _: &MonitorLouder, window, cx| {
+        view.step_volume(0.0, panel::STEP_DB, window, cx);
+    }))
+}
+
 impl Render for RecordingWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tick();
@@ -796,6 +943,7 @@ impl Render for RecordingWindow {
         let film_s = self.recorder.film_now_s(media);
         let count_in = self.recorder.count_in(media);
         let level = self.recorder.level_dbfs(media);
+        let hold = self.peak_meter.hold_dbfs(media.host_now_s());
         let recording = self.recorder.is_recording();
         let frame = self.media.latest_frame();
 
@@ -806,21 +954,25 @@ impl Render for RecordingWindow {
             note,
             next,
             level_dbfs: level,
+            hold_dbfs: hold,
+            near_clip: self.peak_meter.near_clip(),
             recording,
             blocked: self.blocked(),
             message: self.message.as_deref(),
             editor: self.editing.as_ref().map(|draft| &draft.input),
         };
+        let panel_view = self.panel.open.then(|| self.render_panel(cx));
         let key_context = if self.editing.is_some() {
             EDITING
         } else {
             CONTEXT
         };
 
-        div()
+        let root = div()
             .id("recording-window")
             .key_context(key_context)
-            .track_focus(&self.focus)
+            .track_focus(&self.focus);
+        audio_actions(root, cx)
             .on_action(cx.listener(Self::record))
             .on_action(cx.listener(Self::retake))
             .on_action(cx.listener(Self::choose))
@@ -852,6 +1004,7 @@ impl Render for RecordingWindow {
                             .child(video::video(frame, count_in, recording))
                             .child(prompter.render()),
                     )
+                    .children(panel_view)
                     .child(
                         div()
                             .w(px(300.))
@@ -867,6 +1020,7 @@ impl Render for RecordingWindow {
                                     .line_id()
                                     .map(|id| self.checks.pending_of(id))
                                     .unwrap_or_default(),
+                                &self.clipped_takes(),
                             )),
                     ),
             )
@@ -877,7 +1031,7 @@ impl Render for RecordingWindow {
                     .text_size(px(13.))
                     .text_color(rgb(colors::DIM))
                     .child(
-                        "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes",
+                        "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · −/+ film · ,/. monitor · K clear clip",
                     ),
             )
     }

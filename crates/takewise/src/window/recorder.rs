@@ -44,6 +44,9 @@ const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
 pub struct Update {
     pub committed: Option<TakeRef>,
     pub message: Option<String>,
+    /// The committed take's highest peak in dBFS, for the "clipped" mark
+    /// until its check says.
+    pub peak_dbfs: Option<f64>,
 }
 
 pub struct Recorder {
@@ -53,8 +56,12 @@ pub struct Recorder {
     park_s: f64,
     /// Peak of the last captured buffer in dBFS, and when it arrived.
     level: Option<(f64, f64)>,
-    /// The idle capture that drives the level meter (never played back).
+    /// The highest peak of the meter's buffers in the last tick.
+    tick_peak: Option<f64>,
+    /// The idle capture that drives the level meter (never played back),
+    /// and the device and channel it captures.
     meter: Option<Receiver<CaptureBuffer>>,
+    meter_input: Option<(String, u16)>,
     meter_retry_at: f64,
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
@@ -140,7 +147,9 @@ impl Recorder {
             warmup: Warmup::Pending,
             park_s: 0.0,
             level: None,
+            tick_peak: None,
             meter: None,
+            meter_input: None,
             meter_retry_at: 0.0,
             unsaved: Vec::new(),
             unsaved_retry_at: 0.0,
@@ -211,6 +220,15 @@ impl Recorder {
         (media.host_now_s() - at < LEVEL_HOLD_S).then_some(db)
     }
 
+    /// The highest peak to judge clipping by: of the take so far while one
+    /// records, else of the buffers the last tick received.
+    pub fn clip_peak_dbfs(&self) -> Option<f64> {
+        match &self.phase {
+            Phase::Recording(take) => take.writer.progress().peak_dbfs,
+            _ => self.tick_peak,
+        }
+    }
+
     /// Rests the film at `film_s` while nothing plays.
     pub fn park(&mut self, media: &mut dyn Media, film_s: f64) {
         self.park_s = film_s;
@@ -261,6 +279,16 @@ impl Recorder {
             }
             Some((device, channel)) => {
                 let now = media.host_now_s();
+                let moved = self
+                    .meter_input
+                    .as_ref()
+                    .is_some_and(|(d, c)| d != device || *c != channel);
+                if self.meter.is_some() && moved {
+                    // Another device or channel was chosen: meter that.
+                    self.meter = None;
+                    media.stop_capture();
+                    self.level = None;
+                }
                 if self.meter.is_some() && media.capture_error().is_some() {
                     self.meter = None;
                     media.stop_capture();
@@ -269,7 +297,10 @@ impl Recorder {
                 if self.meter.is_none() && now >= self.meter_retry_at {
                     let (tx, rx) = mpsc::channel();
                     match media.start_capture(device, channel, tx) {
-                        Ok(()) => self.meter = Some(rx),
+                        Ok(()) => {
+                            self.meter = Some(rx);
+                            self.meter_input = Some((device.to_owned(), channel));
+                        }
                         Err(_) => self.meter_retry_at = now + METER_RETRY_S,
                     }
                 }
@@ -382,8 +413,8 @@ impl Recorder {
         }
         if !clock.placed() {
             return Update {
-                committed: None,
                 message: Some("Stopped before the film started; nothing was recorded.".to_owned()),
+                ..Update::default()
             };
         }
         // Placed with the film's timebase as read back (a late start moves
@@ -403,6 +434,7 @@ impl Recorder {
             (ms > FILM_SHIFT_TOLERANCE_MS).then_some(ms)
         });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
+        let take_peak = peak_dbfs(&written.samples);
         let shift_note = film_shift_ms.map(|ms| {
             if unplayed_s.is_some() {
                 format!(
@@ -450,6 +482,7 @@ impl Recorder {
         };
         let mut update = self.save(dir, unsaved);
         update.message = join(join(update.message, dropouts), shift_note);
+        update.peak_dbfs = update.committed.as_ref().map(|_| take_peak);
         update
     }
 
@@ -459,6 +492,7 @@ impl Recorder {
             Ok(saved) => Update {
                 committed: Some(saved.take),
                 message: saved.note,
+                peak_dbfs: None,
             },
             Err(err) => {
                 let message = format!(
@@ -469,6 +503,7 @@ impl Recorder {
                 Update {
                     committed: None,
                     message: Some(message),
+                    peak_dbfs: None,
                 }
             }
         }
@@ -568,10 +603,13 @@ impl Recorder {
     pub fn tick(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
         let now = media.host_now_s();
         self.tick_warmup(media, now);
+        self.tick_peak = None;
         if let Some(meter) = &self.meter {
             while let Ok(buffer) = meter.try_recv() {
                 if !buffer.samples.is_empty() {
-                    self.level = Some((peak_dbfs(&buffer.samples), now));
+                    let peak = peak_dbfs(&buffer.samples);
+                    self.level = Some((peak, now));
+                    self.tick_peak = Some(self.tick_peak.map_or(peak, |max| max.max(peak)));
                 }
             }
         }
@@ -601,6 +639,7 @@ impl Recorder {
                 let finished = self.finish_take(media, dir);
                 Update {
                     committed: finished.committed,
+                    peak_dbfs: finished.peak_dbfs,
                     message: match failure {
                         Some(failure) => join(
                             Some(format!("Recording stopped: {failure}")),

@@ -1,4 +1,4 @@
-//! The prompter: film time, the slot running out, the input level, the
+//! The prompter: film time, the slot running out, the input meter, the
 //! current line large with the pace guide filling it, the next line dimmed,
 //! and any message or reason recording is blocked.
 
@@ -9,10 +9,7 @@ use gpui_kit::{
 };
 use takewise_core::pace_fill;
 
-use super::colors;
-
-/// The level meter's floor.
-const METER_FLOOR_DB: f64 = -60.0;
+use super::{colors, meter};
 
 /// The line to read and its slot.
 #[derive(Debug, Clone, Copy)]
@@ -29,7 +26,10 @@ pub struct Prompter<'a> {
     pub reading: Option<Reading<'a>>,
     pub note: Option<&'a str>,
     pub next: Option<&'a str>,
+    /// The input level and the held peak in dBFS.
     pub level_dbfs: Option<f64>,
+    pub hold_dbfs: Option<f64>,
+    pub near_clip: bool,
     pub recording: bool,
     pub blocked: Option<&'a str>,
     pub message: Option<&'a str>,
@@ -86,19 +86,6 @@ impl Prompter<'_> {
             };
             (span, progress)
         });
-        let level = self.level_dbfs.unwrap_or(f64::NEG_INFINITY);
-        let level_fraction = if level.is_finite() {
-            (level - METER_FLOOR_DB) / -METER_FLOOR_DB
-        } else {
-            0.0
-        };
-        let level_color = if level > -1.0 {
-            colors::RECORD
-        } else if level > -6.0 {
-            colors::WARN
-        } else {
-            colors::GOOD
-        };
         div()
             .flex()
             .flex_row()
@@ -120,8 +107,11 @@ impl Prompter<'_> {
                     .child(format!("slot {span:.1} s"))
             })
             .child(div().flex_1())
-            .child(bar(level_fraction, 120., level_color))
-            .child("mic")
+            .child(meter::main_meter(
+                self.level_dbfs,
+                self.hold_dbfs,
+                self.near_clip,
+            ))
             .into_any_element()
     }
 

@@ -66,6 +66,9 @@ pub struct TakeState {
     pub missing: bool,
     /// The take was recorded against different text than the line has now.
     pub recorded_against_old_text: bool,
+    /// The latest check found samples at or above the clipping threshold;
+    /// `None` when unchecked.
+    pub clipped: Option<bool>,
 }
 
 // serde's `serialize_with` hands the field over by reference.
@@ -187,6 +190,7 @@ fn fold_take(
         reason,
         stale_check,
         speech: latest_checked.and_then(|c| c.speech),
+        clipped: latest_checked.map(|c| c.clipped_samples > 0),
         missing: !project.dir.join(&rec.file).is_file(),
         recorded_against_old_text: rec.snapshot.text != current.text,
     };

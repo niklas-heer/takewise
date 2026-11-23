@@ -16,7 +16,7 @@ use gpui_kit::{
 use takewise_core::{
     self as tw, AvailableInput, EventKind, Field, FilmInfo, Project, RecordedInput, Timebase,
 };
-use takewise_media::{CaptureBuffer, Frame};
+use takewise_media::{CaptureBuffer, DeviceInfo, Frame, Transport};
 
 use super::checks::{Checker, SharedTranscriber};
 use super::clock::FilmClock;
@@ -40,6 +40,17 @@ struct Fake {
     timebase: Option<Timebase>,
     /// Why `film_play_at` fails, when it does.
     play_error: Option<String>,
+    outputs: Vec<DeviceInfo>,
+    /// Where the film plays (`None`: the system default).
+    film_output: Option<String>,
+    film_gain_db: Option<f64>,
+    /// The device and channel of the last capture started.
+    capture_input: Option<(String, u16)>,
+    /// The device whose channels are metered, and their levels.
+    channel_meter: Option<String>,
+    levels: Vec<f32>,
+    /// Why switching the sample rate fails, when it does.
+    rate_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,7 +73,29 @@ impl FakeMedia {
             plays: Vec::new(),
             timebase: None,
             play_error: None,
+            outputs: vec![
+                output("Test Phones", Transport::Usb),
+                output("MacBook Speakers", Transport::BuiltIn),
+            ],
+            film_output: None,
+            film_gain_db: None,
+            capture_input: None,
+            channel_meter: None,
+            levels: vec![-40.0, f32::NEG_INFINITY],
+            rate_error: None,
         })))
+    }
+
+    /// Delivers a buffer whose every sample is `value`.
+    fn send_value(&self, host_s: f64, len: usize, value: i32) {
+        let mut fake = self.0.borrow_mut();
+        let sink = fake.sink.as_ref().expect("a capture is running");
+        sink.send(CaptureBuffer {
+            host_time_s: host_s,
+            samples: vec![value; len],
+        })
+        .expect("the window receives");
+        fake.sent += 1;
     }
 
     fn set_now(&self, now: f64) {
@@ -88,6 +121,15 @@ impl FakeMedia {
 
     fn capturing(&self) -> bool {
         self.0.borrow().sink.is_some()
+    }
+}
+
+fn output(name: &str, transport: Transport) -> DeviceInfo {
+    DeviceInfo {
+        name: name.to_owned(),
+        sample_rate: 48_000,
+        channels: 2,
+        transport,
     }
 }
 
@@ -123,7 +165,9 @@ impl Media for FakeMedia {
     }
     fn film_pause(&mut self) {}
     fn film_seek(&mut self, _: f64) {}
-    fn film_set_gain_db(&mut self, _: f64) {}
+    fn film_set_gain_db(&mut self, db: f64) {
+        self.0.borrow_mut().film_gain_db = Some(db);
+    }
     fn film_set_muted(&mut self, _: bool) {}
     fn latest_frame(&mut self) -> Option<Frame> {
         None
@@ -137,13 +181,14 @@ impl Media for FakeMedia {
     fn start_capture(
         &mut self,
         device: &str,
-        _: u16,
+        channel: u16,
         sink: Sender<CaptureBuffer>,
     ) -> Result<(), String> {
         let mut fake = self.0.borrow_mut();
         if !fake.inputs.iter().any(|input| input.name == device) {
             return Err(format!("no input device named {device:?}"));
         }
+        fake.capture_input = Some((device.to_owned(), channel));
         fake.sink = Some(sink);
         fake.sent = 0;
         fake.capture_error = None;
@@ -165,6 +210,51 @@ impl Media for FakeMedia {
         Ok(())
     }
     fn stop_take(&mut self) {}
+    fn outputs(&self) -> Vec<DeviceInfo> {
+        self.0.borrow().outputs.clone()
+    }
+    fn default_output(&self) -> Option<String> {
+        Some("MacBook Speakers".to_owned())
+    }
+    fn film_set_output(&mut self, device: &str) -> Result<(), String> {
+        let mut fake = self.0.borrow_mut();
+        if !fake.outputs.iter().any(|output| output.name == device) {
+            return Err(format!("no output device named {device:?}"));
+        }
+        fake.film_output = Some(device.to_owned());
+        Ok(())
+    }
+    fn start_channel_meter(&mut self, device: &str) -> Result<(), String> {
+        self.0.borrow_mut().channel_meter = Some(device.to_owned());
+        Ok(())
+    }
+    fn stop_channel_meter(&mut self) {
+        self.0.borrow_mut().channel_meter = None;
+    }
+    fn channel_levels(&self) -> Vec<f32> {
+        let fake = self.0.borrow();
+        if fake.channel_meter.is_some() {
+            fake.levels.clone()
+        } else {
+            Vec::new()
+        }
+    }
+    fn set_nominal_rate(&mut self, device: &str, rate: u32) -> Result<(), String> {
+        let mut fake = self.0.borrow_mut();
+        if let Some(err) = fake.rate_error.clone() {
+            return Err(err);
+        }
+        for input in fake.inputs.iter_mut().filter(|i| i.name == device) {
+            input.sample_rate = rate;
+        }
+        Ok(())
+    }
+    fn buffer_frames(&self, _: &str) -> Option<u32> {
+        Some(512)
+    }
+    fn monitor_unavailable(&self) -> Option<String> {
+        Some("not available yet: monitoring needs a test on your setup".to_owned())
+    }
 }
 
 /// Lines close together, so the pre-roll of `b` holds the first frame.
@@ -1934,5 +2024,342 @@ fn quitting_mid_check_kills_its_child_and_temporary_files(cx: &mut TestAppContex
         checked_events(&f.dir),
         0,
         "a cancelled check records nothing"
+    );
+}
+
+// The audio panel, meters and volume keys.
+
+fn config(dir: &Path) -> tw::ProjectConfig {
+    Project::open(dir).expect("project").config
+}
+
+#[gpui_kit::test]
+fn missing_device_opens_panel(cx: &mut TestAppContext) {
+    let f = open(cx, &[("Other Mic", 48_000)]);
+    frame(cx, f.window);
+    f.view.read_with(cx, |view, _| {
+        assert!(view.panel.open, "the panel opens by itself");
+        let issue = view.panel.issue.as_ref().expect("an input issue");
+        assert_eq!(
+            issue.message(),
+            "Test Mic is not connected. Connect it or pick another input."
+        );
+        assert_eq!(view.inputs.len(), 1, "the panel lists the connected inputs");
+    });
+    press(cx, f.window, &["space"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(recorded(&f.dir).len(), 0, "Space stays blocked");
+
+    f.view.update(cx, |view, _| view.choose_input("Other Mic"));
+    frame(cx, f.window);
+    f.view.read_with(cx, |view, _| {
+        assert_eq!(view.panel.issue, None);
+        assert_eq!(view.blocked(), None);
+    });
+    record_take(cx, &f);
+    assert_eq!(recorded(&f.dir)[0].2.device, "Other Mic");
+}
+
+#[gpui_kit::test]
+fn panel_meters_every_channel_while_open_and_idle(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().channel_meter, None, "closed: no meter");
+    press(cx, f.window, &["a"]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().channel_meter.as_deref(), Some(DEVICE));
+    begin(cx, &f, 100.0);
+    assert_eq!(
+        f.media.0.borrow().channel_meter,
+        None,
+        "no channel meter during a take"
+    );
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().channel_meter.as_deref(), Some(DEVICE));
+    press(cx, f.window, &["a"]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().channel_meter, None);
+}
+
+#[gpui_kit::test]
+fn pickers_disabled_during_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000), ("Other Mic", 48_000)]);
+    press(cx, f.window, &["a"]);
+    begin(cx, &f, 100.0);
+    assert!(!f.view.read_with(cx, |view, _| view.pickers_enabled()));
+    f.view.update(cx, |view, _| {
+        view.choose_input("Other Mic");
+        view.choose_channel(2);
+        view.choose_output("Test Phones");
+        view.switch_to_48k();
+    });
+    frame(cx, f.window);
+    let config = config(&f.dir);
+    assert_eq!(config.input.device.as_deref(), Some(DEVICE));
+    assert_eq!(config.input.channel, 1);
+    assert_eq!(config.output.device, None);
+    assert_eq!(f.media.0.borrow().film_output, None);
+    assert!(
+        message(cx, &f.view).contains("between takes"),
+        "{}",
+        message(cx, &f.view)
+    );
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.pickers_enabled()));
+    assert_eq!(recorded(&f.dir)[0].2.device, DEVICE);
+}
+
+#[gpui_kit::test]
+fn route_change_applies_between_takes(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000), ("Other Mic", 48_000)]);
+    let settings = f.dir.join("settings.toml");
+    let path = settings.clone();
+    f.view.update(cx, |view, _| view.defaults_path = Some(path));
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().capture_input,
+        Some((DEVICE.to_owned(), 1)),
+        "the meter listens to the configured input"
+    );
+    f.view.update(cx, |view, _| {
+        view.choose_input("Other Mic");
+        view.choose_channel(2);
+        view.choose_output("Test Phones");
+    });
+    frame(cx, f.window);
+    let config = config(&f.dir);
+    assert_eq!(config.input.device.as_deref(), Some("Other Mic"));
+    assert_eq!(config.input.channel, 2);
+    assert_eq!(config.output.device.as_deref(), Some("Test Phones"));
+    assert_eq!(
+        f.media.0.borrow().film_output.as_deref(),
+        Some("Test Phones"),
+        "the film plays through the new output"
+    );
+    assert_eq!(
+        f.media.0.borrow().capture_input,
+        Some(("Other Mic".to_owned(), 2)),
+        "the meter follows the new input and channel"
+    );
+    let defaults = tw::route::load_defaults_from(&settings)
+        .expect("settings")
+        .expect("saved defaults");
+    assert_eq!(defaults.input.as_deref(), Some("Other Mic"));
+    assert_eq!(defaults.channel, 2);
+    assert_eq!(defaults.output.as_deref(), Some("Test Phones"));
+
+    record_take(cx, &f);
+    let (_, _, event) = &recorded(&f.dir)[0];
+    assert_eq!((event.device.as_str(), event.channel), ("Other Mic", 2));
+}
+
+#[gpui_kit::test]
+fn configured_output_is_used_on_open(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Test Phones")).expect("route");
+    });
+    assert_eq!(
+        f.media.0.borrow().film_output.as_deref(),
+        Some("Test Phones")
+    );
+    let missing = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Gone Phones")).expect("route");
+    });
+    let text = message(cx, &missing.view);
+    assert!(
+        text.contains("Gone Phones is not connected") && text.contains("MacBook Speakers"),
+        "{text}"
+    );
+}
+
+#[gpui_kit::test]
+fn rate_switch_unblocks_or_says_why_not(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 44_100)]);
+    f.view.read_with(cx, |view, _| {
+        assert!(matches!(
+            view.panel.issue,
+            Some(super::panel::InputIssue::WrongRate { rate: 44_100, .. })
+        ));
+        assert!(view.blocked().is_some());
+    });
+    let refusal = "\"Test Mic\" could not switch to 48000 Hz: the device does not support that rate (CoreAudio status '!dat')";
+    f.media.0.borrow_mut().rate_error = Some(refusal.to_owned());
+    f.view.update(cx, |view, _| view.switch_to_48k());
+    let text = message(cx, &f.view);
+    assert!(text.starts_with(refusal), "{text}");
+    assert!(text.contains("Recording stays off"), "{text}");
+    assert!(f.view.read_with(cx, |view, _| view.blocked().is_some()));
+
+    f.media.0.borrow_mut().rate_error = None;
+    f.view.update(cx, |view, _| view.switch_to_48k());
+    f.view.read_with(cx, |view, _| {
+        assert_eq!(view.blocked(), None);
+        assert_eq!(view.panel.issue, None);
+    });
+}
+
+#[gpui_kit::test]
+fn volume_keys_match_characters(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let volumes = |f: &Fixture, cx: &mut TestAppContext| {
+        f.view
+            .read_with(cx, |view, _| (view.film_gain_db, view.monitor_db))
+    };
+    assert_eq!(volumes(&f, cx), (-12.0, -6.0));
+    press(cx, f.window, &["-"]);
+    assert_eq!(volumes(&f, cx), (-13.0, -6.0));
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(-13.0));
+    // QWERTY types + with shift and =; QWERTZ has a + key.
+    press(cx, f.window, &["shift-=->+"]);
+    assert_eq!(volumes(&f, cx).0, -12.0);
+    press(cx, f.window, &["+"]);
+    assert_eq!(volumes(&f, cx).0, -11.0);
+    press(cx, f.window, &["=", "shift-="]);
+    assert_eq!(volumes(&f, cx).0, -11.0, "only a typed + raises it");
+    press(cx, f.window, &[",", ",", "."]);
+    assert_eq!(volumes(&f, cx), (-11.0, -7.0));
+    press(cx, f.window, &["."; 20]);
+    assert_eq!(volumes(&f, cx).1, 6.0, "the monitor stops at +6 dB");
+    press(cx, f.window, &["+"; 20]);
+    assert_eq!(volumes(&f, cx).0, 0.0, "the film stops at 0 dB");
+
+    // Written once the keys rest.
+    f.media.set_now(101.0);
+    frame(cx, f.window);
+    let saved = config(&f.dir);
+    assert_eq!(saved.record.film_gain_db, 0.0);
+    assert_eq!(saved.monitor.volume_db, 6.0);
+
+    // During a take the film's level changes at once and is written after.
+    begin(cx, &f, 200.0);
+    press(cx, f.window, &["-", "-"]);
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(-2.0));
+    f.media.set_now(201.0);
+    frame(cx, f.window);
+    assert_eq!(
+        config(&f.dir).record.film_gain_db,
+        0.0,
+        "not during the take"
+    );
+    press(cx, f.window, &["space"]);
+    f.media.set_now(202.0);
+    frame(cx, f.window);
+    assert_eq!(config(&f.dir).record.film_gain_db, -2.0);
+    assert_eq!(
+        volumes(&f, cx).0,
+        -2.0,
+        "the reload after the take keeps it"
+    );
+}
+
+/// −0.4 dBFS: near clipping, not clipped.
+const LOUD: i32 = 8_000_000;
+
+#[gpui_kit::test]
+fn near_clip_latches_until_k(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window); // the idle meter runs
+    let near = |f: &Fixture, cx: &mut TestAppContext| {
+        f.view.read_with(cx, |view, _| view.peak_meter.near_clip())
+    };
+    f.media.send(100.0, 480);
+    frame(cx, f.window);
+    assert!(!near(&f, cx));
+    f.media.send_value(100.01, 480, LOUD);
+    f.media.send(100.02, 480); // a quiet buffer in the same frame
+    frame(cx, f.window);
+    assert!(near(&f, cx), "a loud buffer turns it red");
+    f.media.set_now(105.0);
+    f.media.send(105.0, 480);
+    frame(cx, f.window);
+    assert!(near(&f, cx), "it stays red");
+    press(cx, f.window, &["k"]);
+    assert!(!near(&f, cx), "K clears it");
+
+    f.media.send_value(105.1, 480, LOUD);
+    frame(cx, f.window);
+    assert!(near(&f, cx));
+    begin(cx, &f, 110.0);
+    assert!(!near(&f, cx), "the next take clears it");
+}
+
+#[gpui_kit::test]
+fn clipped_take_row(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // Take 1 reaches full scale; take 2 stays near clipping only.
+    for (value, at) in [(takewise_core::takes::FULL_SCALE, 100.0), (LOUD, 200.0)] {
+        begin(cx, &f, at);
+        f.media.send_value(at + 0.1, 2400, value);
+        settle(cx, &f);
+        f.media.set_now(at + 0.5);
+        press(cx, f.window, &["space"]);
+    }
+    let clipped =
+        |f: &Fixture, cx: &mut TestAppContext| f.view.read_with(cx, |view, _| view.clipped_takes());
+    assert_eq!(clipped(&f, cx), [1], "marked from the recorded peak");
+    let both_checked = |f: &Fixture, cx: &mut TestAppContext| {
+        f.view.read_with(cx, |view, _| {
+            view.line_state()
+                .is_some_and(|line| line.takes.iter().all(|t| t.clipped.is_some()))
+        })
+    };
+    for _ in 0..3000 {
+        frame(cx, f.window);
+        if both_checked(&f, cx) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(clipped(&f, cx), [1], "and from the check");
+    f.view.read_with(cx, |view, _| {
+        let takes = &view.line_state().expect("line").takes;
+        assert_eq!(takes[0].clipped, Some(true));
+        assert_eq!(takes[1].clipped, Some(false));
+    });
+}
+
+#[gpui_kit::test]
+fn h_says_why_monitoring_is_off(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["h"]);
+    let text = message(cx, &f.view);
+    assert!(
+        text.contains("not available yet: monitoring needs a test on your setup")
+            && text.contains("direct monitoring"),
+        "{text}"
+    );
+    begin(cx, &f, 100.0);
+    f.view.update(cx, |view, _| view.message = None);
+    press(cx, f.window, &["h"]);
+    assert_eq!(message(cx, &f.view), "", "H does nothing during a take");
+}
+
+#[gpui_kit::test]
+fn stale_calibration_shows_in_the_panel(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_latency_offset(dir, 25).expect("offset");
+    });
+    let stale = f
+        .view
+        .read_with(cx, |view, _| view.panel.calibration.clone())
+        .expect("stale");
+    assert!(stale.contains("calibrate --write"), "{stale}");
+    let fresh = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        let info = tw::CalibrationInfo {
+            input: DEVICE.to_owned(),
+            output: "MacBook Speakers".to_owned(),
+            buffer_frames: Some(512),
+            date: "2026-11-23".to_owned(),
+        };
+        tw::set_calibration(dir, 25, &info).expect("calibration");
+    });
+    assert_eq!(
+        fresh
+            .view
+            .read_with(cx, |view, _| view.panel.calibration.clone()),
+        None
     );
 }

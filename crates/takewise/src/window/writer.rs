@@ -28,6 +28,8 @@ pub struct Progress {
     pub first_host_s: Option<f64>,
     /// Peak of the last buffer in dBFS, and its host time.
     pub level: Option<(f64, f64)>,
+    /// The highest peak of the take so far in dBFS.
+    pub peak_dbfs: Option<f64>,
     /// Samples durable in the partial WAV (written and flushed).
     pub flushed: u64,
     /// Why the partial WAV could not be written; the audio stays in memory.
@@ -154,7 +156,9 @@ impl State {
         set(progress, |p| {
             p.buffers += 1;
             p.first_host_s = first;
-            p.level = Some((peak_dbfs(&buffer.samples), buffer.host_time_s));
+            let peak = peak_dbfs(&buffer.samples);
+            p.level = Some((peak, buffer.host_time_s));
+            p.peak_dbfs = Some(p.peak_dbfs.map_or(peak, |max| max.max(peak)));
         });
         if self.failed {
             return;

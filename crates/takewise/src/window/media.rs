@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::mpsc::Sender;
 
 use takewise_core::{AvailableInput, Timebase};
-use takewise_media::{Capture, CaptureBuffer, FilmPlayer, Frame, TakePlayer};
+use takewise_media::{
+    Capture, CaptureBuffer, ChannelMeter, DeviceInfo, FilmPlayer, Frame, Monitor, TakePlayer,
+};
 
 /// Everything the window needs from the film player, the take player, the
 /// capture and the host clock. Called on the main thread only.
@@ -50,6 +52,26 @@ pub trait Media {
     /// take's beginning).
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String>;
     fn stop_take(&mut self);
+
+    /// The connected output devices.
+    fn outputs(&self) -> Vec<DeviceInfo>;
+    /// The name of the system's default output device.
+    fn default_output(&self) -> Option<String>;
+    /// Plays the film through the output device with this name.
+    fn film_set_output(&mut self, device: &str) -> Result<(), String>;
+    /// Starts metering every channel of `device` (replacing any meter).
+    fn start_channel_meter(&mut self, device: &str) -> Result<(), String>;
+    fn stop_channel_meter(&mut self);
+    /// Peak of each channel of the metered device in dBFS over the last
+    /// 100 ms; empty without a meter.
+    fn channel_levels(&self) -> Vec<f32>;
+    /// Sets `device`'s nominal sample rate; the error says why not in words.
+    fn set_nominal_rate(&mut self, device: &str, rate: u32) -> Result<(), String>;
+    /// The input buffer size of `device` in frames, when CoreAudio says.
+    fn buffer_frames(&self, device: &str) -> Option<u32>;
+    /// Why software monitoring cannot run at all, if it cannot; the seam
+    /// monitoring plugs into once the hardware spike proved it.
+    fn monitor_unavailable(&self) -> Option<String>;
 }
 
 /// The real media: AVPlayer for the film and takes, cpal for capture.
@@ -57,6 +79,7 @@ pub struct RealMedia {
     film: FilmPlayer,
     take: Option<TakePlayer>,
     capture: Option<Capture>,
+    meter: Option<ChannelMeter>,
 }
 
 impl RealMedia {
@@ -67,6 +90,7 @@ impl RealMedia {
             film,
             take: None,
             capture: None,
+            meter: None,
         })
     }
 
@@ -173,5 +197,46 @@ impl Media for RealMedia {
         if let Some(take) = &self.take {
             take.stop();
         }
+    }
+
+    fn outputs(&self) -> Vec<DeviceInfo> {
+        takewise_media::output_devices().unwrap_or_default()
+    }
+
+    fn default_output(&self) -> Option<String> {
+        takewise_media::default_output().ok().map(|d| d.name)
+    }
+
+    fn film_set_output(&mut self, device: &str) -> Result<(), String> {
+        self.set_output_device(device)
+    }
+
+    fn start_channel_meter(&mut self, device: &str) -> Result<(), String> {
+        self.meter = None;
+        self.meter = Some(ChannelMeter::start(device).map_err(|err| err.to_string())?);
+        Ok(())
+    }
+
+    fn stop_channel_meter(&mut self) {
+        self.meter = None;
+    }
+
+    fn channel_levels(&self) -> Vec<f32> {
+        self.meter
+            .as_ref()
+            .map(ChannelMeter::levels)
+            .unwrap_or_default()
+    }
+
+    fn set_nominal_rate(&mut self, device: &str, rate: u32) -> Result<(), String> {
+        takewise_media::set_nominal_sample_rate(device, rate).map_err(|err| err.to_string())
+    }
+
+    fn buffer_frames(&self, device: &str) -> Option<u32> {
+        takewise_media::buffer_frames(device).ok()
+    }
+
+    fn monitor_unavailable(&self) -> Option<String> {
+        Monitor::available().err().map(|err| err.to_string())
     }
 }

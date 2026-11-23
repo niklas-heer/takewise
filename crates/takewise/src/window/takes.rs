@@ -27,8 +27,14 @@ pub fn label(take: &TakeState, checking: bool) -> (String, u32) {
     }
 }
 
-/// `checking`: the line's takes whose check is running or queued.
-pub fn takes(line: Option<&LineState>, selected: Option<u32>, checking: &[u32]) -> AnyElement {
+/// `checking`: the line's takes whose check is running or queued;
+/// `clipped`: those whose samples reached the clipping threshold.
+pub fn takes(
+    line: Option<&LineState>,
+    selected: Option<u32>,
+    checking: &[u32],
+    clipped: &[u32],
+) -> AnyElement {
     let Some(line) = line else {
         return div().into_any_element();
     };
@@ -87,7 +93,10 @@ pub fn takes(line: Option<&LineState>, selected: Option<u32>, checking: &[u32]) 
                                 .flex()
                                 .gap(px(10.))
                                 .child(format!("{}", take.take))
-                                .child(div().text_color(rgb(color)).child(text)),
+                                .child(div().text_color(rgb(color)).child(text))
+                                .when(clipped.contains(&take.take), |el| {
+                                    el.child(div().text_color(rgb(colors::RECORD)).child("clipped"))
+                                }),
                         )
                         .child(div().text_color(rgb(colors::ACCENT)).child(star)),
                 )
