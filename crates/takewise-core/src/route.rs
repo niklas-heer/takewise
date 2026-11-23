@@ -92,6 +92,19 @@ pub fn calibration_stale(config: &ProjectConfig, current: &Route) -> Option<Stri
     })
 }
 
+/// The latency offset to apply on `current`, in ms, and whether the
+/// calibration is stale there: `[input] latency_offset_ms` only while
+/// [`calibration_stale`] finds the calibration still fits the route (the
+/// same input, output and buffer), else `(0, true)`. An offset measured on
+/// other devices would shift takes by the wrong amount, so none applies
+/// until `takewise calibrate --write` runs on this route.
+pub fn effective_latency_offset(config: &ProjectConfig, current: &Route) -> (i32, bool) {
+    match calibration_stale(config, current) {
+        Some(_) => (0, true),
+        None => (config.input.latency_offset_ms, false),
+    }
+}
+
 /// Why the setup check does not cover `current`: it never ran, or the
 /// devices or channel differ from the ones it checked.
 pub fn setup_warning(config: &ProjectConfig, current: &Route) -> Option<String> {
@@ -224,6 +237,32 @@ mod tests {
         let output = calibration_stale(&config, &route("Duo Main", Some("Speakers"), Some(512)))
             .expect("stale on another output");
         assert!(output.contains("output \"Speakers\""), "{output}");
+    }
+
+    #[test]
+    fn the_offset_applies_only_on_its_route() {
+        let config = config();
+        let same = route("Duo Main", Some("Duo Main"), Some(512));
+        assert_eq!(effective_latency_offset(&config, &same), (7, false));
+        // Another input, output or buffer: no offset, and stale.
+        for other in [
+            route("MacBook Mic", Some("Duo Main"), Some(512)),
+            route("Duo Main", Some("Speakers"), Some(512)),
+            route("Duo Main", Some("Duo Main"), Some(128)),
+        ] {
+            assert_eq!(
+                effective_latency_offset(&config, &other),
+                (0, true),
+                "{other:?}"
+            );
+        }
+        // An offset from before calibrations were recorded does not apply.
+        let mut legacy = config.clone();
+        legacy.calibration = None;
+        assert_eq!(effective_latency_offset(&legacy, &same), (0, true));
+        // No calibration and no offset: nothing to apply, nothing stale.
+        legacy.input.latency_offset_ms = 0;
+        assert_eq!(effective_latency_offset(&legacy, &same), (0, false));
     }
 
     #[test]

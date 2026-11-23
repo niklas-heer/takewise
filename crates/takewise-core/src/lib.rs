@@ -50,7 +50,8 @@ pub use project::{
     OutputConfig, Processing, Project, ProjectConfig, RecordConfig, SetupInfo,
 };
 pub use route::{
-    Route, calibration_stale, load_defaults, save_defaults, settings_path, setup_warning,
+    Route, calibration_stale, effective_latency_offset, load_defaults, save_defaults,
+    settings_path, setup_warning,
 };
 pub use run_check::{Unchecked, check_take, checker, unchecked_takes, words_not_checked_takes};
 pub use script::{Line, Problem, Script, validate};
