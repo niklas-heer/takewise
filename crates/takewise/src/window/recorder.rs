@@ -381,9 +381,10 @@ impl Recorder {
     }
 
     /// Stops the take and commits it. A take without any audio is dropped
-    /// (nothing was begun on disk); one whose film could not be scheduled
-    /// is placed where the film should have played, and flagged. When the take cannot be saved, it is
-    /// kept in memory and saving is retried; the error says so.
+    /// (nothing was begun on disk); one whose film could not be scheduled,
+    /// or was stopped before it was, is placed where the film would have
+    /// played, and flagged. When the take cannot be saved, it is kept in
+    /// memory and saving is retried; the error says so.
     pub fn finish_take(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
         let Phase::Recording(take) = mem::replace(&mut self.phase, Phase::Idle) else {
             return Update::default();
@@ -397,25 +398,29 @@ impl Recorder {
             channel,
             latency_s,
             offset_ms,
-            clock,
+            plan,
+            capture_started_host_s,
+            mut clock,
             writer,
             partial,
             film_ended_host_s,
             ..
         } = *take;
         let written = writer.finish();
+        // Stopped after audio arrived but before a frame scheduled the film:
+        // the audio is placed by the mapping the film would have had, had it
+        // been scheduled when the first buffer arrived.
+        let estimated = !written.samples.is_empty() && !clock.placed();
+        if estimated {
+            let first = written.first_host_s.unwrap_or(capture_started_host_s);
+            clock.assume(first, plan.film_from_s, plan.hold_first_frame_s);
+        }
         let unplayed_s = clock.unplayed_lateness_s(media, media.host_now_s());
         media.film_pause();
         media.film_seek(self.park_s);
         self.level = None;
         if written.samples.is_empty() {
             return Update::default();
-        }
-        if !clock.placed() {
-            return Update {
-                message: Some("Stopped before the film started; nothing was recorded.".to_owned()),
-                ..Update::default()
-            };
         }
         // Placed with the film's timebase as read back (a late start moves
         // the take), by the same mapping the calibration measures.
@@ -435,15 +440,21 @@ impl Recorder {
         });
         let dropouts = dropout_note(&written.dropouts, first_film_s);
         let take_peak = peak_dbfs(&written.samples);
-        let shift_note = film_shift_ms.map(|ms| {
-            if unplayed_s.is_some() {
+        let shift_note = if estimated {
+            Some("Stopped before the film started; placement estimated.".to_owned())
+        } else {
+            film_shift_ms.map(|ms| {
+                if unplayed_s.is_some() {
                 format!(
                     "The film did not play during the take; its placement may be off by {ms:.0} ms."
                 )
-            } else {
-                format!("The film stalled during the take; placement may be off by {ms:.0} ms.")
-            }
-        });
+                } else {
+                    format!(
+                        "The film stalled during the take; placement may be off by {ms:.0} ms."
+                    )
+                }
+            })
+        };
         // The take keeps its film position: placed against the line's slot
         // as it is now, which M or an agent may have moved during the take.
         // The text stays the one read during the take, so an edit made

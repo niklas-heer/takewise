@@ -1308,6 +1308,40 @@ fn a_film_that_cannot_play_keeps_the_audio_as_a_take(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn stopping_before_the_film_was_scheduled_keeps_the_audio(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0, pre-roll from 6.0
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    // The first buffer arrives, but the window stops (Space, or closing)
+    // before a frame scheduled the film.
+    f.media.send(100.05, 2400);
+    settle(cx, &f);
+    f.media.set_now(100.06);
+    f.view.update(cx, |view, _| view.finish_take());
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "the audio is kept as a take");
+    let event = &takes[0].2;
+    assert_eq!(event.samples, 2400);
+    // Placed as the film would have been scheduled when the first buffer
+    // arrived: film 6.0 at host 100.35, so the first sample (host 100.0)
+    // is film 5.65, 2.35 s before the line.
+    assert!(
+        close(event.line_offset_s, -2.35),
+        "placed by the estimated mapping: {}",
+        event.line_offset_s
+    );
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("Stopped before the film started; placement estimated."),
+        "{shown}"
+    );
+    assert!(!shown.contains("nothing was recorded"), "{shown}");
+    assert!(shown.contains("Recorded d take 1"), "{shown}");
+}
+
+#[gpui_kit::test]
 fn a_stall_during_the_take_is_recorded(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     press(cx, f.window, &["down", "down", "down"]); // d
