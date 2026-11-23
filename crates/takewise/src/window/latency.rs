@@ -184,7 +184,7 @@ impl RecordingWindow {
         self.reload();
         self.check_inputs();
         Ok(format!(
-            "{placed}. Stored latency_offset_ms = {offset} for {} and {}.",
+            "{placed}. Stored latency_offset_ms = {offset} for {} and {}. Press Enter to finish.",
             measurement.input, measurement.output
         ))
     }

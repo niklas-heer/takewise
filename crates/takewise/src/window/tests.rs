@@ -3177,6 +3177,7 @@ fn setup_check_calibrates_the_latency(cx: &mut TestAppContext) {
     let latency = setup_of(cx, &f).latency.expect("an outcome");
     let stored = latency.expect("calibrated");
     assert!(stored.contains("latency_offset_ms = -30"), "{stored}");
+    assert!(stored.ends_with("Press Enter to finish."), "{stored}");
     let config = Project::open(&f.dir).expect("project").config;
     assert_eq!(config.input.latency_offset_ms, -30);
     let cal = config.calibration.expect("[calibration]");
