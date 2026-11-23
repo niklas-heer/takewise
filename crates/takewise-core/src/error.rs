@@ -33,6 +33,12 @@ pub enum Error {
     },
     #[error("no Takewise project at {} (missing project.toml)", .0.display())]
     NotAProject(PathBuf),
+    #[error("{0}")]
+    MissingFfmpeg(String),
+    #[error("ffmpeg failed: {0}")]
+    Ffmpeg(String),
+    #[error("{0}")]
+    ExportSetting(String),
 }
 
 impl Error {
@@ -48,6 +54,9 @@ impl Error {
             Error::UnknownLine(_) => "unknown-line",
             Error::UnknownTake { .. } => "unknown-take",
             Error::MissingFile { .. } => "missing-file",
+            Error::MissingFfmpeg(_) => "missing-tool",
+            Error::Ffmpeg(_) => "ffmpeg-failed",
+            Error::ExportSetting(_) => "bad-export-setting",
         }
     }
 }

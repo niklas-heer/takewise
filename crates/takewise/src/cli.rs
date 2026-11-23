@@ -131,13 +131,8 @@ enum Command {
         #[arg(long, default_value = "narrator")]
         by: String,
     },
-    /// Write export/narration.wav and export/manifest.json.
-    Export {
-        dir: PathBuf,
-        /// Use the proposed take for lines without a chosen one.
-        #[arg(long)]
-        use_proposed: bool,
-    },
+    /// Write export/narration.wav (or .flac) and export/manifest.json.
+    Export(ExportArgs),
     /// Check whisper-cli (with a 1 s transcription), the whisper model,
     /// ffmpeg, ffprobe, the film and the audio devices.
     Doctor { dir: Option<PathBuf> },
@@ -324,7 +319,7 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
                 format!("Chose {line} take {take} ({by})"),
             ))
         }
-        Command::Export { dir, use_proposed } => export(&dir, use_proposed),
+        Command::Export(args) => export(&args),
         Command::Doctor { dir } => Ok(doctor(dir.as_deref())),
     }
 }
@@ -338,6 +333,14 @@ fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
     })?;
     let info = film::probe(&film_path)?;
     let project = Project::init(dir, &film_path, info)?;
+    // New projects export clean (a project without `[export]` stays raw).
+    tw::set_export(
+        dir,
+        &tw::ExportConfig {
+            processing: tw::Processing::Clean,
+            ..tw::ExportConfig::default()
+        },
+    )?;
     let mut text = format!(
         "Created {} for {} ({:.1} s). Write the lines into script.toml.",
         dir.display(),
@@ -577,15 +580,81 @@ fn script_set(
     ))
 }
 
-fn export(dir: &Path, use_proposed: bool) -> Result<Outcome, CliError> {
-    let report = tw::export(dir, &ExportOptions { use_proposed })?;
+#[derive(Debug, clap::Args)]
+pub struct ExportArgs {
+    dir: PathBuf,
+    /// Use the proposed take for lines without a chosen one.
+    #[arg(long)]
+    use_proposed: bool,
+    /// The narration file's format (overrides `[export] format`).
+    #[arg(long, value_enum)]
+    format: Option<FormatArg>,
+    /// Bits per sample (overrides `[export] bit_depth`); 16 is dithered.
+    #[arg(long, value_parser = ["16", "24"])]
+    bit_depth: Option<String>,
+    /// The narration's sample rate (overrides `[export] sample_rate`).
+    #[arg(long, value_parser = ["48000", "44100"])]
+    sample_rate: Option<String>,
+    /// `raw` places the takes as recorded; `clean` filters them and sets the
+    /// loudness to -16 LUFS (overrides `[export] processing`).
+    #[arg(long, value_enum)]
+    processing: Option<ProcessingArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum FormatArg {
+    Wav,
+    Flac,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProcessingArg {
+    Raw,
+    Clean,
+}
+
+impl ExportArgs {
+    fn options(&self) -> ExportOptions {
+        ExportOptions {
+            use_proposed: self.use_proposed,
+            format: self.format.map(|f| match f {
+                FormatArg::Wav => tw::ExportFormat::Wav,
+                FormatArg::Flac => tw::ExportFormat::Flac,
+            }),
+            bit_depth: self.bit_depth.as_deref().and_then(|b| b.parse().ok()),
+            sample_rate: self.sample_rate.as_deref().and_then(|r| r.parse().ok()),
+            processing: self.processing.map(|p| match p {
+                ProcessingArg::Raw => tw::Processing::Raw,
+                ProcessingArg::Clean => tw::Processing::Clean,
+            }),
+        }
+    }
+}
+
+fn export(args: &ExportArgs) -> Result<Outcome, CliError> {
+    let dir = args.dir.as_path();
+    let report = tw::export(dir, &args.options())?;
     if report.refused.is_empty() {
-        let narration = dir.join("export/narration.wav");
+        let narration = dir.join("export").join(&report.narration);
         let mut text = format!(
-            "Wrote {} ({} line(s))\n",
+            "Wrote {} ({} line(s))",
             narration.display(),
             report.lines.len()
         );
+        if let Some(settings) = &report.settings {
+            let _ = write!(
+                text,
+                ": {} {} Hz {}-bit {}",
+                settings.processing.as_str(),
+                settings.sample_rate,
+                settings.bit_depth,
+                settings.format.extension()
+            );
+            if let (Some(lufs), Some(peak)) = (settings.loudness_lufs, settings.true_peak_dbtp) {
+                let _ = write!(text, ", {lufs:.1} LUFS, true peak {peak:.1} dBTP");
+            }
+        }
+        text.push('\n');
         for w in &report.warnings {
             let _ = writeln!(text, "warning: {}: {} ({})", w.line, w.message, w.code);
         }
@@ -593,6 +662,7 @@ fn export(dir: &Path, use_proposed: bool) -> Result<Outcome, CliError> {
             json!({
                 "narration": narration,
                 "manifest": dir.join("export/manifest.json"),
+                "settings": report.settings,
                 "lines": report.lines,
                 "warnings": report.warnings,
             }),

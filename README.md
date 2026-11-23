@@ -27,7 +27,7 @@ takewise status promo.takewise                          # lines, takes, verdicts
 takewise script set promo.takewise hook --start 1.5     # change one field of one line, keeping comments
 takewise judge promo.takewise hook 2 --verdict keep --reason "clear, warm" --by claude-opus-5-5 --score 0.8
 takewise choose promo.takewise hook 2 --by claude-opus-5-5
-takewise export promo.takewise                          # export/narration.wav and export/manifest.json
+takewise export promo.takewise                          # export/narration.wav (or .flac) and export/manifest.json
 takewise record promo.takewise                          # open the recording window in Takewise.app
 takewise calibrate promo.takewise --write               # loopback test: store latency_offset_ms
 takewise doctor promo.takewise                          # tools, the model, the film, input devices and the output
@@ -35,7 +35,7 @@ takewise doctor promo.takewise                          # tools, the model, the 
 
 - `status --strict` exits 1 while a line has no chosen take or any problem exists; `--repair` adopts takes a crash left without a ledger event; `--refresh-film` re-measures a film that changed. Notices, which do not fail `--strict`, include `calibration-stale` (the input, the output or the capture buffer differs from the ones the latency was measured on) and `no-setup` (no setup check has run yet; the check arrives in milestone 4b).
 - `script set` takes exactly one of `--text`, `--start`, `--end`, `--note`, `--clear-end` and `--clear-note`. Pass `--expect <script_version>` from `status --json` to refuse the edit if the script changed since you read it.
-- `export` uses each line's chosen take and refuses, naming the lines, when one has none, when a take has no detectable speech, or when two lines overlap. `--use-proposed` fills unchosen lines with the proposed take.
+- `export` uses each line's chosen take and refuses, naming the lines, when one has none, when a take has no detectable speech, or when two lines overlap. `--use-proposed` fills unchosen lines with the proposed take. `[export]` in `project.toml` sets the file, and `--format wav|flac`, `--bit-depth 16|24`, `--sample-rate 48000|44100` and `--processing raw|clean` override it for one export. `raw` places the takes as recorded. `clean`, the default for projects made by `init`, high-passes each take at 80 Hz, reduces its noise by 10 dB when a room tone from the setup check matches it (the manifest says per line when and why it did not), and sets one static gain: −16 LUFS integrated, lowered when the true peak would rise above −1 dBTP; the manifest records the measured loudness and true peak of the final file. Takes are never changed. 16-bit files are dithered. `ffmpeg` is needed for `clean`, 44.1 kHz and FLAC; `raw` WAV at 48 kHz works without it. A project without `[export]` exports 48 kHz 24-bit WAV, `raw`. Only one narration file sits beside the manifest: switching the format removes the other.
 - `record` refuses a script with validation problems (exit 1) and exits 2 when no `Takewise.app` is found. In the window: Space records or stops a take of the current line (pre-roll, a count-in, the line filling at an even pace across its slot), Enter chooses the selected take, R records another, P plays the line in context with the take locked to the film, M sets the line's start to the playhead while the film plays, E edits the line's text, ↑/↓ move between lines and ←/→ between takes. A line longer than three rows scrolls with the pace guide, keeping the current words on the middle row. The audio keys are described [below](#sound-the-audio-panel-and-meters). The window records only from the project's `[input] device` at 48 kHz and says why when it cannot. It reloads when `script.toml` or `takes.jsonl` change, and refuses an edit made against a script that changed on disk. Closing it mid-take keeps the take.
 - `calibrate` plays ten short beeps (made with `ffmpeg`) with seeks through the default output, or `--output <device>`, while the project's input records them in Takewise.app; hold the headphones to the microphone. It prints where the beeps landed (mean and standard deviation in ms) and with `--write` stores the offset that cancels the mean in `[input] latency_offset_ms`, with the input, output and capture buffer size it was measured on in `[calibration]`, keeping `project.toml`'s comments. Without `--output` it plays through the project's `[output] device`, else the system output. Fewer than six detected beeps exits 1. Calibrate again whenever `status` or the audio panel says the calibration is stale.
 - `doctor` lists the input devices with their sample rates and channels, checks the project's input device (chosen, connected, at 48 kHz), and warns when the output is Bluetooth.
@@ -54,13 +54,13 @@ Press **A** in the recording window for the audio panel. It also opens by itself
 
 ## Placing the narration in DaVinci Resolve
 
-`export/narration.wav` is 48 kHz mono 24-bit PCM, starts at the film's first frame and is exactly as long as the film. Takewise has no Resolve code; an agent with Resolve tools places it:
+The narration file (`export/narration.wav` or `.flac`, mono, at the manifest's `sample_rate` and `bit_depth`) starts at the film's first frame and is exactly as long as the film. Takewise has no Resolve code; an agent with Resolve tools places it:
 
-1. Import `export/narration.wav` into the media pool.
-2. Add a new mono audio track to the film's timeline and place the WAV at the timeline's start (the film's first frame), so sample 0 lines up with frame 0.
+1. Import the narration file named in the manifest's `narration.file` into the media pool.
+2. Add a new mono audio track to the film's timeline and place it at the timeline's start (the film's first frame), so sample 0 lines up with frame 0.
 3. For each entry in `export/manifest.json` under `lines`, add a timeline marker at `speech_film_s[0]` with the line's `id` as its name and `text` as its note.
 
-To place takes individually instead, put each line's `take_file` on the track at `dest_samples[0] / 48000` seconds and trim it to `source_samples`; the positions in the manifest are exact sample offsets.
+To place takes individually instead, put each line's `take_file` (always the raw original at 48 kHz) on the track at `dest_samples[0] / sample_rate` seconds and trim it to `source_samples` (take samples at `source_sample_rate`, 48 kHz); the positions in the manifest are exact sample offsets.
 
 ## License
 

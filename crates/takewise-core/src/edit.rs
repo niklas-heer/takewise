@@ -12,8 +12,8 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
 use crate::project::{
-    CalibrationInfo, FilmInfo, PROJECT_FILE, SCRIPT_FILE, SetupInfo, parse_script, read_config,
-    read_script_bytes,
+    CalibrationInfo, ExportConfig, FilmInfo, PROJECT_FILE, SCRIPT_FILE, SetupInfo, parse_script,
+    read_config, read_script_bytes,
 };
 use crate::script::validate;
 
@@ -213,6 +213,35 @@ pub fn set_setup(dir: &Path, info: &SetupInfo) -> Result<()> {
             setup,
             "speech_to_noise_db",
             info.speech_to_noise_db.map(|db| Value::from(round_db(db))),
+        );
+        Ok(())
+    })
+}
+
+/// Writes `[export]` under the lock, keeping the file's comments and
+/// layout.
+pub fn set_export(dir: &Path, config: &ExportConfig) -> Result<()> {
+    edit_project(dir, |doc| {
+        let export = table(doc, "export")?;
+        set_value(
+            export,
+            "format",
+            Some(Value::from(config.format.extension())),
+        );
+        set_value(
+            export,
+            "bit_depth",
+            Some(Value::from(i64::from(config.bit_depth))),
+        );
+        set_value(
+            export,
+            "sample_rate",
+            Some(Value::from(i64::from(config.sample_rate))),
+        );
+        set_value(
+            export,
+            "processing",
+            Some(Value::from(config.processing.as_str())),
         );
         Ok(())
     })

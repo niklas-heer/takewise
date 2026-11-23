@@ -11,6 +11,7 @@ pub mod ffmpeg;
 pub mod fsutil;
 pub mod ledger;
 pub mod project;
+pub mod render;
 pub mod room;
 pub mod route;
 pub mod run_check;
@@ -28,12 +29,13 @@ pub mod words;
 
 pub use check::Transcript;
 pub use edit::{
-    Field, ScriptVersion, script_version, set_calibration, set_film_info, set_latency_offset,
-    set_line_field, set_route, set_setup, set_volumes,
+    Field, ScriptVersion, script_version, set_calibration, set_export, set_film_info,
+    set_latency_offset, set_line_field, set_route, set_setup, set_volumes,
 };
 pub use error::{Error, Result};
 pub use export::{
-    ExportOptions, ExportReport, ExportWarning, ManifestLine, ManifestWord, Refusal, export,
+    ExportOptions, ExportReport, ExportSettings, ExportWarning, ManifestLine, ManifestWord,
+    Refusal, export, narration_file,
 };
 pub use fsutil::{ProjectLock, lock, write_atomic};
 pub use ledger::{
@@ -41,8 +43,8 @@ pub use ledger::{
     WordDiff, WordDiffKind, append, read,
 };
 pub use project::{
-    CalibrationInfo, CheckConfig, FilmInfo, InputConfig, MonitorConfig, OutputConfig, Project,
-    ProjectConfig, RecordConfig, SetupInfo,
+    CalibrationInfo, CheckConfig, ExportConfig, ExportFormat, FilmInfo, InputConfig, MonitorConfig,
+    OutputConfig, Processing, Project, ProjectConfig, RecordConfig, SetupInfo,
 };
 pub use route::{
     Route, calibration_stale, load_defaults, save_defaults, settings_path, setup_warning,

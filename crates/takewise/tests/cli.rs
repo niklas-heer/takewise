@@ -207,7 +207,13 @@ fn choose_then_export_writes_wav_and_manifest() {
     assert_eq!(data["lines"][0]["chosen"]["take"], 1);
     assert_eq!(data["lines"][0]["chosen"]["by"], "claude");
 
-    let (code, value) = json(takewise().arg("export").arg(&dir));
+    // New projects export clean; raw needs no ffmpeg.
+    let (code, value) = json(
+        takewise()
+            .arg("export")
+            .arg(&dir)
+            .args(["--processing", "raw"]),
+    );
     assert_eq!(code, 0, "{value}");
     assert!(dir.join("export/narration.wav").is_file());
     let manifest: Value =
@@ -224,7 +230,12 @@ fn choose_then_export_writes_wav_and_manifest() {
         .args(["hook", "--text", "Hi there."])
         .assert()
         .success();
-    let (code, value) = json(takewise().arg("export").arg(&dir));
+    let (code, value) = json(
+        takewise()
+            .arg("export")
+            .arg(&dir)
+            .args(["--processing", "raw"]),
+    );
     assert_eq!(code, 0, "{value}");
     assert_eq!(
         value["data"]["warnings"][0]["code"],
@@ -233,6 +244,7 @@ fn choose_then_export_writes_wav_and_manifest() {
     takewise()
         .arg("export")
         .arg(&dir)
+        .args(["--processing", "raw"])
         .assert()
         .success()
         .stdout(predicate::str::contains("recorded-against-old-text"));
@@ -249,6 +261,54 @@ fn choose_then_export_writes_wav_and_manifest() {
         .args(["nope", "1"])
         .assert()
         .code(2);
+}
+
+#[test]
+fn export_flags_override_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    // A new project exports clean.
+    let config = fs::read_to_string(dir.join("project.toml")).unwrap();
+    assert!(config.contains("[export]"), "{config}");
+    assert!(config.contains("processing = \"clean\""), "{config}");
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    record_take(&dir, "hook");
+    takewise()
+        .arg("choose")
+        .arg(&dir)
+        .args(["hook", "1"])
+        .assert()
+        .success();
+    let (code, value) = json(
+        takewise()
+            .arg("export")
+            .arg(&dir)
+            .args(["--processing", "raw", "--bit-depth", "16"])
+            .args(["--format", "wav", "--sample-rate", "48000"]),
+    );
+    assert_eq!(code, 0, "{value}");
+    let settings = &value["data"]["settings"];
+    assert_eq!(settings["processing"], "raw", "{value}");
+    assert_eq!(settings["bit_depth"], 16, "{value}");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["processing"], "raw");
+    assert_eq!(manifest["bit_depth"], 16);
+    // A 16-bit PCM WAV header: bits per sample at byte 34.
+    let wav = fs::read(dir.join("export/narration.wav")).unwrap();
+    assert_eq!(&wav[12..16], b"fmt ");
+    assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+    // The config is not changed by the flags.
+    let config = fs::read_to_string(dir.join("project.toml")).unwrap();
+    assert!(config.contains("processing = \"clean\""), "{config}");
+    // Values outside the supported set are usage errors.
+    let (code, _) = json(
+        takewise()
+            .arg("export")
+            .arg(&dir)
+            .args(["--sample-rate", "96000"]),
+    );
+    assert_eq!(code, 2);
 }
 
 #[test]

@@ -1,4 +1,8 @@
-//! Export: one narration WAV aligned to the film's first frame, and a manifest.
+//! Export: one narration file (WAV or FLAC) aligned to the film's first
+//! frame, and a manifest. `raw` places the takes as recorded; `clean`
+//! filters each take and sets one static gain for the loudness (see
+//! `docs/design.md`, "Export and Resolve handoff" and "Export cleanup and
+//! formats").
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -10,16 +14,20 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::check::speech_onset;
+use crate::clean::{Cleaner, NOISE_REDUCTION_DB, find_room_tone};
 use crate::error::{Error, Result, io};
+use crate::ffmpeg::{Ffmpeg, read_float_wav};
 use crate::fsutil::{lock, rename_temp, write_temp};
 use crate::ledger::{Checked, EventKind, Ledger, Verdict, read};
-use crate::project::Project;
+use crate::project::{ExportConfig, ExportFormat, Processing, Project};
+use crate::render::{self, Loudness, MAX_TRUE_PEAK_DBTP, SOURCE_RATE, Target, UNIT};
 use crate::script::{Line, validate};
 use crate::speech::analyze;
 use crate::state::{State, fold};
-use crate::takes::{encode_wav, read_take_wav};
+use crate::takes::read_take_wav;
 
 pub const EXPORT_DIR: &str = "export";
+/// The narration file as a 48 kHz WAV; see [`narration_file`].
 pub const NARRATION_FILE: &str = "narration.wav";
 pub const MANIFEST_FILE: &str = "manifest.json";
 /// Audio kept on either side of the detected speech.
@@ -33,15 +41,78 @@ const TIGHT_GAP_S: f64 = 0.020;
 pub struct ExportOptions {
     /// Use the proposed take for lines without a chosen one.
     pub use_proposed: bool,
+    /// Override `[export]` (or its defaults) for this export.
+    pub format: Option<ExportFormat>,
+    pub bit_depth: Option<u16>,
+    pub sample_rate: Option<u32>,
+    pub processing: Option<Processing>,
+}
+
+impl ExportOptions {
+    /// The settings in effect: these options over `[export]`, over the
+    /// defaults (48 kHz 24-bit WAV, `raw`).
+    pub fn settings(&self, config: Option<&ExportConfig>) -> Result<ExportConfig> {
+        let base = config.copied().unwrap_or_default();
+        let settings = ExportConfig {
+            format: self.format.unwrap_or(base.format),
+            bit_depth: self.bit_depth.unwrap_or(base.bit_depth),
+            sample_rate: self.sample_rate.unwrap_or(base.sample_rate),
+            processing: self.processing.unwrap_or(base.processing),
+        };
+        if ![16, 24].contains(&settings.bit_depth) {
+            return Err(Error::ExportSetting(format!(
+                "bit depth {} is not supported; use 16 or 24",
+                settings.bit_depth
+            )));
+        }
+        if ![48_000, 44_100].contains(&settings.sample_rate) {
+            return Err(Error::ExportSetting(format!(
+                "sample rate {} is not supported; use 48000 or 44100",
+                settings.sample_rate
+            )));
+        }
+        Ok(settings)
+    }
+}
+
+/// The narration file's name for a format: `narration.wav` or
+/// `narration.flac`.
+pub fn narration_file(format: ExportFormat) -> String {
+    format!("narration.{}", format.extension())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ExportReport {
+    /// The narration file written, relative to the export directory;
+    /// empty when refused.
+    pub narration: String,
+    /// The settings it was written with; `None` when refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<ExportSettings>,
     pub lines: Vec<ManifestLine>,
     /// Why nothing was written; empty on success.
     pub refused: Vec<Refusal>,
     /// Exported, but worth a look; also listed in the manifest.
     pub warnings: Vec<ExportWarning>,
+}
+
+/// How the narration file was written, as the manifest states it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExportSettings {
+    pub processing: Processing,
+    pub format: ExportFormat,
+    pub sample_rate: u32,
+    /// The takes' rate, which source ranges count in.
+    pub source_sample_rate: u32,
+    pub bit_depth: u16,
+    /// Integrated loudness and true peak of the final file (`clean`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loudness_lufs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub true_peak_dbtp: Option<f64>,
+    /// The static gain `clean` applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -65,9 +136,10 @@ pub struct ManifestLine {
     pub take_file: String,
     /// Who chose the take, or `proposed`.
     pub chosen_by: String,
-    /// Half-open sample range taken from the take.
+    /// Half-open sample range taken from the take, at the take's rate.
     pub source_samples: [u64; 2],
-    /// Half-open sample range in `narration.wav`.
+    /// Half-open sample range in the narration file, at its rate
+    /// (`round(n × rate / 48000)` of the range at 48 kHz).
     pub dest_samples: [u64; 2],
     /// Detected speech start and end in film seconds, clamped to the film;
     /// a `speech-cropped` warning gives the unclamped values. The start is
@@ -78,6 +150,10 @@ pub struct ManifestLine {
     /// against the line as it is now; absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub words_film_s: Option<Vec<ManifestWord>>,
+    /// `clean` only: the noise reduction the take got, or why it was
+    /// skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_reduction: Option<String>,
 }
 
 /// A transcribed word placed in the film.
@@ -93,9 +169,10 @@ pub struct ManifestWord {
 struct Manifest<'a> {
     v: u32,
     film: ManifestFilm<'a>,
-    /// The WAV this manifest describes; a mismatch means the pair is torn.
+    /// The file this manifest describes; a mismatch means the pair is torn.
     narration: ManifestNarration,
-    sample_rate: u32,
+    #[serde(flatten)]
+    settings: ExportSettings,
     lines: &'a [ManifestLine],
     warnings: &'a [ExportWarning],
 }
@@ -103,7 +180,7 @@ struct Manifest<'a> {
 #[derive(Serialize)]
 struct ManifestNarration {
     /// Relative to the manifest.
-    file: &'static str,
+    file: String,
     size: u64,
     sha256: String,
 }
@@ -119,7 +196,11 @@ struct ManifestFilm<'a> {
 /// A take ready to be mixed in.
 struct Placed {
     line: ManifestLine,
-    samples: Vec<i32>,
+    /// The take (or its cleaned copy) at 48 kHz, in 24-bit units.
+    samples: Vec<f64>,
+    take: u32,
+    /// The take's pre-roll noise floor, for matching a room tone.
+    floor_dbfs: f64,
     /// Source start and destination start and end, after cropping.
     src: usize,
     dest: (usize, usize),
@@ -174,16 +255,106 @@ pub fn export(dir: &Path, opts: &ExportOptions) -> Result<ExportReport> {
     let project = Project::open(dir)?;
     let ledger = read(dir)?;
     let state = fold(&project, &ledger);
-    export_locked(&project, &ledger, &state, opts.use_proposed)
+    export_locked(&project, &ledger, &state, opts)
 }
 
 fn export_locked(
     project: &Project,
     ledger: &Ledger,
     state: &State,
-    use_proposed: bool,
+    opts: &ExportOptions,
 ) -> Result<ExportReport> {
+    let settings = opts.settings(project.config.export.as_ref())?;
+    let use_proposed = opts.use_proposed;
     let dir = project.dir.join(EXPORT_DIR);
+    let (mut placed, tight, refused) = gather(project, ledger, state, use_proposed);
+    if !refused.is_empty() {
+        remove_if_present(&dir.join(MANIFEST_FILE))?;
+        return Ok(ExportReport {
+            refused,
+            ..ExportReport::default()
+        });
+    }
+
+    let ffmpeg = ffmpeg_for(settings)?;
+    if settings.processing == Processing::Clean {
+        let ffmpeg = ffmpeg.as_ref().ok_or_else(|| missing_ffmpeg(settings))?;
+        clean_takes(project, ledger, &mut placed, ffmpeg)?;
+    }
+    let film_len = to_usize(seconds_to_samples(
+        project.film_duration(),
+        project.config.sample_rate,
+    ));
+    let mixed = mix(&placed, film_len, project.config.sample_rate);
+    let target = Target {
+        sample_rate: settings.sample_rate,
+        bit_depth: settings.bit_depth,
+        format: settings.format,
+    };
+    fs::create_dir_all(&dir).map_err(io(&dir))?;
+    let file = narration_file(settings.format);
+    let narration_path = dir.join(&file);
+    let (narration_temp, report) =
+        render_narration(&mixed, settings, target, ffmpeg.as_ref(), &narration_path)?;
+    let narration = match describe_file(&narration_temp, &file) {
+        Ok(narration) => narration,
+        Err(err) => {
+            let _ = fs::remove_file(&narration_temp);
+            return Err(io(&narration_path)(err));
+        }
+    };
+
+    let mut warnings = warnings(&placed, project.film_duration());
+    warnings.extend(tight);
+    let lines: Vec<ManifestLine> = placed
+        .into_iter()
+        .map(|p| {
+            let mut line = p.line;
+            line.dest_samples = line
+                .dest_samples
+                .map(|n| render::at_rate(n, settings.sample_rate));
+            line
+        })
+        .collect();
+    let info = &project.config.film_info;
+    let manifest = Manifest {
+        v: 1,
+        film: ManifestFilm {
+            path: project.film_path().display().to_string(),
+            duration_s: info.duration_s,
+            size: info.size,
+            modified: &info.modified,
+        },
+        narration,
+        settings: report,
+        lines: &lines,
+        warnings: &warnings,
+    };
+    publish(
+        &dir,
+        &manifest,
+        &narration_temp,
+        &narration_path,
+        settings.format,
+    )?;
+    Ok(ExportReport {
+        narration: file,
+        settings: Some(report),
+        lines,
+        refused: Vec::new(),
+        warnings,
+    })
+}
+
+/// Places each line's take, or collects why export refuses: script
+/// problems, lines without a usable take, overlapping speech. Splits the
+/// margins of neighbours and returns `tight-gap` warnings.
+fn gather(
+    project: &Project,
+    ledger: &Ledger,
+    state: &State,
+    use_proposed: bool,
+) -> (Vec<Placed>, Vec<ExportWarning>, Vec<Refusal>) {
     let mut refused = Vec::new();
     let problems = validate(&project.script, project.film_duration());
     if !problems.is_empty() {
@@ -214,76 +385,182 @@ fn export_locked(
     }
     let tight = split_margins(&mut placed, project.config.sample_rate);
     refused.extend(overlaps(&placed));
-    if !refused.is_empty() {
-        remove_if_present(&dir.join(MANIFEST_FILE))?;
-        return Ok(ExportReport {
-            lines: Vec::new(),
-            refused,
-            warnings: Vec::new(),
-        });
-    }
+    (placed, tight, refused)
+}
 
-    let rate = project.config.sample_rate;
-    let film_len = to_usize(seconds_to_samples(project.film_duration(), rate));
-    let out = mix(&placed, film_len, rate);
-    fs::create_dir_all(&dir).map_err(io(&dir))?;
-    let wav_path = dir.join(NARRATION_FILE);
-    let wav_temp = write_temp(&wav_path, |file| {
-        let copy = file.try_clone()?;
-        encode_wav(copy, &out, rate)
-            .map(drop)
-            .map_err(|err| std::io::Error::other(err.to_string()))
-    })?;
-    let narration = match describe_wav(&wav_temp) {
-        Ok(narration) => narration,
-        Err(err) => {
-            let _ = fs::remove_file(&wav_temp);
-            return Err(io(&wav_path)(err));
-        }
-    };
-
-    let mut warnings = warnings(&placed, project.film_duration());
-    warnings.extend(tight);
-    let lines: Vec<ManifestLine> = placed.into_iter().map(|p| p.line).collect();
-    let info = &project.config.film_info;
-    let manifest = Manifest {
-        v: 1,
-        film: ManifestFilm {
-            path: project.film_path().display().to_string(),
-            duration_s: info.duration_s,
-            size: info.size,
-            modified: &info.modified,
-        },
-        narration,
-        sample_rate: rate,
-        lines: &lines,
-        warnings: &warnings,
-    };
+/// Writes the manifest and puts both files in place: the old manifest goes
+/// first, then the narration, the manifest last, so an interruption
+/// anywhere leaves no manifest, or one whose hash does not match the
+/// narration, but never an old manifest vouching for a changed export. A
+/// narration of the other format goes too, so one narration file sits
+/// beside the manifest.
+fn publish(
+    dir: &Path,
+    manifest: &Manifest<'_>,
+    narration_temp: &Path,
+    narration_path: &Path,
+    format: ExportFormat,
+) -> Result<()> {
     let manifest_path = dir.join(MANIFEST_FILE);
-    let manifest_temp = match write_manifest(&manifest_path, &manifest) {
+    let manifest_temp = match write_manifest(&manifest_path, manifest) {
         Ok(temp) => temp,
         Err(err) => {
-            let _ = fs::remove_file(&wav_temp);
+            let _ = fs::remove_file(narration_temp);
             return Err(err);
         }
     };
-    // The old manifest goes first, then the WAV, the manifest last: an
-    // interruption anywhere leaves no manifest, or one whose hash does not
-    // match the WAV, but never an old manifest vouching for a changed export.
     if let Err(err) = remove_if_present(&manifest_path) {
-        let _ = fs::remove_file(&wav_temp);
+        let _ = fs::remove_file(narration_temp);
         let _ = fs::remove_file(&manifest_temp);
         return Err(err);
     }
-    if let Err(err) = rename_temp(&wav_temp, &wav_path) {
+    if let Err(err) = rename_temp(narration_temp, narration_path) {
         let _ = fs::remove_file(&manifest_temp);
         return Err(err);
     }
-    rename_temp(&manifest_temp, &manifest_path)?;
-    Ok(ExportReport {
-        lines,
-        refused: Vec::new(),
-        warnings,
+    for other in [ExportFormat::Wav, ExportFormat::Flac] {
+        if other != format {
+            remove_if_present(&dir.join(narration_file(other)))?;
+        }
+    }
+    rename_temp(&manifest_temp, &manifest_path)
+}
+
+/// `ffmpeg` when the settings need it: `clean`, 44.1 kHz or FLAC; `raw`
+/// 48 kHz WAV works without it.
+fn ffmpeg_for(settings: ExportConfig) -> Result<Option<Ffmpeg>> {
+    let needed = settings.processing == Processing::Clean
+        || settings.sample_rate != SOURCE_RATE
+        || settings.format == ExportFormat::Flac;
+    if !needed {
+        return Ok(None);
+    }
+    Ffmpeg::find()
+        .map(Some)
+        .ok_or_else(|| missing_ffmpeg(settings))
+}
+
+fn missing_ffmpeg(settings: ExportConfig) -> Error {
+    let mut needs = Vec::new();
+    if settings.processing == Processing::Clean {
+        needs.push("clean processing");
+    }
+    if settings.sample_rate != SOURCE_RATE {
+        needs.push("44.1 kHz");
+    }
+    if settings.format == ExportFormat::Flac {
+        needs.push("FLAC");
+    }
+    Error::MissingFfmpeg(format!(
+        "ffmpeg not found on PATH or in /opt/homebrew/bin; {} need it. Install it with `brew install ffmpeg`, or export raw 48 kHz WAV (--processing raw --format wav --sample-rate 48000)",
+        needs.join(" and ")
+    ))
+}
+
+/// Replaces each placed take's samples with its cleaned copy (the whole
+/// take, so placement is unchanged) and notes its noise reduction.
+fn clean_takes(
+    project: &Project,
+    ledger: &Ledger,
+    placed: &mut [Placed],
+    ffmpeg: &Ffmpeg,
+) -> Result<()> {
+    let processor = Cleaner::new(ffmpeg.clone()).map_err(Error::Ffmpeg)?;
+    let tmp = tempfile::Builder::new()
+        .prefix("takewise-clean-")
+        .tempdir()
+        .map_err(io(std::env::temp_dir()))?;
+    for (i, p) in placed.iter_mut().enumerate() {
+        let recorded = ledger.events.iter().find_map(|e| match &e.kind {
+            EventKind::Recorded(rec) if e.line == p.line.id && e.take == p.take => {
+                Some((rec, e.at))
+            }
+            _ => None,
+        });
+        let room = match recorded {
+            Some((rec, at)) => find_room_tone(&project.dir, rec, at, p.floor_dbfs),
+            None => Err("the take has no recorded event".to_owned()),
+        };
+        let src = project.dir.join(&p.line.take_file);
+        let out = tmp.path().join(format!("{i}.wav"));
+        let info = processor
+            .clean_take(&src, room.as_ref().ok(), &out)
+            .map_err(Error::Ffmpeg)?;
+        let (cleaned, _) = read_float_wav(&out).map_err(Error::Ffmpeg)?;
+        let len = p.samples.len();
+        p.samples = cleaned.into_iter().map(|v| v * UNIT).collect();
+        p.samples.resize(len, 0.0);
+        p.line.noise_reduction = Some(match (&room, info.noise_floor_db) {
+            (Ok(tone), Some(floor)) => format!(
+                "afftdn {NOISE_REDUCTION_DB:.0} dB at a noise floor of {floor:.1} dB from {}",
+                tone.file
+            ),
+            (Err(why), _) => format!("skipped: {why}"),
+            (Ok(_), None) => "skipped".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Renders the narration to a temp file beside `path`: `clean` measures
+/// the placed narration, applies one static gain, and measures the final
+/// file again; a true peak above −1 dBTP after resampling or dither lowers
+/// the gain by the excess and renders once more. Returns the temp file and
+/// the settings for the manifest.
+fn render_narration(
+    mixed: &[f64],
+    settings: ExportConfig,
+    target: Target,
+    ffmpeg: Option<&Ffmpeg>,
+    path: &Path,
+) -> Result<(PathBuf, ExportSettings)> {
+    let clean = settings.processing == Processing::Clean;
+    let mut gain_db = 0.0;
+    if clean {
+        let ffmpeg = ffmpeg.ok_or_else(|| missing_ffmpeg(settings))?;
+        let before = render::measure_samples(ffmpeg, mixed).map_err(Error::Ffmpeg)?;
+        gain_db = render::static_gain_db(before);
+    }
+    let encode = |gain_db: f64| -> Result<PathBuf> {
+        let pcm = render::prepare(mixed, gain_db, target, ffmpeg).map_err(Error::Ffmpeg)?;
+        let temp = write_temp(path, |_| Ok(()))?;
+        if let Err(err) = render::write(&temp, &pcm, target, ffmpeg) {
+            let _ = fs::remove_file(&temp);
+            return Err(Error::Ffmpeg(err));
+        }
+        Ok(temp)
+    };
+    let mut temp = encode(gain_db)?;
+    let mut loudness: Option<Loudness> = None;
+    if clean && let Some(ffmpeg) = ffmpeg {
+        let mut after = measure_or_remove(ffmpeg, &temp)?;
+        if after.true_peak_dbtp > MAX_TRUE_PEAK_DBTP {
+            let _ = fs::remove_file(&temp);
+            gain_db -= after.true_peak_dbtp - MAX_TRUE_PEAK_DBTP;
+            temp = encode(gain_db)?;
+            after = measure_or_remove(ffmpeg, &temp)?;
+        }
+        loudness = Some(after);
+    }
+    Ok((
+        temp,
+        ExportSettings {
+            processing: settings.processing,
+            format: settings.format,
+            sample_rate: settings.sample_rate,
+            source_sample_rate: SOURCE_RATE,
+            bit_depth: settings.bit_depth,
+            loudness_lufs: loudness.map(|l| l.integrated_lufs),
+            true_peak_dbtp: loudness.map(|l| l.true_peak_dbtp),
+            gain_db: clean.then_some((gain_db * 100.0).round() / 100.0),
+        },
+    ))
+}
+
+fn measure_or_remove(ffmpeg: &Ffmpeg, temp: &Path) -> Result<Loudness> {
+    render::measure(ffmpeg, temp).map_err(|err| {
+        let _ = fs::remove_file(temp);
+        Error::Ffmpeg(err)
     })
 }
 
@@ -384,8 +661,11 @@ fn place(
             dest_samples: [to_u64(dest0), to_u64(dest1)],
             speech_film_s: [clamped.0, clamped.1],
             words_film_s: check.and_then(|c| words_film_s(c, take_start_film)),
+            noise_reduction: None,
         },
-        samples,
+        samples: samples.iter().map(|&s| f64::from(s)).collect(),
+        take: take_no,
+        floor_dbfs: analysis.noise_floor_dbfs,
         src: src0,
         dest: (dest0, dest1),
         speech: (to_usize(speech_dest.0), to_usize(speech_dest.1)),
@@ -524,9 +804,9 @@ fn overlaps(placed: &[Placed]) -> Vec<Refusal> {
 
 /// Copies each placed range into a silent film-length buffer with linear
 /// fades at both ends, each as long as its room allows (none where a split
-/// gap leaves no margin).
-fn mix(placed: &[Placed], film_len: usize, rate: u32) -> Vec<i32> {
-    let mut out = vec![0i32; film_len];
+/// gap leaves no margin). In 24-bit units, unrounded.
+fn mix(placed: &[Placed], film_len: usize, rate: u32) -> Vec<f64> {
+    let mut out = vec![0.0; film_len];
     let fade = to_usize(seconds_to_samples(FADE_S, rate)).max(1);
     for p in placed {
         let len = p.dest.1 - p.dest.0;
@@ -536,20 +816,15 @@ fn mix(placed: &[Placed], film_len: usize, rate: u32) -> Vec<i32> {
         for (k, (slot, &sample)) in out[p.dest.0..p.dest.1].iter_mut().zip(source).enumerate() {
             let to_end = len - 1 - k;
             *slot = if k < fade_in {
-                scale(sample, k as f64 / fade_in as f64)
+                sample * (k as f64 / fade_in as f64)
             } else if to_end < fade_out {
-                scale(sample, to_end as f64 / fade_out as f64)
+                sample * (to_end as f64 / fade_out as f64)
             } else {
                 sample
             };
         }
     }
     out
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn scale(sample: i32, gain: f64) -> i32 {
-    (f64::from(sample) * gain).round() as i32
 }
 
 /// Writes the manifest to a temp file next to `path` and returns its path.
@@ -562,7 +837,7 @@ fn write_manifest(path: &Path, manifest: &Manifest<'_>) -> Result<PathBuf> {
     write_temp(path, |file| file.write_all(&json))
 }
 
-fn describe_wav(path: &Path) -> std::io::Result<ManifestNarration> {
+fn describe_file(path: &Path, file: &str) -> std::io::Result<ManifestNarration> {
     let bytes = fs::read(path)?;
     let sha256 = Sha256::digest(&bytes)
         .iter()
@@ -571,7 +846,7 @@ fn describe_wav(path: &Path) -> std::io::Result<ManifestNarration> {
             hex
         });
     Ok(ManifestNarration {
-        file: NARRATION_FILE,
+        file: file.to_owned(),
         size: to_u64(bytes.len()),
         sha256,
     })
@@ -598,6 +873,7 @@ mod tests {
         RecordedInput, TakeRef, begin_take, commit_take, read_take_wav, write_take_wav,
     };
     use crate::testutil::{RATE, burst, noise};
+    use crate::{ExportConfig, ExportFormat, Processing};
 
     const FILM_SAMPLES: usize = 2_472_000; // 51.5 s
 
@@ -674,7 +950,14 @@ mod tests {
     }
 
     fn run(dir: &Path, use_proposed: bool) -> ExportReport {
-        export(dir, &ExportOptions { use_proposed }).unwrap()
+        export(
+            dir,
+            &ExportOptions {
+                use_proposed,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap()
     }
 
     fn narration(dir: &Path) -> Vec<i32> {
@@ -1263,5 +1546,359 @@ mod tests {
         assert_eq!(audio[535_200], 0);
         // 10 ms fades: the first placed sample is silent and the level ramps up.
         assert_eq!(audio[472_800], 0);
+    }
+
+    fn export_with(dir: &Path, config: ExportConfig) -> ExportReport {
+        crate::edit::set_export(dir, &config).unwrap();
+        let report = run(dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        report
+    }
+
+    fn manifest(dir: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(dir.join("export/manifest.json")).unwrap()).unwrap()
+    }
+
+    fn export_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.join("export"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Decodes an export file at its own rate, as float samples.
+    fn decode(ffmpeg: &Ffmpeg, path: &Path) -> (Vec<f64>, u32) {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("decoded.wav");
+        ffmpeg
+            .run(&[
+                std::ffi::OsStr::new("-loglevel"),
+                std::ffi::OsStr::new("error"),
+                std::ffi::OsStr::new("-i"),
+                path.as_os_str(),
+                std::ffi::OsStr::new("-c:a"),
+                std::ffi::OsStr::new("pcm_f32le"),
+                out.as_os_str(),
+            ])
+            .unwrap();
+        read_float_wav(&out).unwrap()
+    }
+
+    fn peak_at(x: &[f64]) -> usize {
+        x.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
+    /// A take whose speech is a quiet tone with one loud click at 2.5 s of
+    /// the take (sample 120 000), so the click is the peak.
+    fn click_take(dir: &Path) -> TakeRef {
+        let project = Project::open(dir).unwrap();
+        let input = RecordedInput {
+            sample_rate: RATE,
+            device: "Test Mic".to_owned(),
+            channel: 1,
+            line_offset_s: -2.0,
+            snapshot: project.snapshot("hook").unwrap(),
+            dropouts: None,
+            film_shift_ms: None,
+        };
+        let partial = begin_take(dir, "hook", &input).unwrap();
+        let mut audio = noise(5.0);
+        crate::testutil::burst_at(&mut audio, 2.0, 3.0, -30.0);
+        audio[120_000] = 6 << 20;
+        write_take_wav(&partial.wav, &audio, RATE).unwrap();
+        commit_take(dir, partial).unwrap()
+    }
+
+    fn ffmpeg_or_skip() -> Option<Ffmpeg> {
+        let found = Ffmpeg::find();
+        if found.is_none() {
+            eprintln!("skipped: ffmpeg not found");
+        }
+        found
+    }
+
+    #[test]
+    fn raw_default_unchanged() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let report = run(&dir, false);
+        assert_eq!(report.narration, "narration.wav");
+        let m = manifest(&dir);
+        assert_eq!(m["processing"], "raw");
+        assert_eq!(m["format"], "wav");
+        assert_eq!(m["sample_rate"], 48_000);
+        assert_eq!(m["source_sample_rate"], 48_000);
+        assert_eq!(m["bit_depth"], 24);
+        assert!(m.get("loudness_lufs").is_none(), "{m}");
+        assert!(m["lines"][0].get("noise_reduction").is_none(), "{m}");
+        // Between the fades, the take's samples are copied bit for bit.
+        let (take_audio, _) = read_take_wav(&dir.join("takes/hook/001.wav")).unwrap();
+        let out = narration(&dir);
+        let [src0, _] = report.lines[0].source_samples;
+        let [dest0, dest1] = report.lines[0].dest_samples;
+        let (src0, dest0, dest1) = (to_usize_u(src0), to_usize_u(dest0), to_usize_u(dest1));
+        for k in 480..(dest1 - dest0 - 480) {
+            assert_eq!(out[dest0 + k], take_audio[src0 + k], "sample {k}");
+        }
+        assert_eq!(export_files(&dir), ["manifest.json", "narration.wav"]);
+    }
+
+    fn to_usize_u(n: u64) -> usize {
+        usize::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn raw_wav_needs_no_ffmpeg() {
+        let raw = ExportConfig::default();
+        assert_eq!(ffmpeg_for(raw).unwrap(), None);
+        // 16 bits are dithered in Rust: still no ffmpeg.
+        let sixteen = ExportConfig {
+            bit_depth: 16,
+            ..raw
+        };
+        assert_eq!(ffmpeg_for(sixteen).unwrap(), None);
+        for needs in [
+            ExportConfig {
+                processing: Processing::Clean,
+                ..raw
+            },
+            ExportConfig {
+                format: ExportFormat::Flac,
+                ..raw
+            },
+            ExportConfig {
+                sample_rate: 44_100,
+                ..raw
+            },
+        ] {
+            match ffmpeg_for(needs) {
+                Ok(found) => assert!(found.is_some()),
+                Err(err) => assert_eq!(err.code(), "missing-tool"),
+            }
+        }
+        // And the raw export itself runs without it.
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let report = export_with(&dir, sixteen);
+        assert_eq!(report.settings.unwrap().bit_depth, 16);
+        let spec = hound::WavReader::open(dir.join("export/narration.wav"))
+            .unwrap()
+            .spec();
+        assert_eq!((spec.bits_per_sample, spec.sample_rate), (16, 48_000));
+    }
+
+    #[test]
+    fn clean_hits_minus_16_lufs_within_half_lu() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let report = export_with(
+            &dir,
+            ExportConfig {
+                processing: Processing::Clean,
+                ..ExportConfig::default()
+            },
+        );
+        let settings = report.settings.unwrap();
+        let measured = render::measure(&ffmpeg, &dir.join("export/narration.wav")).unwrap();
+        assert!(
+            (measured.integrated_lufs + 16.0).abs() <= 0.5,
+            "{measured:?}"
+        );
+        assert!(measured.true_peak_dbtp <= -1.0, "{measured:?}");
+        assert_eq!(settings.loudness_lufs, Some(measured.integrated_lufs));
+        assert_eq!(settings.true_peak_dbtp, Some(measured.true_peak_dbtp));
+        let m = manifest(&dir);
+        assert_eq!(m["processing"], "clean");
+        assert_eq!(m["loudness_lufs"], measured.integrated_lufs);
+        // No room tone was recorded: noise reduction was skipped, and why.
+        let note = m["lines"][0]["noise_reduction"].as_str().unwrap();
+        assert!(note.starts_with("skipped: no room tone"), "{note}");
+    }
+
+    #[test]
+    fn true_peak_never_above_minus_one() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = click_take(&dir);
+        choose(&dir, &t);
+        for (rate, bits) in [(48_000, 24), (44_100, 16)] {
+            let report = export_with(
+                &dir,
+                ExportConfig {
+                    processing: Processing::Clean,
+                    sample_rate: rate,
+                    bit_depth: bits,
+                    ..ExportConfig::default()
+                },
+            );
+            let measured = render::measure(&ffmpeg, &dir.join("export/narration.wav")).unwrap();
+            // The click limits the gain: true peak at −1 dBTP at most, and
+            // the speech stays below −16 LUFS.
+            assert!(
+                measured.true_peak_dbtp <= -1.0,
+                "{rate}/{bits}: {measured:?}"
+            );
+            assert!(
+                measured.integrated_lufs < -16.5,
+                "{rate}/{bits}: {measured:?}"
+            );
+            assert_eq!(
+                report.settings.unwrap().true_peak_dbtp,
+                Some(measured.true_peak_dbtp)
+            );
+        }
+    }
+
+    #[test]
+    fn clean_places_a_click_where_raw_does() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = click_take(&dir);
+        choose(&dir, &t);
+        // The take starts 8 s into the film: the click belongs at 504 000.
+        let raw = narration(&dir_after(&dir, ExportConfig::default()));
+        let raw_at = peak_at(&raw.iter().map(|&s| f64::from(s)).collect::<Vec<_>>());
+        assert_eq!(raw_at, 504_000);
+        // With a room tone, so noise reduction (and its delay) is in play.
+        let tone = crate::room::RoomInput {
+            input: "Test Mic",
+            channel: 1,
+            output: "Phones",
+            floor_dbfs: -65.0,
+            gated: false,
+        };
+        crate::room::save_room_tone(&dir, &noise(5.0), RATE, jiff::Timestamp::now(), &tone)
+            .unwrap();
+        export_with(
+            &dir,
+            ExportConfig {
+                processing: Processing::Clean,
+                ..ExportConfig::default()
+            },
+        );
+        let note = manifest(&dir)["lines"][0]["noise_reduction"].clone();
+        assert!(note.as_str().unwrap().starts_with("afftdn 10 dB"), "{note}");
+        let (clean, _) = decode(&ffmpeg, &dir.join("export/narration.wav"));
+        assert!(
+            peak_at(&clean).abs_diff(504_000) <= 1,
+            "{}",
+            peak_at(&clean)
+        );
+        // At 44.1 kHz the click is at round(504 000 × 44 100 / 48 000).
+        export_with(
+            &dir,
+            ExportConfig {
+                processing: Processing::Clean,
+                sample_rate: 44_100,
+                ..ExportConfig::default()
+            },
+        );
+        let (resampled, rate) = decode(&ffmpeg, &dir.join("export/narration.wav"));
+        assert_eq!(rate, 44_100);
+        assert!(
+            peak_at(&resampled).abs_diff(463_050) <= 1,
+            "{}",
+            peak_at(&resampled)
+        );
+    }
+
+    /// Exports with `config` and returns `dir`.
+    fn dir_after(dir: &Path, config: ExportConfig) -> PathBuf {
+        export_with(dir, config);
+        dir.to_path_buf()
+    }
+
+    #[test]
+    fn export_44k_16bit_flac_ranges_and_length() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let at48 = run(&dir, false).lines[0].dest_samples;
+        let report = export_with(
+            &dir,
+            ExportConfig {
+                format: ExportFormat::Flac,
+                bit_depth: 16,
+                sample_rate: 44_100,
+                processing: Processing::Clean,
+            },
+        );
+        assert_eq!(report.narration, "narration.flac");
+        assert_eq!(
+            report.lines[0].dest_samples,
+            at48.map(|n| render::at_rate(n, 44_100))
+        );
+        let m = manifest(&dir);
+        assert_eq!(m["sample_rate"], 44_100);
+        assert_eq!(m["source_sample_rate"], 48_000);
+        assert_eq!(m["bit_depth"], 16);
+        assert_eq!(m["format"], "flac");
+        assert_eq!(m["narration"]["file"], "narration.flac");
+        // Source ranges stay in take samples at 48 kHz.
+        assert_eq!(m["lines"][0]["source_samples"][0], 96_000 - 7_200);
+        let path = dir.join("export/narration.flac");
+        let (decoded, rate) = decode(&ffmpeg, &path);
+        assert_eq!(rate, 44_100);
+        assert_eq!(decoded.len(), 2_271_150);
+        let measured = render::measure(&ffmpeg, &path).unwrap();
+        assert!(measured.true_peak_dbtp <= -1.0, "{measured:?}");
+        let probe = std::process::Command::new(ffmpeg.path.with_file_name("ffprobe"))
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=sample_fmt",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output();
+        if let Ok(probe) = probe {
+            assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "s16");
+        }
+    }
+
+    #[test]
+    fn format_switch_leaves_one_file() {
+        if ffmpeg_or_skip().is_none() {
+            return;
+        }
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        run(&dir, false);
+        assert_eq!(export_files(&dir), ["manifest.json", "narration.wav"]);
+        let flac = ExportConfig {
+            format: ExportFormat::Flac,
+            ..ExportConfig::default()
+        };
+        export_with(&dir, flac);
+        assert_eq!(export_files(&dir), ["manifest.json", "narration.flac"]);
+        let m = manifest(&dir);
+        assert_eq!(m["narration"]["file"], "narration.flac");
+        let bytes = fs::read(dir.join("export/narration.flac")).unwrap();
+        assert_eq!(m["narration"]["size"], bytes.len());
+        export_with(&dir, ExportConfig::default());
+        assert_eq!(export_files(&dir), ["manifest.json", "narration.wav"]);
+        assert_eq!(manifest(&dir)["narration"]["file"], "narration.wav");
     }
 }

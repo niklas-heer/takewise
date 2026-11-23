@@ -56,6 +56,70 @@ pub struct ProjectConfig {
     /// The last setup check (written from milestone 4b on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<SetupInfo>,
+    /// How `export` writes the narration; without it, 48 kHz 24-bit WAV,
+    /// `raw`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<ExportConfig>,
+}
+
+/// `[export]`: the narration file's format and processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExportConfig {
+    pub format: ExportFormat,
+    /// 16 or 24.
+    pub bit_depth: u16,
+    /// 48000 or 44100.
+    pub sample_rate: u32,
+    pub processing: Processing,
+}
+
+impl Default for ExportConfig {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::Wav,
+            bit_depth: 24,
+            sample_rate: 48_000,
+            processing: Processing::Raw,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    #[default]
+    Wav,
+    Flac,
+}
+
+impl ExportFormat {
+    /// The narration file's extension.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Wav => "wav",
+            ExportFormat::Flac => "flac",
+        }
+    }
+}
+
+/// `raw` places the takes as recorded; `clean` filters them and sets the
+/// loudness (see `docs/design.md`, "Export cleanup and formats").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Processing {
+    #[default]
+    Raw,
+    Clean,
+}
+
+impl Processing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Processing::Raw => "raw",
+            Processing::Clean => "clean",
+        }
+    }
 }
 
 /// `[output]`: where film audio (and monitoring) plays.
@@ -206,6 +270,7 @@ impl Project {
             monitor: MonitorConfig::default(),
             calibration: None,
             setup: None,
+            export: None,
         };
         let text = toml::to_string(&config).map_err(|err| Error::Parse {
             path: project_file.clone(),
