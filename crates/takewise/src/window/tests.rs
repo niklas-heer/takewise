@@ -52,6 +52,8 @@ struct Fake {
     /// Why switching the sample rate fails, when it does.
     rate_error: Option<String>,
     mic: tw::MicPermission,
+    /// Why monitoring cannot run; `None` once it can.
+    monitor_unavailable: Option<String>,
 }
 
 #[derive(Clone)]
@@ -85,6 +87,9 @@ impl FakeMedia {
             levels: vec![-40.0, f32::NEG_INFINITY],
             rate_error: None,
             mic: tw::MicPermission::Granted,
+            monitor_unavailable: Some(
+                "not available yet: monitoring needs a test on your setup".to_owned(),
+            ),
         })))
     }
 
@@ -255,7 +260,7 @@ impl Media for FakeMedia {
         Some(512)
     }
     fn monitor_unavailable(&self) -> Option<String> {
-        Some("not available yet: monitoring needs a test on your setup".to_owned())
+        self.0.borrow().monitor_unavailable.clone()
     }
     fn microphone_permission(&self) -> tw::MicPermission {
         self.0.borrow().mic
@@ -2374,6 +2379,17 @@ fn h_says_why_monitoring_is_off(cx: &mut TestAppContext) {
     f.view.update(cx, |view, _| view.message = None);
     press(cx, f.window, &["h"]);
     assert_eq!(message(cx, &f.view), "", "H does nothing during a take");
+}
+
+#[gpui_kit::test]
+fn monitor_keys_hidden_while_monitoring_is_unavailable(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let hints = f.view.read_with(cx, |view, _| view.key_hints());
+    assert!(!hints.contains("monitor"), "{hints}");
+    assert!(hints.contains("−/+ film"), "{hints}");
+    f.media.0.borrow_mut().monitor_unavailable = None;
+    let hints = f.view.read_with(cx, |view, _| view.key_hints());
+    assert!(hints.contains(",/. monitor"), "{hints}");
 }
 
 #[gpui_kit::test]

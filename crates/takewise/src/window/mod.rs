@@ -91,6 +91,9 @@ const EDITING: &str = "RecorderEditing";
 const SETUP: &str = "RecorderSetup";
 /// The keys, along the window's bottom edge.
 const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · ,/. monitor · K clear clip";
+/// The keys while monitoring is unavailable: the monitor volume keys are
+/// not advertised.
+const KEY_HINTS_NO_MONITOR: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · K clear clip";
 /// How often the input devices are checked while idle.
 const INPUT_CHECK_S: f64 = 2.0;
 
@@ -498,6 +501,15 @@ impl RecordingWindow {
     #[cfg(test)]
     fn prompter_text(&self) -> Option<&str> {
         self.prompter_line().map(|reading| reading.text)
+    }
+
+    /// The key hints: the monitor keys only while monitoring can run.
+    fn key_hints(&self) -> &'static str {
+        if self.media.monitor_unavailable().is_some() {
+            KEY_HINTS_NO_MONITOR
+        } else {
+            KEY_HINTS
+        }
     }
 
     fn blocked(&self) -> Option<&str> {
@@ -1268,7 +1280,7 @@ impl Render for RecordingWindow {
                     .py(px(8.))
                     .text_size(px(13.))
                     .text_color(rgb(colors::DIM))
-                    .child(KEY_HINTS),
+                    .child(self.key_hints()),
             )
     }
 }

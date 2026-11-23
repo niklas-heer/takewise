@@ -472,7 +472,12 @@ impl RecordingWindow {
                 "Monitor volume",
                 &self.panel.monitor_slider,
                 self.monitor_db,
-                ", / .",
+                // The keys are not advertised while monitoring cannot run.
+                if self.media.monitor_unavailable().is_some() {
+                    ""
+                } else {
+                    ", / ."
+                },
             ))
             .child(self.monitor_switch())
             .when_some(self.panel.calibration.clone(), |el, stale| {
@@ -710,7 +715,11 @@ fn volume(
                 .justify_between()
                 .text_color(rgb(colors::DIM))
                 .child(label)
-                .child(format!("{db:+.0} dB · {keys}")),
+                .child(if keys.is_empty() {
+                    format!("{db:+.0} dB")
+                } else {
+                    format!("{db:+.0} dB · {keys}")
+                }),
         )
         .child(
             Slider::new(state)
