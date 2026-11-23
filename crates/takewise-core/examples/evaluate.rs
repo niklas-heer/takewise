@@ -26,6 +26,11 @@
 //! rule is shown separately as the breath lead (energy start to first word).
 //! Audio is read where it is; a cut part is written to a temporary file that
 //! is removed afterwards. Nothing is written to a project.
+//!
+//! `evaluate --spellings` needs no audio or whisper: it checks a corpus of
+//! lines against transcripts spelled the way whisper writes them (times,
+//! amounts, hyphens, "all right", negative numbers, annotations over several
+//! words) and fails when a verdict differs from the expected one.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,8 +38,12 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use takewise_core::check::{Transcript, build_checked};
+use takewise_core::speech::Frames;
 use takewise_core::whisper::{Transcriber as _, WhisperCli, keep_within};
-use takewise_core::{CheckConfig, Snapshot, analyze, checker, read_take_wav, write_take_wav};
+use takewise_core::words::isolate_annotations;
+use takewise_core::{
+    Analysis, CheckConfig, Snapshot, Verdict, Word, analyze, checker, read_take_wav, write_take_wav,
+};
 
 #[derive(Deserialize)]
 struct Lines {
@@ -59,9 +68,12 @@ fn default_preroll() -> f64 {
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: evaluate <lines.toml>");
+        eprintln!("usage: evaluate <lines.toml> | evaluate --spellings");
         return ExitCode::from(2);
     };
+    if path == "--spellings" {
+        return spellings();
+    }
     match run(Path::new(&path)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -148,4 +160,147 @@ fn run(path: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Lines, what whisper writes for them, and the verdict the checks owe.
+const SPELLINGS: &[(&str, &str, Verdict)] = &[
+    // Times.
+    ("Meet me at 9:30.", "Meet me at 9.30.", Verdict::Keep),
+    ("Meet me at 9:30.", "Meet me at 9:30.", Verdict::Keep),
+    ("Meet me at 9:30.", "Meet me at nine thirty.", Verdict::Keep),
+    ("Meet me at nine thirty.", "Meet me at 9:30.", Verdict::Keep),
+    ("Meet me at 9:30.", "Meet me at 9.35.", Verdict::Listen),
+    // Amounts.
+    (
+        "It costs $3.50.",
+        "It costs three dollars fifty.",
+        Verdict::Keep,
+    ),
+    (
+        "It costs three dollars fifty.",
+        "It costs $3.50.",
+        Verdict::Keep,
+    ),
+    (
+        "It costs $3.50.",
+        "It costs three dollars and fifty cents.",
+        Verdict::Keep,
+    ),
+    // "Three fifty" may be 350: listen.
+    ("It costs $3.50.", "It costs three fifty.", Verdict::Listen),
+    // Hyphens.
+    (
+        "I recorded the voice-over.",
+        "I recorded the voiceover.",
+        Verdict::Keep,
+    ),
+    ("Send me an email.", "Send me an e-mail.", Verdict::Keep),
+    ("Everyone came.", "Every one came.", Verdict::Listen),
+    // All right.
+    ("Alright, let's go.", "All right, let's go.", Verdict::Keep),
+    ("All right, let's go.", "Alright, let's go.", Verdict::Keep),
+    // Negative numbers.
+    (
+        "It was -5 degrees.",
+        "It was minus five degrees.",
+        Verdict::Keep,
+    ),
+    (
+        "It was -5 degrees.",
+        "It was negative five degrees.",
+        Verdict::Keep,
+    ),
+    ("It was -5 degrees.", "It was 5 degrees.", Verdict::Listen),
+    // Annotations over several words: a sound, no leaked words.
+    (
+        "Nobody misses a birthday.",
+        "Nobody [background music playing] misses a birthday.",
+        Verdict::Listen,
+    ),
+    (
+        "Nobody misses a birthday.",
+        "Nobody misses a birthday. (soft music)",
+        Verdict::Listen,
+    ),
+];
+
+/// Speech from 1 s to 4 s of a 5 s take, sound throughout it.
+fn synthetic_analysis() -> Analysis {
+    let levels = (0..500)
+        .map(|i| {
+            if (100..400).contains(&i) {
+                -20.0
+            } else {
+                -70.0
+            }
+        })
+        .collect();
+    Analysis {
+        speech: Some((1.0, 4.0)),
+        peak_dbfs: -6.0,
+        clipped_samples: 0,
+        noise_floor_dbfs: -70.0,
+        frames: Frames {
+            levels_dbfs: levels,
+            threshold_dbfs: -55.0,
+            frame_s: 0.01,
+        },
+    }
+}
+
+/// `heard`'s words spread evenly over the speech, made into whisper's words.
+fn synthetic_words(heard: &str) -> Vec<Word> {
+    let parts: Vec<&str> = heard.split_whitespace().collect();
+    #[allow(clippy::cast_precision_loss)]
+    let step = 3.0 / parts.len() as f64;
+    let words = (0_u32..)
+        .zip(&parts)
+        .map(|(i, text)| Word {
+            text: (*text).to_owned(),
+            start: 1.0 + f64::from(i) * step,
+            end: 1.0 + f64::from(i + 1) * step,
+            confidence: Some(0.9),
+        })
+        .collect();
+    isolate_annotations(words)
+}
+
+fn spellings() -> ExitCode {
+    let analysis = synthetic_analysis();
+    let mut failed = 0;
+    println!("| script | heard | expected | verdict | reasons |");
+    println!("|---|---|---|---|---|");
+    for &(script, heard, expected) in SPELLINGS {
+        let snapshot = Snapshot {
+            text: script.to_owned(),
+            start: 0.0,
+            end: 6.0,
+        };
+        let transcript = Transcript::Words(synthetic_words(heard));
+        let checked = build_checked(&snapshot, 0.0, &analysis, &transcript, "evaluate");
+        let reasons: Vec<&str> = checked.reasons.iter().map(|r| r.message.as_str()).collect();
+        let mark = if checked.verdict == expected {
+            ""
+        } else {
+            failed += 1;
+            " ✗"
+        };
+        println!(
+            "| {script} | {heard} | {} | {}{mark} | {} |",
+            expected.as_str(),
+            checked.verdict.as_str(),
+            if reasons.is_empty() {
+                "–".to_owned()
+            } else {
+                reasons.join("; ")
+            }
+        );
+    }
+    if failed == 0 {
+        println!("\nall {} verdicts as expected", SPELLINGS.len());
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("{failed} of {} verdicts differ", SPELLINGS.len());
+        ExitCode::FAILURE
+    }
 }
