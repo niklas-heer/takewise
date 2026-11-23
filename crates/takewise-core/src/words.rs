@@ -937,7 +937,8 @@ pub fn isolate_annotations(words: Vec<Word>) -> Vec<Word> {
     let mut out = Vec::new();
     for word in &words {
         let mut text = String::new();
-        let mut bracketed = false;
+        // A word inside an open annotation belongs to it, brackets or not.
+        let mut bracketed = note.is_some();
         let mut closed = Vec::new();
         if let Some(note) = note.as_mut() {
             note.text.push(' ');
@@ -963,6 +964,7 @@ pub fn isolate_annotations(words: Vec<Word>) -> Vec<Word> {
                             && let Some(mut done) = note.take()
                         {
                             done.end = word.end;
+                            done.text = tidy_annotation(&done.text);
                             closed.push(done);
                         }
                     }
@@ -985,6 +987,23 @@ pub fn isolate_annotations(words: Vec<Word>) -> Vec<Word> {
     }
     if depth > 0 {
         return words;
+    }
+    out
+}
+
+/// An annotation's words with single spaces and none inside its brackets:
+/// `[ soft  music ]` is `[soft music]`.
+fn tidy_annotation(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(joined.len());
+    for c in joined.chars() {
+        if matches!(c, ']' | ')') && out.ends_with(' ') {
+            out.pop();
+        }
+        if c == ' ' && out.ends_with(['[', '(']) {
+            continue;
+        }
+        out.push(c);
     }
     out
 }
@@ -1535,6 +1554,25 @@ mod tests {
         assert_eq!(
             said(&isolate_annotations(heard("a (b c"))),
             ["a", "(b", "c"]
+        );
+    }
+
+    #[test]
+    fn an_annotation_over_several_words_keeps_its_middle_words() {
+        let said =
+            |words: &[Word]| -> Vec<String> { words.iter().map(|w| w.text.clone()).collect() };
+        let words = isolate_annotations(heard("Nobody [background music playing] misses"));
+        assert_eq!(
+            said(&words),
+            ["Nobody", "[background music playing]", "misses"]
+        );
+        assert_eq!((words[1].start, words[1].end), (1.0, 3.5));
+        // Brackets as words of their own.
+        let words = isolate_annotations(heard("a [ soft music ] b"));
+        assert_eq!(said(&words), ["a", "[soft music]", "b"]);
+        assert_eq!(
+            said(&drop_annotations(heard("a (clears his throat) b"))),
+            ["a", "b"]
         );
     }
 
