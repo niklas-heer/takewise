@@ -9,7 +9,8 @@
 //! ("eighteen sixty seven", "nineteen oh five") is its value; "1990s" and
 //! "nineteen nineties" are `1990s`, "21st" and "twenty-first" `21st`, "3.5"
 //! and "three point five zero" `3.5` (a decimal is its value), "$5" and
-//! "five dollars" `5 dollars`. A lone whole one stays the word `one`, since
+//! "five dollars" `5 dollars`; a sign is kept, so "-5", "minus five" and
+//! "negative five" are `-5`, never `5`. A lone whole one stays the word `one`, since
 //! it is often not a number ("every one"), and "first" and "second" are
 //! ordinals only when attached ("twenty-first"), never in "a sixty second
 //! timer". A number said over
@@ -395,6 +396,7 @@ struct Number {
 /// A number's value as written: digits before and after the decimal point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Value {
+    negative: bool,
     int: u64,
     frac: String,
 }
@@ -402,6 +404,7 @@ struct Value {
 impl Value {
     fn whole(int: u64) -> Value {
         Value {
+            negative: false,
             int,
             frac: String::new(),
         }
@@ -422,16 +425,22 @@ impl Value {
             .int
             .checked_mul(scale)?
             .checked_add(frac.checked_mul(pad)?)?;
-        Some(Value::whole(int))
+        Some(Value {
+            negative: self.negative,
+            ..Value::whole(int)
+        })
     }
 
-    /// The canonical token: `1867`, `3.5`, `21st`, `1990s`; a lone whole
-    /// one stays the word `one` ("every one", "no one").
+    /// The canonical token: `1867`, `-5`, `3.5`, `21st`, `1990s`; a lone
+    /// whole one stays the word `one` ("every one", "no one").
     fn render(&self, form: Form) -> String {
+        let sign = if self.negative { "-" } else { "" };
         match form {
-            Form::Cardinal if self.frac.is_empty() && self.int == 1 => "one".to_owned(),
-            Form::Cardinal if self.frac.is_empty() => self.int.to_string(),
-            Form::Cardinal => format!("{}.{}", self.int, self.frac),
+            Form::Cardinal if self.frac.is_empty() && self.int == 1 && !self.negative => {
+                "one".to_owned()
+            }
+            Form::Cardinal if self.frac.is_empty() => format!("{sign}{}", self.int),
+            Form::Cardinal => format!("{sign}{}.{}", self.int, self.frac),
             Form::Ordinal => {
                 let suffix = match (self.int % 10, self.int % 100) {
                     (_, 11..=13) => "th",
@@ -668,6 +677,16 @@ fn cardinal(words: &[Option<&str>], i: usize) -> Option<(u64, Form, usize)> {
 /// The canonical tokens of a number starting at item `k` and the index after
 /// it, or `None` when no number starts there.
 fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(Vec<Token>, usize)> {
+    // "minus five" and "negative five" are `-5`.
+    if matches!(word_at(words, k), Some("minus" | "negative"))
+        && items.get(k + 1).is_some_and(|l| l.sep != Sep::Break)
+        && let Some((mut tokens, next)) = number_phrase(items, words, k + 1)
+        && let Some(first) = tokens.first_mut()
+        && let Some(negated) = negate(&first.text)
+    {
+        first.text = negated;
+        return Some((tokens, next));
+    }
     let (value, form, mut next, currency) = match &items.get(k)?.item {
         Item::Number(number) => (number.value.clone(), number.form, k + 1, number.currency),
         Item::Word(_) => {
@@ -707,6 +726,17 @@ fn number_phrase(items: &[Lexed], words: &[Option<&str>], k: usize) -> Option<(V
         tokens.push(Token::plain(text));
     }
     Some((tokens, next))
+}
+
+/// A cardinal token with a minus sign: `5` is `-5`, `one` `-1`; `None` for
+/// one that has a sign already or is no cardinal.
+fn negate(text: &str) -> Option<String> {
+    if text == "one" {
+        return Some("-1".to_owned());
+    }
+    let cardinal = text.starts_with(|c: char| c.is_ascii_digit())
+        && text.chars().all(|c| c.is_ascii_digit() || c == '.');
+    cardinal.then(|| format!("-{text}"))
 }
 
 /// One raw token as items: words, contractions, or a number in digits. A
@@ -751,9 +781,13 @@ fn lex(raw: &str, part: usize, sep: Sep, items: &mut Vec<Lexed>) {
     }
 }
 
-/// A number in digits: `1,500`, `3.5`, `21st`, `1990s`, `$5`; `None` for
-/// anything else (`mp3`) or a number too large to hold.
+/// A number in digits: `1,500`, `-5`, `3.5`, `21st`, `1990s`, `$5`; `None`
+/// for anything else (`mp3`) or a number too large to hold.
 fn lex_number(token: &str) -> Option<Number> {
+    let (negative, token) = match token.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
     let mut chars = token.chars();
     let currency = match chars.next() {
         Some('$') => Some(("dollar", "dollars")),
@@ -785,11 +819,12 @@ fn lex_number(token: &str) -> Option<Number> {
     if whole.is_empty() || !all_digits(whole) || !all_digits(frac) {
         return None;
     }
-    if form != Form::Cardinal && !frac.is_empty() {
+    if form != Form::Cardinal && (!frac.is_empty() || negative) {
         return None;
     }
     Some(Number {
         value: Value {
+            negative,
             int: whole.parse().ok()?,
             frac: frac.to_owned(),
         },
@@ -807,6 +842,7 @@ fn raw_tokens(text: &str) -> (Vec<(String, Sep)>, Sep) {
         .chars()
         .map(|c| match c {
             '\u{2019}' | '\u{2018}' | '\u{02bc}' => '\'',
+            '\u{2212}' => '-',
             other => other,
         })
         .flat_map(char::to_lowercase)
@@ -829,7 +865,9 @@ fn raw_tokens(text: &str) -> (Vec<(String, Sep)>, Sep) {
             current.push(c);
             continue;
         }
-        if matches!(c, '$' | '€' | '£') && after.is_some_and(char::is_ascii_digit) {
+        // A minus sign starts a number: "-5", but not "10-15".
+        let sign = c == '-' && !before.is_some_and(|b| b.is_alphanumeric());
+        if (sign || matches!(c, '$' | '€' | '£')) && after.is_some_and(char::is_ascii_digit) {
             flush(&mut current, &mut sep);
             current.push(c);
             continue;
@@ -1470,6 +1508,37 @@ mod tests {
             );
         }
         assert_ne!(align(&normalize("3.5"), &heard("three point five one")), []);
+    }
+
+    #[test]
+    fn negative_numbers_keep_their_sign() {
+        assert_eq!(shown("-5 and −3.5"), tokens("-5 and -3.5"));
+        assert_eq!(shown("minus five"), tokens("-5"));
+        assert_eq!(shown("negative one"), tokens("-1"));
+        assert_eq!(shown("-1"), tokens("-1"));
+        // A hyphen between words or numbers is no sign.
+        assert_eq!(shown("pages 10-15"), tokens("pages 10 15"));
+        for (script, said) in [
+            ("It was -5 degrees", "It was minus five degrees"),
+            ("It was -5 degrees", "It was negative five degrees"),
+            ("It was -5 degrees", "It was -5 degrees"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        let diffs = align(&normalize("It was -5 degrees"), &heard("It was 5 degrees"));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].expected.as_deref(), Some("-5"));
+        let diffs = align(&normalize("minus five"), &heard("five"));
+        assert_ne!(diffs, []);
     }
 
     #[test]
