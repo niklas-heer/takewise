@@ -15,7 +15,8 @@ pub enum MicPermission {
     Denied,
     /// A device-management profile forbids it.
     Restricted,
-    /// Not asked yet: the first take asks.
+    /// Not asked yet: macOS asks when the window first opens the input,
+    /// for its meters or a take.
     NotDetermined,
 }
 
@@ -62,7 +63,7 @@ mod tests {
         assert_eq!(
             mic_advice(MicPermission::NotDetermined),
             None,
-            "the first take asks"
+            "macOS asks when the input is first opened"
         );
         assert_eq!(
             serde_json::to_value(MicPermission::NotDetermined).unwrap(),

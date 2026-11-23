@@ -3496,7 +3496,7 @@ fn a_denied_microphone_blocks_recording_with_the_settings_path(cx: &mut TestAppC
         "{blocked}"
     );
 
-    // Not asked yet: the first take asks, so recording goes ahead.
+    // Not asked yet: opening the input asks, so recording goes ahead.
     f.media.0.borrow_mut().mic = tw::MicPermission::NotDetermined;
     press(cx, f.window, &["space"]);
     assert!(f.media.capturing(), "the take starts and macOS asks");

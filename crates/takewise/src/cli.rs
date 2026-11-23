@@ -1512,7 +1512,9 @@ fn microphone_check() -> Result<Check, String> {
     let (ok, detail) = match (permission, tw::mic_advice(permission)) {
         (_, Some(advice)) => (false, advice),
         (tw::MicPermission::NotDetermined, None) => {
-            (true, "not asked yet; the first take asks for it".to_owned())
+            let detail = "not asked yet; macOS asks the first time Takewise listens to your \
+                 input, usually when you pick it in the audio panel";
+            (true, detail.to_owned())
         }
         (_, None) => (true, format!("{} may use it", bundle.display())),
     };
