@@ -3,11 +3,15 @@
 
 use gpui_kit::{
     AnyElement, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div,
-    prelude::FluentBuilder as _, px, rgb, surface,
+    prelude::FluentBuilder as _, px, rgb, rgba, surface,
 };
 use takewise_media::Frame;
 
 use super::colors;
+
+/// The plate behind the count-in's digit: its side, and black at 60 %.
+const COUNT_IN_PLATE_PX: f32 = 220.0;
+const COUNT_IN_PLATE: u32 = 0x0000_0099;
 
 pub fn video(frame: Option<Frame>, count_in: Option<u32>, recording: bool) -> AnyElement {
     let picture = match frame {
@@ -32,9 +36,20 @@ pub fn video(frame: Option<Frame>, count_in: Option<u32>, recording: bool) -> An
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(160.))
-                    .text_color(rgb(colors::TEXT))
-                    .child(n.to_string()),
+                    .child(
+                        // On a dark plate, so the digit reads over a light
+                        // film as well as over a dark one.
+                        div()
+                            .size(px(COUNT_IN_PLATE_PX))
+                            .rounded(px(36.))
+                            .bg(rgba(COUNT_IN_PLATE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(160.))
+                            .text_color(rgb(colors::TEXT))
+                            .child(n.to_string()),
+                    ),
             )
         })
         .when(recording, |el| {
