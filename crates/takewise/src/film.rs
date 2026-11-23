@@ -51,9 +51,13 @@ pub fn probe(path: &Path) -> Result<FilmInfo, CliError> {
 
 /// The file's size and modification time (RFC 3339, whole seconds).
 pub fn stamp(path: &Path) -> Result<(u64, String), CliError> {
-    let meta = std::fs::metadata(path).map_err(|err| {
-        CliError::Setup(format!("cannot read the film {}: {err}", path.display()))
-    })?;
+    stamp_io(path)
+        .map_err(|err| CliError::Setup(format!("cannot read the film {}: {err}", path.display())))
+}
+
+/// [`stamp`], with the I/O error as it came.
+pub fn stamp_io(path: &Path) -> std::io::Result<(u64, String)> {
+    let meta = std::fs::metadata(path)?;
     let modified = meta
         .modified()
         .ok()

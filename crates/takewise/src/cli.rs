@@ -761,15 +761,17 @@ impl ExportArgs {
     }
 }
 
-/// The film on disk now, measured like `init` measured it: its size and
+/// The film at `path` now, measured like `init` measured it: its size and
 /// modification time, and its duration when `ffprobe` can read it.
-fn film_on_disk(dir: &Path) -> Result<tw::FilmOnDisk, CliError> {
-    let path = Project::open(dir)?.film_path();
+fn film_on_disk(path: &Path) -> tw::Result<tw::FilmOnDisk> {
     if !path.exists() {
         return Ok(tw::FilmOnDisk::Missing);
     }
-    let (size, modified) = film::stamp(&path)?;
-    let duration_s = film::probe(&path).ok().map(|info| info.duration_s);
+    let (size, modified) = film::stamp_io(path).map_err(|source| tw::Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let duration_s = film::probe(path).ok().map(|info| info.duration_s);
     Ok(tw::FilmOnDisk::Found {
         size,
         modified,
@@ -779,7 +781,9 @@ fn film_on_disk(dir: &Path) -> Result<tw::FilmOnDisk, CliError> {
 
 fn export(args: &ExportArgs) -> Result<Outcome, CliError> {
     let dir = args.dir.as_path();
-    let report = tw::export(dir, &args.options(), &film_on_disk(dir)?)?;
+    // Probed at the start and again just before publishing.
+    let film = Project::open(dir)?.film_path();
+    let report = tw::export(dir, &args.options(), &|| film_on_disk(&film))?;
     if report.refused.is_empty() {
         let narration = dir.join("export").join(&report.narration);
         let mut text = format!(

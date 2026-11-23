@@ -331,58 +331,86 @@ fn state_version(dir: &Path) -> Result<StateVersion> {
 }
 
 /// Writes `export/narration.wav` (film length, mono 24-bit) and
-/// `export/manifest.json` from each line's chosen take, after comparing
-/// `film` with the film the project measured.
+/// `export/manifest.json` from each line's chosen take, after comparing the
+/// film on disk (`film` probes it) with the film the project measured.
 ///
-/// The project, script and ledger are read and folded under the project
-/// lock, which is then released while the takes are cleaned and the
+/// The project, script and ledger are read under the project lock, which is
+/// then released while the takes are loaded and analyzed, cleaned and the
 /// narration rendered (`ffmpeg` can take a while). The lock is taken again
 /// to publish: only when the project, script and ledger are unchanged, so
-/// the pair reflects the state at write time. When they changed, the export
-/// renders once more from the new state, then refuses with `state-changed`.
+/// the pair reflects the state at write time, and only when the film probes
+/// as it did at the start (`film-missing`, `film-changed` otherwise). When
+/// the state changed, the export renders once more from the new state, then
+/// refuses with `state-changed`.
 ///
 /// On refusal it writes nothing and removes an earlier manifest, so no stale
 /// pair looks valid; the export is regenerable and takes are untouched.
-pub fn export(dir: &Path, opts: &ExportOptions, film: &FilmOnDisk) -> Result<ExportReport> {
-    export_observed(dir, opts, film, &mut || {})
+pub fn export(
+    dir: &Path,
+    opts: &ExportOptions,
+    film: &dyn Fn() -> Result<FilmOnDisk>,
+) -> Result<ExportReport> {
+    export_observed(dir, opts, film, &mut |_| {})
 }
 
 /// How many times export renders before refusing with `state-changed`.
 const RENDER_ATTEMPTS: usize = 2;
 
-/// [`export`], calling `rendered` after each render, outside the lock.
+/// Where an export is when [`export_observed`] reports to its observer;
+/// both stages run without the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The takes are loaded, analyzed and placed.
+    Planned,
+    /// The narration is rendered to its temp file.
+    Rendered,
+}
+
+/// [`export`], reporting each [`Stage`] to `observe`.
 fn export_observed(
     dir: &Path,
     opts: &ExportOptions,
-    film: &FilmOnDisk,
-    rendered: &mut dyn FnMut(),
+    film: &dyn Fn() -> Result<FilmOnDisk>,
+    observe: &mut dyn FnMut(Stage),
 ) -> Result<ExportReport> {
     let export_dir = dir.join(EXPORT_DIR);
+    let started = film()?;
     for _ in 0..RENDER_ATTEMPTS {
-        let (project, ledger, version, settings, plan) = {
+        let (project, ledger, version) = {
             let _guard = lock(dir)?;
             let version = state_version(dir)?;
-            let project = Project::open(dir)?;
-            let ledger = read(dir)?;
-            let state = fold(&project, &ledger);
-            let settings = opts.settings(project.config.export.as_ref())?;
-            let plan = match plan(&project, &ledger, &state, opts, film) {
-                Ok(plan) => plan,
-                Err(refused) => return refuse(&export_dir, refused),
-            };
-            (project, ledger, version, settings, plan)
+            (Project::open(dir)?, read(dir)?, version)
+        };
+        let state = fold(&project, &ledger);
+        let settings = opts.settings(project.config.export.as_ref())?;
+        let planned = plan(&project, &ledger, &state, opts, &started);
+        observe(Stage::Planned);
+        let plan = match planned {
+            Ok(plan) => plan,
+            Err(refused) => {
+                let _guard = lock(dir)?;
+                if state_version(dir)? == version {
+                    return refuse(&export_dir, refused);
+                }
+                continue;
+            }
         };
         let render = render_export(&project, &ledger, settings, plan)?;
-        rendered();
+        observe(Stage::Rendered);
         let _guard = lock(dir)?;
-        let unchanged = match state_version(dir) {
-            Ok(now) => now == version,
+        let checked = state_version(dir).and_then(|now| Ok((now == version, film()?)));
+        let (unchanged, now) = match checked {
+            Ok(checked) => checked,
             Err(err) => {
                 let _ = fs::remove_file(&render.narration_temp);
                 return Err(err);
             }
         };
         if unchanged {
+            if let Some(refusal) = film_moved(&project, &started, &now) {
+                let _ = fs::remove_file(&render.narration_temp);
+                return refuse(&export_dir, vec![refusal]);
+            }
             return publish_export(&project, &export_dir, render);
         }
         let _ = fs::remove_file(&render.narration_temp);
@@ -398,6 +426,53 @@ fn export_observed(
             ),
         }],
     )
+}
+
+/// Why the film probed before publishing (`now`) is not the one export
+/// started with, if it is not: `film-missing` or `film-changed`.
+fn film_moved(project: &Project, started: &FilmOnDisk, now: &FilmOnDisk) -> Option<Refusal> {
+    let same = match (started, now) {
+        (FilmOnDisk::Missing, FilmOnDisk::Missing) => true,
+        (
+            FilmOnDisk::Found {
+                size,
+                modified,
+                duration_s,
+            },
+            FilmOnDisk::Found {
+                size: size_now,
+                modified: modified_now,
+                duration_s: duration_now,
+            },
+        ) => {
+            size == size_now
+                && modified == modified_now
+                && match (duration_s, duration_now) {
+                    (Some(a), Some(b)) => (a - b).abs() <= FILM_DURATION_TOLERANCE_S,
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    if same {
+        return None;
+    }
+    Some(match now {
+        FilmOnDisk::Missing => Refusal {
+            code: "film-missing",
+            lines: Vec::new(),
+            message: format!(
+                "the film {} went missing while the export rendered",
+                project.film_path().display()
+            ),
+        },
+        FilmOnDisk::Found { .. } => Refusal {
+            code: "film-changed",
+            lines: Vec::new(),
+            message: "the film changed while the export rendered; check the timings, then run `takewise status --refresh-film`".to_owned(),
+        },
+    })
 }
 
 /// Removes an earlier manifest and reports `refused`.
@@ -1200,7 +1275,7 @@ mod tests {
                 use_proposed,
                 ..ExportOptions::default()
             },
-            &unchanged_film(dir),
+            &|| Ok(unchanged_film(dir)),
         )
         .unwrap()
     }
@@ -1703,7 +1778,9 @@ mod tests {
         fs::remove_file(&wav).unwrap();
         fs::create_dir(&wav).unwrap();
         fs::write(wav.join("keep"), b"x").unwrap();
-        let result = export(&dir, &ExportOptions::default(), &unchanged_film(&dir));
+        let result = export(&dir, &ExportOptions::default(), &|| {
+            Ok(unchanged_film(&dir))
+        });
         assert!(result.is_err(), "{result:?}");
         assert!(
             !dir.join("export/manifest.json").exists(),
@@ -1779,7 +1856,7 @@ mod tests {
         choose(&dir, &t);
         let opts = ExportOptions::default();
         let refused = |film: FilmOnDisk| {
-            let report = export(&dir, &opts, &film).unwrap();
+            let report = export(&dir, &opts, &|| Ok(film.clone())).unwrap();
             assert!(!dir.join("export/narration.wav").exists());
             refused_codes(&report)
         };
@@ -1810,11 +1887,11 @@ mod tests {
             vec!["film-changed"]
         );
         // Without ffprobe the duration is unknown: size and time decide.
-        let report = export(&dir, &opts, &found(size, &modified, None)).unwrap();
+        let report = export(&dir, &opts, &|| Ok(found(size, &modified, None))).unwrap();
         assert_eq!(report.refused, []);
         // And a refusal afterwards removes the manifest.
         assert_eq!(
-            refused_codes(&export(&dir, &opts, &FilmOnDisk::Missing).unwrap()),
+            refused_codes(&export(&dir, &opts, &|| Ok(FilmOnDisk::Missing)).unwrap()),
             vec!["film-missing"]
         );
         assert!(!dir.join("export/manifest.json").exists());
@@ -1840,8 +1917,11 @@ mod tests {
         let report = export_observed(
             &dir,
             &ExportOptions::default(),
-            &unchanged_film(&dir),
-            &mut || {
+            &|| Ok(unchanged_film(&dir)),
+            &mut |stage| {
+                if stage != Stage::Rendered {
+                    return;
+                }
                 renders += 1;
                 if renders == 1 {
                     choose_by(&dir, second.take, "claude");
@@ -1867,8 +1947,11 @@ mod tests {
         let report = export_observed(
             &dir,
             &ExportOptions::default(),
-            &unchanged_film(&dir),
-            &mut || {
+            &|| Ok(unchanged_film(&dir)),
+            &mut |stage| {
+                if stage != Stage::Rendered {
+                    return;
+                }
                 renders += 1;
                 choose_by(&dir, t.take, &format!("agent-{renders}"));
             },
@@ -1883,6 +1966,66 @@ mod tests {
             .filter(|n| n.to_string_lossy().ends_with(".tmp"))
             .collect();
         assert_eq!(leftovers, Vec::<std::ffi::OsString>::new());
+    }
+
+    #[test]
+    fn a_film_that_changes_while_rendering_refuses_export() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        assert_eq!(run(&dir, false).refused, []);
+        let start = unchanged_film(&dir);
+        let FilmOnDisk::Found { size, .. } = start.clone() else {
+            unreachable!()
+        };
+        let probes = std::cell::Cell::new(0);
+        for (later, code) in [
+            (FilmOnDisk::Missing, "film-missing"),
+            (
+                FilmOnDisk::Found {
+                    size: size + 1,
+                    modified: "2026-11-23T08:00:00Z".to_owned(),
+                    duration_s: Some(52.0),
+                },
+                "film-changed",
+            ),
+        ] {
+            probes.set(0);
+            let film = || {
+                probes.set(probes.get() + 1);
+                Ok(if probes.get() == 1 {
+                    start.clone()
+                } else {
+                    later.clone()
+                })
+            };
+            let report =
+                export_observed(&dir, &ExportOptions::default(), &film, &mut |_| {}).unwrap();
+            assert_eq!(refused_codes(&report), vec![code]);
+            assert_eq!(probes.get(), 2, "probed at the start and before publishing");
+            assert!(!dir.join("export/manifest.json").exists());
+        }
+    }
+
+    #[test]
+    fn takes_load_without_the_lock() {
+        let (_tmp, dir) = setup(ONE_LINE);
+        let t = take(&dir, "hook", Some((2.0, 3.0)));
+        choose(&dir, &t);
+        let mut stages = Vec::new();
+        let report = export_observed(
+            &dir,
+            &ExportOptions::default(),
+            &|| Ok(unchanged_film(&dir)),
+            &mut |stage| {
+                let file = fs::File::open(dir.join(crate::fsutil::LOCK_FILE)).unwrap();
+                assert!(file.try_lock().is_ok(), "the lock is free at {stage:?}");
+                stages.push(stage);
+            },
+        )
+        .unwrap();
+        assert_eq!(report.refused, []);
+        assert_eq!(stages, [Stage::Planned, Stage::Rendered]);
     }
 
     #[test]
