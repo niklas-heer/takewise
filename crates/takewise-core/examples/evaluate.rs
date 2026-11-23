@@ -170,6 +170,19 @@ const SPELLINGS: &[(&str, &str, Verdict)] = &[
     ("Meet me at 9:30.", "Meet me at nine thirty.", Verdict::Keep),
     ("Meet me at nine thirty.", "Meet me at 9:30.", Verdict::Keep),
     ("Meet me at 9:30.", "Meet me at 9.35.", Verdict::Listen),
+    ("Meet me at 10:00.", "Meet me at 10.00.", Verdict::Keep),
+    ("Meet me at 10:00.", "Meet me at 10.", Verdict::Keep),
+    (
+        "Meet me at 10:00.",
+        "Meet me at ten o'clock.",
+        Verdict::Keep,
+    ),
+    (
+        "Meet me at ten o'clock.",
+        "Meet me at 10:00.",
+        Verdict::Keep,
+    ),
+    ("Meet me at 10:00.", "Meet me at 11.00.", Verdict::Listen),
     // Amounts.
     (
         "It costs $3.50.",

@@ -24,7 +24,8 @@
 //! [`align`] still matches a number split in two on one side against the
 //! joined form on the other (`60 second` and `62nd`, `20 first` and `21st`),
 //! a clock time with a colon such as `11:30` on either side against "eleven
-//! thirty", `11 30` or `11.30` (as whisper writes it) on the other, and
+//! thirty", `11 30` or `11.30` (as whisper writes it) on the other, a full
+//! hour such as `10:00` against "ten", `10`, `10.00` or "ten o'clock", and
 //! "alright" against "all right"; without a colon on one side, two numbers
 //! are never a time.
 //!
@@ -155,7 +156,11 @@ fn same(expected: &Token, heard: &Token) -> bool {
     {
         return true;
     }
-    if is_time_as_decimal(expected, heard) || is_time_as_decimal(heard, expected) {
+    if is_time_as_decimal(expected, heard)
+        || is_time_as_decimal(heard, expected)
+        || is_full_hour(expected, heard)
+        || is_full_hour(heard, expected)
+    {
         return true;
     }
     if let (Some(a), Some(b)) = (whole_number(expected), whole_number(heard))
@@ -192,6 +197,15 @@ fn is_time_as_decimal(time: &Token, decimal: &Token) -> bool {
         && (1..=2).contains(&frac.len())
         && frac.chars().all(|c| c.is_ascii_digit())
         && format!("{frac:0<2}").parse() == Ok(minutes)
+}
+
+/// Whether `hour` is the full hour `time` said without its minutes: `10`
+/// for `10:00`, as "ten", "10" or whisper's `10.00` (`10` once normalized)
+/// say it.
+fn is_full_hour(time: &Token, hour: &Token) -> bool {
+    clock(&time.text).is_some_and(|(hours, minutes)| {
+        minutes == 0 && whole_number(hour) == Some((hours, Form::Cardinal))
+    })
 }
 
 /// A clock time with a colon, such as `11:30`: its hours and minutes.
@@ -263,7 +277,12 @@ fn pair_is_one(first: &Token, second: &Token, one: &Token) -> Option<Join> {
     let spelled = SPLIT_SPELLINGS
         .iter()
         .any(|&(joined, a, b)| one.is_plain(joined) && first.is_plain(a) && second.is_plain(b));
-    if contracted || spelled {
+    // "ten o'clock" is `10:00`.
+    let full_hour = second.is_plain("o'clock")
+        && clock(&one.text).is_some_and(|(hours, minutes)| {
+            minutes == 0 && whole_number(first) == Some((hours, Form::Cardinal))
+        });
+    if contracted || spelled || full_hour {
         return Some(Join::Same);
     }
     let joined = one.text.len() == first.text.len() + second.text.len()
@@ -1864,6 +1883,43 @@ mod tests {
         assert_eq!(diffs.len(), 1, "{diffs:?}");
         assert_eq!(diffs[0].expected.as_deref(), Some("-$5"));
         assert_ne!(align(&normalize("It lost $5"), &heard("It lost -$5")), []);
+    }
+
+    #[test]
+    fn a_full_hour_matches_its_spoken_forms() {
+        for said in [
+            "at 10.00",
+            "at 10:00",
+            "at 10",
+            "at ten",
+            "at ten o'clock",
+            "at 10 o'clock",
+            "at ten o’clock",
+        ] {
+            assert_eq!(align(&normalize("at 10:00"), &heard(said)), [], "{said}");
+        }
+        for (script, said) in [
+            ("at ten o'clock", "at 10:00"),
+            ("at 10:00", "at ten o'clock"),
+        ] {
+            assert_eq!(
+                align(&normalize(script), &heard(said)),
+                [],
+                "{script} / {said}"
+            );
+            assert_eq!(
+                align(&normalize(said), &heard(script)),
+                [],
+                "{said} / {script}"
+            );
+        }
+        // Another hour is a difference.
+        assert_ne!(align(&normalize("at 10:00"), &heard("at 11.00")), []);
+        assert_ne!(
+            align(&normalize("at 10:00"), &heard("at eleven o'clock")),
+            []
+        );
+        assert_ne!(align(&normalize("at 10:30"), &heard("at 10")), []);
     }
 
     #[test]
