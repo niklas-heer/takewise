@@ -75,6 +75,38 @@ impl Frames {
         }
         longest as f64 * self.frame_s
     }
+
+    /// Where the sound resumes after the last silent run of at least
+    /// `gap_s` that starts between `from` and `to` seconds: the start of
+    /// the first sound frame after it, in seconds; `None` without such a
+    /// run or when no sound follows it.
+    pub fn sound_after_gap(&self, from: f64, to: f64, gap_s: f64) -> Option<f64> {
+        if self.frame_s <= 0.0 || to <= from {
+            return None;
+        }
+        let first = to_index((from / self.frame_s - 1e-6).ceil());
+        let last = to_index((to / self.frame_s + 1e-6).floor());
+        let mut found = None;
+        let mut silence_from: Option<usize> = None;
+        for (i, &level) in self.levels_dbfs.iter().enumerate().skip(first) {
+            if level <= self.threshold_dbfs {
+                if silence_from.is_none() && i >= last {
+                    break;
+                }
+                silence_from.get_or_insert(i);
+                continue;
+            }
+            if let Some(start) = silence_from.take()
+                && (i - start) as f64 * self.frame_s >= gap_s - 1e-9
+            {
+                found = Some(i as f64 * self.frame_s);
+            }
+            if i >= last {
+                break;
+            }
+        }
+        found
+    }
 }
 
 fn dbfs(amplitude: f64) -> f64 {

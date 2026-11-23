@@ -47,8 +47,9 @@ pub enum Transcript {
 /// `t` in the take is `line_offset_s + t` in line time. Early start is
 /// measured from the energy speech start, unless silence of at least
 /// [`BREATH_GAP_S`] lies between it and the first transcribed word (a breath
-/// or a noise before the words), then from that word; overrun always from
-/// the energy speech end.
+/// or a noise before the words), then from where the sound resumes after
+/// the last such gap (DTW places words late); overrun always from the
+/// energy speech end.
 /// `speech` and the transcript's times stay in seconds from the take's first
 /// sample; `overrun_s` is signed (negative when speech ends inside the slot).
 pub fn build_checked(
@@ -165,7 +166,14 @@ fn speech_onset(analysis: &Analysis, heard: Option<&[Word]>) -> Option<f64> {
         (Some(energy), Some(word))
             if analysis.frames.longest_silence_s(energy, word) >= BREATH_GAP_S - 1e-9 =>
         {
-            Some(word)
+            // DTW places a word late, so the sound after the gap is the
+            // words' onset.
+            Some(
+                analysis
+                    .frames
+                    .sound_after_gap(energy, word, BREATH_GAP_S)
+                    .unwrap_or(word),
+            )
         }
         (Some(energy), _) => Some(energy),
         (None, word) => word,
@@ -400,6 +408,23 @@ mod tests {
         let checked = check(&analysis, &words_from(LINE, 0.6));
         assert_eq!(checked.verdict, Verdict::Retake);
         assert_eq!(codes(&checked), ["early-start"]);
+    }
+
+    #[test]
+    fn rule_early_start_after_a_breath_from_the_sound_after_the_gap() {
+        // A breath, a gap, then the words' sound 0.4 s before the line; DTW
+        // places the first word 0.15 s late, at 0.25 s early, which alone
+        // would pass. The sound after the gap is the real start.
+        let analysis = voiced(&[(0.2, 0.3), (0.6, 3.5)]);
+        let checked = check(&analysis, &words_from(LINE, 0.75));
+        assert_eq!(checked.verdict, Verdict::Retake, "{:?}", checked.reasons);
+        assert_eq!(codes(&checked), ["early-start"]);
+        assert!(checked.reasons[0].message.contains("0.40 s"));
+
+        // Two breaths: the sound after the last gap before the words counts.
+        let analysis = voiced(&[(0.1, 0.2), (0.4, 0.5), (0.8, 3.5)]);
+        let checked = check(&analysis, &words_from(LINE, 0.9));
+        assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
     }
 
     #[test]
