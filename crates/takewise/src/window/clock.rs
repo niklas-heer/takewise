@@ -37,6 +37,9 @@ pub struct FilmClock {
     scheduled_from_s: f64,
     /// Whether the player was read playing since the current start.
     read_back: bool,
+    /// The mapping a start would have scheduled, when the player refused to
+    /// play: it places the take, though the film never follows it.
+    assumed: Option<Timebase>,
 }
 
 impl FilmClock {
@@ -47,6 +50,27 @@ impl FilmClock {
     /// Whether the film was scheduled (and not stopped since).
     pub fn started(&self) -> bool {
         self.start_host_s.is_some()
+    }
+
+    /// Whether samples can be placed: the film was scheduled, or a refused
+    /// start's mapping is assumed.
+    pub fn placed(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    /// Records the mapping [`FilmClock::start`] would have scheduled at
+    /// `now`, for a player that refused to play: the take is placed by it,
+    /// and [`FilmClock::unplayed_lateness_s`] says how far it ran ahead of
+    /// the film that never moved. Only before any start.
+    pub fn assume(&mut self, now: f64, from_s: f64, hold_s: f64) -> Timebase {
+        let tb = Timebase {
+            rate: 1.0,
+            film_anchor_s: from_s,
+            host_anchor_s: now + START_LEAD_S + hold_s,
+        };
+        self.history.record(f64::NEG_INFINITY, tb);
+        self.assumed = Some(tb);
+        tb
     }
 
     /// Schedules the film to play from `from_s` after holding its frame for
@@ -112,8 +136,12 @@ impl FilmClock {
     /// How far the film is behind its schedule at `host_s` when the player
     /// was never read playing since the current start, although it should
     /// have been: the scheduled mapping then still places the take, off by
-    /// at least this much. `None` once it played, or before it was due.
+    /// at least this much. `None` once it played, or before it was due. For
+    /// an assumed mapping, how far it ran past its start.
     pub fn unplayed_lateness_s(&self, media: &dyn Media, host_s: f64) -> Option<f64> {
+        if let Some(tb) = self.assumed {
+            return Some((tb.film_at(host_s) - tb.film_anchor_s).max(0.0));
+        }
         let start = self.start_host_s?;
         if self.read_back || host_s < start + READ_BACK_AFTER_S {
             return None;

@@ -331,7 +331,8 @@ impl Recorder {
     }
 
     /// Stops the take and commits it. A take without any audio is dropped
-    /// (nothing was begun on disk). When the take cannot be saved, it is
+    /// (nothing was begun on disk); one whose film could not be scheduled
+    /// is placed where the film should have played, and flagged. When the take cannot be saved, it is
     /// kept in memory and saving is retried; the error says so.
     pub fn finish_take(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
         let Phase::Recording(take) = mem::replace(&mut self.phase, Phase::Idle) else {
@@ -360,7 +361,7 @@ impl Recorder {
         if written.samples.is_empty() {
             return Update::default();
         }
-        if !clock.started() {
+        if !clock.placed() {
             return Update {
                 committed: None,
                 message: Some("Stopped before the film started; nothing was recorded.".to_owned()),
@@ -677,7 +678,14 @@ fn start_film(
                     take.line_start_host_s =
                         Some(tb.host_anchor_s + (take.line_start - tb.film_anchor_s));
                 }
-                Err(err) => failure = Some(format!("the film cannot play: {err}")),
+                Err(err) => {
+                    // The audio is kept, placed where the film should have
+                    // played.
+                    let plan = take.plan;
+                    take.clock
+                        .assume(now, plan.film_from_s, plan.hold_first_frame_s);
+                    failure = Some(format!("the film cannot play: {err}"));
+                }
             }
         } else if now - take.capture_started_host_s > FIRST_BUFFER_TIMEOUT_S {
             failure = Some(format!(

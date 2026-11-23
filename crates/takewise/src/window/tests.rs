@@ -38,6 +38,8 @@ struct Fake {
     /// The player's timebase as read back; by default the last scheduled
     /// one once its start has passed, and stopped before.
     timebase: Option<Timebase>,
+    /// Why `film_play_at` fails, when it does.
+    play_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -59,6 +61,7 @@ impl FakeMedia {
             capture_error: None,
             plays: Vec::new(),
             timebase: None,
+            play_error: None,
         })))
     }
 
@@ -96,6 +99,9 @@ impl Media for FakeMedia {
         true
     }
     fn film_play_at(&mut self, film_s: f64, host_s: f64) -> Result<Timebase, String> {
+        if let Some(err) = self.0.borrow().play_error.clone() {
+            return Err(err);
+        }
         self.0.borrow_mut().plays.push((film_s, host_s));
         Ok(Timebase {
             rate: 1.0,
@@ -1172,6 +1178,31 @@ fn a_film_that_does_not_start_stops_the_take_and_keeps_it(cx: &mut TestAppContex
         shown.contains("the film did not start; check the film file"),
         "{shown}"
     );
+}
+
+#[gpui_kit::test]
+fn a_film_that_cannot_play_keeps_the_audio_as_a_take(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d: start 8.0
+    f.media.0.borrow_mut().play_error = Some("no output device".to_owned());
+    begin(cx, &f, 100.0); // the film would have played 6.0 at host 100.4
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 1, "the audio is kept as a take");
+    let event = &takes[0].2;
+    assert_eq!(event.samples, 2400);
+    assert!(
+        close(event.line_offset_s, -2.4),
+        "placed by the scheduled mapping: {}",
+        event.line_offset_s
+    );
+    assert_eq!(event.film_shift_ms, None, "stopped before the film was due");
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.contains("the film cannot play: no output device"),
+        "{shown}"
+    );
+    assert!(shown.contains("Recorded d take 1"), "{shown}");
 }
 
 #[gpui_kit::test]
