@@ -27,6 +27,7 @@
 //! duration of its tokens' offsets (durations are sound even where the
 //! offsets' positions are not), or at the next word's start, whichever is
 //! first. Confidence is the lowest token probability in the word.
+//! Annotations such as `[BLANK_AUDIO]` or `(sighs)` are dropped.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ use serde::Deserialize;
 use crate::check::Transcript;
 use crate::ledger::Word;
 use crate::project::CheckConfig;
+use crate::words::drop_annotations;
 
 /// Words this far outside the energy speech range are dropped as
 /// hallucinations (whisper likes to hear "Thank you." in silence).
@@ -346,7 +348,7 @@ pub fn parse_full_json(text: &str) -> Result<Vec<Word>, String> {
         }
     }
     let starts: Vec<f64> = partials.iter().map(|p| p.start_cs as f64 / 100.0).collect();
-    Ok(partials
+    let words = partials
         .iter()
         .enumerate()
         .map(|(i, partial)| {
@@ -362,7 +364,8 @@ pub fn parse_full_json(text: &str) -> Result<Vec<Word>, String> {
                 confidence: Some(partial.confidence),
             }
         })
-        .collect())
+        .collect();
+    Ok(drop_annotations(words))
 }
 
 /// Drops words entirely outside the energy speech range widened by
@@ -502,6 +505,28 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         // first.
         assert!((words[1].end - 3.40).abs() < 1e-9, "{:?}", words[1]);
         assert_eq!(words[0].confidence, Some(0.6));
+    }
+
+    #[test]
+    fn parses_without_annotations() {
+        let json = r#"{"transcription": [{"tokens": [
+            {"text": " [", "offsets": {"from": 0, "to": 10}, "p": 0.5, "t_dtw": 10},
+            {"text": "BL", "offsets": {"from": 10, "to": 20}, "p": 0.5, "t_dtw": 12},
+            {"text": "ANK", "offsets": {"from": 20, "to": 30}, "p": 0.5, "t_dtw": 14},
+            {"text": "_", "offsets": {"from": 30, "to": 40}, "p": 0.5, "t_dtw": 16},
+            {"text": "AUDIO", "offsets": {"from": 40, "to": 50}, "p": 0.5, "t_dtw": 18},
+            {"text": "]", "offsets": {"from": 50, "to": 60}, "p": 0.5, "t_dtw": 20},
+            {"text": " Nobody", "offsets": {"from": 100, "to": 400}, "p": 0.9, "t_dtw": 110},
+            {"text": " (", "offsets": {"from": 400, "to": 410}, "p": 0.5, "t_dtw": 140},
+            {"text": "sigh", "offsets": {"from": 410, "to": 500}, "p": 0.5, "t_dtw": 145},
+            {"text": "s", "offsets": {"from": 500, "to": 510}, "p": 0.5, "t_dtw": 150},
+            {"text": ")", "offsets": {"from": 510, "to": 520}, "p": 0.5, "t_dtw": 152},
+            {"text": " misses", "offsets": {"from": 600, "to": 900}, "p": 0.9, "t_dtw": 160}
+        ]}]}"#;
+        let words = parse_full_json(json).unwrap();
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["Nobody", "misses"]);
+        assert!((words[0].start - 1.10).abs() < 1e-9, "{:?}", words[0]);
     }
 
     #[test]

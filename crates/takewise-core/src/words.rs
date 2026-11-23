@@ -705,6 +705,45 @@ fn ordinal(word: &str) -> String {
     }
 }
 
+/// Removes the bracketed or parenthesized annotations whisper writes for
+/// sounds, such as `[BLANK_AUDIO]`, `(sighs)` or `[Music]`, before
+/// alignment; an annotation may span several words. Words keep their times.
+/// When a bracket is never closed, nothing is removed.
+pub fn drop_annotations(words: Vec<Word>) -> Vec<Word> {
+    let mut depth = 0_usize;
+    let mut kept = Vec::new();
+    for word in &words {
+        let mut text = String::new();
+        let mut bracketed = false;
+        for c in word.text.chars() {
+            match c {
+                '[' | '(' => {
+                    depth += 1;
+                    bracketed = true;
+                }
+                ']' | ')' => {
+                    depth = depth.saturating_sub(1);
+                    bracketed = true;
+                }
+                _ if depth == 0 => text.push(c),
+                _ => bracketed = true,
+            }
+        }
+        if !bracketed {
+            kept.push(word.clone());
+        } else if text.chars().any(char::is_alphanumeric) {
+            kept.push(Word {
+                text: text.trim().to_owned(),
+                ..word.clone()
+            });
+        }
+    }
+    if depth > 0 {
+        return words;
+    }
+    kept
+}
+
 /// A normalized heard token with the times of the words it came from.
 struct Heard {
     token: Token,
@@ -973,6 +1012,25 @@ mod tests {
         );
         assert_eq!(shown("Rock & roll"), tokens("rock and roll"));
         assert_eq!(shown("  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn drops_bracketed_annotations() {
+        let said =
+            |words: Vec<Word>| -> Vec<String> { words.into_iter().map(|w| w.text).collect() };
+        let words =
+            heard("[BLANK_AUDIO] Nobody (sighs) misses [Music] a (clears throat) birthday.");
+        let kept = drop_annotations(words);
+        assert_eq!(said(kept.clone()), ["Nobody", "misses", "a", "birthday."]);
+        // Each word keeps its own times.
+        assert_eq!(kept[1].start, 3.0);
+        // An annotation inside a word goes, the word stays.
+        assert_eq!(
+            said(drop_annotations(heard("hello(laughs) there"))),
+            ["hello", "there"]
+        );
+        // An unclosed bracket is not an annotation.
+        assert_eq!(said(drop_annotations(heard("a (b c"))), ["a", "(b", "c"]);
     }
 
     #[test]
