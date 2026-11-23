@@ -399,6 +399,29 @@ mod tests {
     }
 
     #[test]
+    fn compound_join_listens() {
+        let checked = build_checked(
+            &Snapshot {
+                text: "Everyone looked at it.".to_owned(),
+                ..snapshot()
+            },
+            OFFSET,
+            &analysis(),
+            &words("Every one looked at it."),
+            CHECKER,
+        );
+        assert_eq!(checked.verdict, Verdict::Listen);
+        assert_eq!(codes(&checked), ["possible-mishearing"]);
+        assert!(
+            checked.reasons[0]
+                .message
+                .contains("“every one” for “everyone”"),
+            "{:?}",
+            checked.reasons
+        );
+    }
+
+    #[test]
     fn short_line_single_substitution_listens() {
         let checked = check(&analysis(), &words("Nobody misses a birthdays"));
         assert_eq!(checked.verdict, Verdict::Listen);

@@ -26,9 +26,11 @@
 //! `family's`, and `Niklas` for `Niklas's` or `Niklas'`; a plain script word
 //! only accepts its own spelling (with or without a heard apostrophe), so
 //! "the light is below" heard as "the lights below" is a difference. Two
-//! words on one side match their concatenation on the other ("every day" and
-//! "everyday"). Diffs name normalized tokens, such as `kindred` or `link's`,
-//! not the original spelling.
+//! words on one side against their concatenation on the other ("every day"
+//! and "everyday", "every one" and "everyone") are one substitution, a
+//! possible mishearing, since they often mean different things. Diffs name
+//! normalized tokens, such as `kindred` or `link's`, not the original
+//! spelling.
 
 use crate::ledger::{Word, WordDiff, WordDiffKind};
 
@@ -919,8 +921,9 @@ struct Heard {
 
 /// Aligns normalized expected tokens with the heard words by minimum edit
 /// distance (a substitution costs 1, a missing or extra token 1 each, so a
-/// substitution always beats a missing+extra pair; two tokens matching one
-/// on the other side cost nothing). `at` is the heard word's start for extra
+/// substitution always beats a missing+extra pair; two tokens that are one
+/// on the other side cost nothing, or a substitution for a compound, which
+/// is reported as one). `at` is the heard word's start for extra
 /// and substituted tokens; for a missing token it is the end of the heard
 /// word before it, or the start of the first heard word when nothing was
 /// heard before it, or `None` when nothing was heard at all.
@@ -1011,6 +1014,18 @@ impl Alignment<'_> {
             if let Some(join) = self.two_heard_as_one(i, j)
                 && cost[i][j] == cost[i - 2][j - 1] + join_cost(join)
             {
+                if join == Join::Compound {
+                    diffs.push(WordDiff {
+                        kind: WordDiffKind::Substituted,
+                        expected: Some(format!(
+                            "{} {}",
+                            expected[i - 2].display(),
+                            expected[i - 1].display()
+                        )),
+                        heard: Some(heard[j - 1].token.display()),
+                        at: Some(heard[j - 1].start),
+                    });
+                }
                 i -= 2;
                 j -= 1;
                 continue;
@@ -1018,6 +1033,18 @@ impl Alignment<'_> {
             if let Some(join) = self.one_heard_as_two(i, j)
                 && cost[i][j] == cost[i - 1][j - 2] + join_cost(join)
             {
+                if join == Join::Compound {
+                    diffs.push(WordDiff {
+                        kind: WordDiffKind::Substituted,
+                        expected: Some(expected[i - 1].display()),
+                        heard: Some(format!(
+                            "{} {}",
+                            heard[j - 2].token.display(),
+                            heard[j - 1].token.display()
+                        )),
+                        at: Some(heard[j - 2].start),
+                    });
+                }
                 i -= 1;
                 j -= 2;
                 continue;
@@ -1065,10 +1092,12 @@ impl Alignment<'_> {
     }
 }
 
-/// What a join of two tokens with one costs in the alignment.
+/// What a join of two tokens with one costs in the alignment: nothing for
+/// the same words, a substitution for a compound.
 fn join_cost(join: Join) -> usize {
     match join {
-        Join::Same | Join::Compound => 0,
+        Join::Same => 0,
+        Join::Compound => 1,
     }
 }
 
@@ -1501,24 +1530,32 @@ mod tests {
     }
 
     #[test]
-    fn align_matches_compounds_both_ways() {
-        for (script, said) in [
-            ("every day", "everyday"),
-            ("every one", "everyone"),
-            ("open source", "opensource"),
+    fn align_flags_compounds_both_ways() {
+        let substituted = |expected: &str, heard: &str, at: f64| WordDiff {
+            kind: WordDiffKind::Substituted,
+            expected: Some(expected.to_owned()),
+            heard: Some(heard.to_owned()),
+            at: Some(at),
+        };
+        for (script, said, two, one, at) in [
+            ("every day", "everyday", "every day", "everyday", 0.0),
+            ("every one", "everyone", "every one", "everyone", 0.0),
             (
                 "Kindred is free and open-source.",
                 "Kindred is free and opensource",
+                "open source",
+                "opensource",
+                4.0,
             ),
         ] {
             assert_eq!(
                 align(&normalize(script), &heard(said)),
-                [],
+                [substituted(two, one, at)],
                 "{script} / {said}"
             );
             assert_eq!(
                 align(&normalize(said), &heard(script)),
-                [],
+                [substituted(one, two, at)],
                 "{said} / {script}"
             );
         }
