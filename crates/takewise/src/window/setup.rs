@@ -39,6 +39,9 @@ pub struct Setup {
     pub listening_until: Option<f64>,
     pub voice: Option<VoiceReport>,
     pub room: Option<RoomReport>,
+    /// Why the room tone or `[setup]` could not be saved: the step stays
+    /// until a new room recording saves.
+    pub save_error: Option<String>,
     /// What went wrong last, in words.
     pub error: Option<String>,
 }
@@ -50,6 +53,7 @@ impl Setup {
             listening_until: None,
             voice: None,
             room: None,
+            save_error: None,
             error: None,
         }
     }
@@ -120,6 +124,12 @@ impl RecordingWindow {
             Step::Voice => {
                 setup.error = Some("Read the sentence first: press Space.".to_owned());
             }
+            Step::Room if setup.save_error.is_some() => {
+                setup.error = Some(
+                    "The setup check is not saved; fix the problem above, then press Space to record the room again."
+                        .to_owned(),
+                );
+            }
             Step::Room if setup.room.is_some() && stale => setup.step = Step::Latency,
             Step::Room if setup.room.is_some() => self.finish_setup(),
             Step::Room => {
@@ -164,17 +174,21 @@ impl RecordingWindow {
                     .map_or(tw::speech::SILENCE_DBFS, |v| v.speech_rms_dbfs);
                 let room = room_report(&samples, RECORD_RATE, speech);
                 setup.room = Some(room.clone());
-                self.save_setup(&samples, &room);
+                let saved = self.save_setup(&samples, &room);
+                if let Some(setup) = &mut self.setup {
+                    setup.save_error = saved.err();
+                }
             }
             Step::Devices | Step::Latency => {}
         }
     }
 
-    /// Keeps the room tone and writes `[setup]`.
-    fn save_setup(&mut self, samples: &[i32], room: &RoomReport) {
+    /// Keeps the room tone, then writes `[setup]`; `[setup]` is not
+    /// written without its room tone. The error says what was not saved.
+    fn save_setup(&mut self, samples: &[i32], room: &RoomReport) -> Result<(), String> {
         let route = self.current_route();
         let Some(input) = route.input.clone() else {
-            return;
+            return Err("Not saved: no input device is chosen.".to_owned());
         };
         let output = route.output.clone().unwrap_or_default();
         let now = jiff::Timestamp::now();
@@ -185,7 +199,11 @@ impl RecordingWindow {
             floor_dbfs: room.floor_dbfs,
             gated: room.gated,
         };
-        let saved = tw::room::save_room_tone(&self.dir, samples, RECORD_RATE, now, &room_input);
+        if let Err(err) =
+            tw::room::save_room_tone(&self.dir, samples, RECORD_RATE, now, &room_input)
+        {
+            return Err(format!("Could not keep the room tone: {err}"));
+        }
         let info = SetupInfo {
             date: now.strftime("%Y-%m-%d").to_string(),
             input,
@@ -194,17 +212,11 @@ impl RecordingWindow {
             room_floor_dbfs: (!room.gated).then_some(room.floor_dbfs),
             speech_to_noise_db: room.snr_db,
         };
-        let written = tw::set_setup(&self.dir, &info);
-        let error = match (saved, written) {
-            (Ok(_), Ok(())) => None,
-            (Err(err), _) => Some(format!("Could not keep the room tone: {err}")),
-            (_, Err(err)) => Some(format!("Could not save the setup check: {err}")),
-        };
+        let written = tw::set_setup(&self.dir, &info)
+            .map_err(|err| format!("Could not save the setup check: {err}"));
         self.reload();
         self.check_inputs();
-        if let Some(setup) = &mut self.setup {
-            setup.error = error;
-        }
+        written
     }
 
     /// Why the setup check should run, if it should: none ran, the devices
@@ -288,7 +300,11 @@ impl RecordingWindow {
                     colors::DIM,
                 ));
                 if let Some(room) = &setup.room {
-                    body.extend(room_lines(room).into_iter().map(|(t, c)| line(t, c)));
+                    let saved = setup.save_error.is_none();
+                    body.extend(room_lines(room, saved).into_iter().map(|(t, c)| line(t, c)));
+                }
+                if let Some(error) = &setup.save_error {
+                    body.push(line(error.clone(), colors::RECORD));
                 }
             }
             Step::Latency => {
@@ -385,8 +401,9 @@ fn voice_lines(voice: &VoiceReport) -> Vec<(String, u32)> {
     lines
 }
 
-/// The room step's report in words, with a color each.
-fn room_lines(room: &RoomReport) -> Vec<(String, u32)> {
+/// The room step's report in words, with a color each; `saved` says
+/// whether the room tone and `[setup]` were saved.
+fn room_lines(room: &RoomReport, saved: bool) -> Vec<(String, u32)> {
     let mut lines = Vec::new();
     match room.snr_db {
         Some(snr) => {
@@ -406,9 +423,11 @@ fn room_lines(room: &RoomReport) -> Vec<(String, u32)> {
         None => lines.push(("Silent between words (gated).".to_owned(), colors::TEXT)),
     }
     lines.extend(room.tips.iter().map(|t| (t.clone(), colors::DIM)));
-    lines.push((
-        "Saved as room tone. Press Enter to continue.".to_owned(),
-        colors::DIM,
-    ));
+    if saved {
+        lines.push((
+            "Saved as room tone. Press Enter to continue.".to_owned(),
+            colors::DIM,
+        ));
+    }
     lines
 }

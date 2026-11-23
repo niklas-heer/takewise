@@ -2736,6 +2736,59 @@ fn setup_writes_project_toml(cx: &mut TestAppContext) {
     assert!(message(cx, &f.view).contains("Setup check saved"));
 }
 
+/// The setup check's state, read from the window.
+fn setup_of(cx: &mut TestAppContext, f: &Fixture) -> super::setup::Setup {
+    f.view
+        .read_with(cx, |view, _| view.setup.clone())
+        .expect("the setup check is open")
+}
+
+#[gpui_kit::test]
+fn a_room_tone_that_cannot_be_kept_is_not_saved(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // A file where the room tone directory goes.
+    fs::write(f.dir.join("takes/.room"), b"").expect("block");
+    through_voice(cx, &f);
+    listen(cx, &f, &room_buffers());
+    let error = setup_of(cx, &f).save_error.expect("an error");
+    assert!(error.contains("Could not keep the room tone"), "{error}");
+    assert_eq!(Project::open(&f.dir).expect("project").config.setup, None);
+
+    press(cx, f.window, &["enter"]);
+    let setup = setup_of(cx, &f);
+    assert_eq!(setup.step, super::setup::Step::Room, "the step stays");
+    assert!(setup.save_error.is_some(), "the error stays visible");
+    assert!(!message(cx, &f.view).contains("Setup check saved"));
+}
+
+#[gpui_kit::test]
+fn a_setup_that_cannot_be_written_is_not_saved(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    fs::create_dir_all(f.dir.join("takes/.room")).expect("room dir");
+    through_voice(cx, &f);
+    fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).expect("lock");
+    listen(cx, &f, &room_buffers());
+    press(cx, f.window, &["enter"]);
+    fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).expect("unlock");
+    let setup = setup_of(cx, &f);
+    let error = setup.save_error.expect("an error");
+    assert!(error.contains("Could not save the setup check"), "{error}");
+    assert_eq!(setup.step, super::setup::Step::Room);
+    assert!(!message(cx, &f.view).contains("Setup check saved"));
+
+    // Recording the room again saves it.
+    listen(cx, &f, &room_buffers());
+    assert_eq!(setup_of(cx, &f).save_error, None);
+    assert!(
+        Project::open(&f.dir)
+            .expect("project")
+            .config
+            .setup
+            .is_some()
+    );
+}
+
 /// An installer that reports half the model, waits for the test to let it
 /// finish, then hears with its transcriber.
 struct FakeInstaller {
