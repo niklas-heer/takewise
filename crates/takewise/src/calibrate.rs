@@ -92,7 +92,8 @@ pub fn make_beep_film(dir: &Path) -> Result<PathBuf, String> {
     let video = format!("testsrc2=s=640x360:r=30:d={FILM_LEN_S}");
     // LPCM audio, so no codec priming shifts the beeps.
     let film = dir.join("beeps.mov");
-    let status = Command::new("ffmpeg")
+    let ffmpeg = takewise_core::whisper::find_tool("ffmpeg").unwrap_or_else(|| "ffmpeg".into());
+    let status = Command::new(ffmpeg)
         .args([
             "-hide_banner",
             "-loglevel",

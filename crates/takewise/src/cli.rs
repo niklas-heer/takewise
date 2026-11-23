@@ -704,19 +704,8 @@ struct Check {
     detail: String,
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-}
-
 fn tool_check(name: &'static str, install: &str) -> Check {
-    match which(name) {
+    match tw::whisper::find_tool(name) {
         Some(path) => Check {
             name,
             ok: true,
@@ -725,7 +714,9 @@ fn tool_check(name: &'static str, install: &str) -> Check {
         None => Check {
             name,
             ok: false,
-            detail: format!("not on PATH; install with `{install}`"),
+            detail: format!(
+                "not on PATH or in /opt/homebrew/bin or /usr/local/bin; install with `{install}`"
+            ),
         },
     }
 }

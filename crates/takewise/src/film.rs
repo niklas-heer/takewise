@@ -10,7 +10,8 @@ use crate::cli::CliError;
 /// Measures the film with `ffprobe` and its file metadata.
 pub fn probe(path: &Path) -> Result<FilmInfo, CliError> {
     let (size, modified) = stamp(path)?;
-    let output = Command::new("ffprobe")
+    let ffprobe = takewise_core::whisper::find_tool("ffprobe").unwrap_or_else(|| "ffprobe".into());
+    let output = Command::new(ffprobe)
         .args([
             "-v",
             "error",

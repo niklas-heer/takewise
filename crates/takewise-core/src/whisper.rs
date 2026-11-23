@@ -185,11 +185,8 @@ impl WhisperCli {
     /// `/opt/homebrew/bin` and `/usr/local/bin`) and the configured model in
     /// `$TAKEWISE_MODELS` or `~/.local/share/takewise/models`.
     pub fn discover(config: &CheckConfig) -> Result<WhisperCli, SetupError> {
-        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).collect())
-            .unwrap_or_default();
-        dirs.extend(FALLBACK_TOOL_DIRS.iter().map(PathBuf::from));
-        Self::discover_in(config, &dirs, &models_dir())
+        let path = std::env::var_os("PATH");
+        Self::discover_in(config, &tool_dirs(path.as_deref()), &models_dir())
     }
 
     /// [`WhisperCli::discover`] with explicit search directories.
@@ -273,6 +270,26 @@ impl Transcriber for WhisperCli {
     fn model(&self) -> String {
         self.model_name()
     }
+}
+
+/// Where tools are looked for: the directories of `path` (a `$PATH` value),
+/// then `/opt/homebrew/bin` and `/usr/local/bin`, since an app started from
+/// Finder gets only `/usr/bin:/bin:/usr/sbin:/sbin`.
+pub fn tool_dirs(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path
+        .map(|path| std::env::split_paths(path).collect())
+        .unwrap_or_default();
+    dirs.extend(FALLBACK_TOOL_DIRS.iter().map(PathBuf::from));
+    dirs
+}
+
+/// The executable `name` in the first of [`tool_dirs`] of `$PATH` that has
+/// it, as the checks find their tools.
+pub fn find_tool(name: &str) -> Option<PathBuf> {
+    tool_dirs(std::env::var_os("PATH").as_deref())
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|path| is_executable(path))
 }
 
 /// `$TAKEWISE_MODELS`, or `~/.local/share/takewise/models`.
@@ -890,6 +907,17 @@ while [ $# -gt 0 ]; do if [ "$1" = "-of" ]; then out=$2; fi; shift; done
         ]}]}"#;
         let err = parse_full_json(json).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn tools_are_found_in_homebrew_with_a_minimal_path() {
+        let dirs = tool_dirs(Some(std::ffi::OsStr::new("/usr/bin:/bin")));
+        let dirs: Vec<&str> = dirs.iter().filter_map(|dir| dir.to_str()).collect();
+        assert_eq!(
+            dirs,
+            ["/usr/bin", "/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+        );
+        assert_eq!(tool_dirs(None).len(), 2);
     }
 
     #[test]

@@ -606,6 +606,39 @@ fn cli_check_setup_errors_exit_2() {
     assert_eq!(value["error"]["code"], "unknown-take", "{value}");
 }
 
+/// Takewise.app started from Finder gets `PATH=/usr/bin:/bin`: the tools
+/// are still found where Homebrew installs them, as the checks find them.
+#[test]
+fn doctor_finds_the_tools_with_a_minimal_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, value) = json(
+        takewise()
+            .arg("doctor")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", tmp.path()),
+    );
+    let checks = value["data"]["checks"].as_array().unwrap();
+    for tool in ["whisper-cli", "ffmpeg", "ffprobe"] {
+        let installed = ["/usr/bin", "/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(tool))
+            .find(|path| {
+                fs::metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            });
+        let check = checks.iter().find(|c| c["name"] == tool).unwrap();
+        match installed {
+            Some(path) => {
+                assert_eq!(check["ok"], true, "{check}");
+                assert_eq!(check["detail"], path.display().to_string(), "{check}");
+            }
+            None => assert_eq!(check["ok"], false, "{check}"),
+        }
+    }
+}
+
 #[test]
 fn doctor_reports_checks() {
     let tmp = tempfile::tempdir().unwrap();
