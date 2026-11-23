@@ -53,6 +53,8 @@ cargo build -p takewise --features screenshots
 # quality (no visible banding in the film's gradients) and lossless
 # recompression.
 for png in "$root"/docs/images/*.png; do
+  # The icon is exported from packaging/AppIcon.icns, not rendered here.
+  [[ "$(basename "$png")" == icon.png ]] && continue
   pngquant --quality 85-98 --speed 1 --strip --force --output "$png" "$png" \
     || { status=$?; [[ $status -eq 99 ]] || exit "$status"; echo "kept $png in full color"; }
   oxipng -q -o 4 --strip safe "$png"
