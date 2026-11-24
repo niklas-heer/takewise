@@ -258,6 +258,7 @@ input = "RODECaster Duo Main Stereo"
 output = "RODECaster Duo Main Stereo"
 buffer_frames = 512                      # the capture buffer during the measurement
 date = "2026-11-23"
+# from = "remembered"                    # copied from an earlier measurement (milestone 6)
 
 [export]
 format = "wav"        # wav or flac
@@ -272,9 +273,10 @@ channel = 1
 output = "RODECaster Duo Main Stereo"
 room_floor_dbfs = -68.0
 speech_to_noise_db = 46.0
+# from = "remembered" # adopted from another project's check today (milestone 6)
 ```
 
-`[calibration]` also records the capture buffer size; when the input, the output or the buffer size differs from it, or a project has an offset but no `[calibration]` (measured before this section), `status` and the window warn that the latency calibration is stale. `status` likewise warns when the devices differ from `[setup]` or no setup check has run. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml` (`TAKEWISE_SETTINGS` names another file); `init` starts a project with them. Device and route changes take effect between takes, never during one.
+`[calibration]` also records the capture buffer size; when the input, the output or the buffer size differs from it, or a project has an offset but no `[calibration]` (measured before this section), `status` and the window warn that the latency calibration is stale. `status` likewise warns when the devices differ from `[setup]` or no setup check has run. The last device choices are also saved as defaults for new projects in `~/Library/Application Support/Takewise/settings.toml` (`TAKEWISE_SETTINGS` names another file); `init` starts a project with them. Device and route changes take effect between takes, never during one. Latency measurements and setup checks are remembered across projects beside that file (see "Remembered setup" below).
 
 ### Recording screen additions (milestone 4a)
 
@@ -295,9 +297,24 @@ speech_to_noise_db = 46.0
 1. *Devices:* input, channel and output, as in the panel. Bluetooth output and the built-in speakers are flagged ("film sound from speakers will leak into your takes; use wired headphones"). The built-in output's current CoreAudio data source tells the speakers (`'ispk'`) from the headphone jack (`'hdpn'`), which is not flagged; a built-in output with neither gets the conditional "If this is the Mac's speakers, film sound will leak into your takes; use wired headphones."
 2. *Voice:* the narrator reads a test sentence shown on screen. Reports peak and average speech level and any clipping, and suggests a gain change in dB on the interface so peaks land near −10 dBFS; after the narrator changes the gain, the sentence is read again until the level fits, so step 3 compares against the final gain. Hints, not verdicts: plosives (bursts of energy below 80 Hz, "turn the mic slightly off-axis or add a pop filter") and boom (much more energy below 200 Hz than in 200 Hz–4 kHz, "if you sound boomy, move a little further from the mic"; tuned on Niklas's voice at known distances).
 3. *Room:* five seconds of silence. Reports the room's noise floor and the speech-to-noise ratio against step 2's speech level: 40 dB or more is good, 30–40 dB acceptable, below 30 dB noisy, with tips. Mains hum is flagged when narrow peaks at 50 or 60 Hz *and* at least two harmonics stand clearly above neighbouring frequencies for the whole recording. The recording is kept as room tone in `takes/.room/<timestamp>.wav` with a sidecar `<timestamp>.json` naming the input device, channel and output it was recorded on, its noise floor and whether it is digital silence (gated). Room tone is matched per take, never per session: for each take, `clean` uses the newest room tone recorded on the device and channel named in the take's `recorded` event, on the same local calendar day as that event (the Mac's time zone, not UTC, so an evening session keeps its room tone). The interface's gain cannot be read, so it is inferred: that room tone is used only when the take's own pre-roll noise floor is within 6 dB of the room tone's floor (a larger difference means the gain or the room changed). Otherwise, or when there is no such room tone, `clean` skips noise reduction for that take, the manifest notes it for the line, and the window suggests running the room step again.
-4. *Latency:* the loopback calibration, run inside the window with the input it already holds (the same routine as `takewise calibrate`), offered whenever `[calibration]` is missing or does not match the current input, output and buffer size, including a new project. Until it runs, takes are recorded without a latency offset and the panel says so.
+4. *Latency:* the loopback calibration, run inside the window with the input it already holds (the same routine as `takewise calibrate`), offered whenever `[calibration]` is missing or does not match the current input, output and buffer size, including a new project, and when a remembered calibration is in use on a Bluetooth output. Until it runs, takes are recorded without a latency offset and the panel says so.
 
 Results are saved in `[setup]`.
+
+### Remembered setup (milestone 6)
+
+Added 2026-11-24 because every new project asked for the setup check and the loopback test again, on the same devices and the same day. Everything lives in `~/Library/Application Support/Takewise/remembered.json`, beside `settings.toml` (beside the file `TAKEWISE_SETTINGS` names, when set), with copies of room tones in `rooms/` next to it. It is changed only by one locked read-modify-write (`takewise_core::remembered`), never through `settings.toml`, which `save_defaults_to` rewrites whole. A newer version's extra fields are ignored; an unreadable file is left alone and nothing is remembered or applied until it reads again.
+
+**Latency.**
+
+- *Remembered:* every stored measurement (`takewise calibrate --write`, or the setup check's latency step), per exact route: input name, output name and capture buffer frames, with the offset and the date. A newer measurement replaces an older one for the same route. Opening a project also remembers its own measurement (a `[calibration]` that records its buffer size and was not itself copied) when nothing newer is remembered for its route, so the first launch of 0.2.0 already knows the WH-1000XM5 measurement of Niklas's projects (−29, −29 and −28 ms).
+- *Applied:* when the window opens, and whenever the route in use or the local day changes between takes, with the devices and buffer resolved live and the input connected. If the project has no calibration that fits that route and one is remembered for exactly it, it is copied into `[input] latency_offset_ms` and `[calibration]` with `from = "remembered"` and the measurement's date. The match is exact, so an offset is never applied to other devices or another buffer size; a project's own fitting measurement always wins; `init` copies nothing, since it knows neither the resolved output nor the buffer size.
+- *Shown:* the panel and `status` (notice `calibration-remembered`) say "latency from an earlier measurement on these devices (date)". Remembered offsets apply to Bluetooth outputs too; for one the panel adds "Bluetooth delay can change after reconnecting; press C to measure again (15 s) if takes sound late.", and the setup check then offers its latency step although the calibration fits. `doctor` keeps warning that wired headphones are better.
+
+**Setup check.**
+
+- *Remembered:* after each setup check, its `[setup]` result for its exact input, channel and output, with a copy of its room tone (WAV and sidecar) in `rooms/`. Results and room tones from earlier days are pruned.
+- *Adopted:* a project with no `[setup]` from today (local day) for the route in use adopts the result remembered from today for exactly that input, channel and output: the room tone is copied into its own `takes/.room/` first (once; a copy it already holds is not copied again), then `[setup]` is written with `from = "remembered"`. `clean` and the setup offer then work unchanged, from the project's own files; a take whose pre-roll floor differs from the room tone by more than 6 dB still skips noise reduction, and the window still suggests the room step again.
 
 **Noise per take.** `checked` gains `speech_level_dbfs` (RMS over the energy speech range). A new verdict rule between rules 7 and 8 (after the sound rule, before `keep`): a take whose speech-to-noise ratio (speech level against its own pre-roll floor) is below 30 dB gives `listen` ("background noise only 24 dB below your voice"). An absolute floor is not used, because it depends on gain.
 

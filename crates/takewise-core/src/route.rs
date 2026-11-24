@@ -207,6 +207,7 @@ mod tests {
             output: "Duo Main".to_owned(),
             buffer_frames: Some(512),
             date: "2026-11-23".to_owned(),
+            from: None,
         });
         config
     }
@@ -319,6 +320,7 @@ mod tests {
             output: "Duo Main".to_owned(),
             room_floor_dbfs: Some(-68.0),
             speech_to_noise_db: Some(46.0),
+            from: None,
         });
         assert_eq!(setup_warning(&config, &current), None);
         let other = Route {

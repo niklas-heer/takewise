@@ -19,6 +19,7 @@ mod model;
 mod panel;
 mod prompter;
 mod recorder;
+mod remembered;
 #[cfg(feature = "screenshots")]
 pub mod screenshots;
 mod setup;
@@ -386,7 +387,7 @@ fn open_recording(dir: PathBuf, loaded: Loaded, cx: &mut App) -> Result<(), Stri
         cx.new(|cx| {
             let mut view =
                 RecordingWindow::new(dir, loaded, Box::new(media), watcher, checker, window, cx);
-            view.defaults_path = start::settings_path();
+            view.use_settings(start::settings_path());
             view.offers_model = true;
             view.model = model::prompt_for(&view.project.config.check, &view.models_dir);
             view
@@ -469,6 +470,12 @@ pub struct RecordingWindow {
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
     beep_film: latency::BeepFilm,
+    /// The remembered setup, `remembered.json` beside the settings; none in
+    /// tests unless a test sets one.
+    remembered_path: Option<PathBuf>,
+    /// The route in use and the local day the remembered setup was last
+    /// looked up for.
+    remembered_for: Option<(takewise_core::Route, jiff::civil::Date)>,
 }
 
 impl RecordingWindow {
@@ -561,6 +568,8 @@ impl RecordingWindow {
             film_output: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
+            remembered_path: None,
+            remembered_for: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -842,8 +851,10 @@ impl RecordingWindow {
             .or_else(|| check_input(configured.as_deref(), &inputs).err());
         self.note_issue(panel::input_issue(configured.as_deref(), &inputs));
         self.inputs = inputs;
-        self.panel.calibration =
-            panel::calibration_note(&self.project.config, &self.current_route());
+        self.use_remembered();
+        let route = self.current_route();
+        self.panel.calibration = panel::calibration_note(&self.project.config, &route);
+        self.panel.remembered = self.remembered_note(&route);
         self.update_setup_offer();
         self.inputs_checked_at = Some(self.media.host_now_s());
     }

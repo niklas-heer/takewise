@@ -190,6 +190,7 @@ pub fn set_calibration(dir: &Path, offset_ms: i32, info: &CalibrationInfo) -> Re
             info.buffer_frames.map(|n| Value::from(i64::from(n))),
         );
         set_value(cal, "date", Some(Value::from(info.date.as_str())));
+        set_value(cal, "from", info.from.as_deref().map(Value::from));
         Ok(())
     })
 }
@@ -214,6 +215,7 @@ pub fn set_setup(dir: &Path, info: &SetupInfo) -> Result<()> {
             "speech_to_noise_db",
             info.speech_to_noise_db.map(|db| Value::from(round_db(db))),
         );
+        set_value(setup, "from", info.from.as_deref().map(Value::from));
         Ok(())
     })
 }
@@ -540,6 +542,7 @@ text = "Third."
             output: "Duo Phones".to_owned(),
             room_floor_dbfs: Some(-68.04),
             speech_to_noise_db: Some(46.27),
+            from: None,
         };
         set_setup(&dir, &info).unwrap();
         let config = Project::open(&dir).unwrap().config;
@@ -558,6 +561,27 @@ text = "Third."
             ..info
         };
         set_setup(&dir, &gated).unwrap();
+        assert_eq!(
+            Project::open(&dir).unwrap().config.setup,
+            Some(gated.clone())
+        );
+        // A copied result says so; a measured one afterwards drops the mark.
+        let copied = SetupInfo {
+            from: Some(crate::project::REMEMBERED.to_owned()),
+            ..gated.clone()
+        };
+        set_setup(&dir, &copied).unwrap();
+        let text = fs::read_to_string(dir.join(PROJECT_FILE)).unwrap();
+        assert!(text.contains("from = \"remembered\""), "{text}");
+        assert!(
+            Project::open(&dir)
+                .unwrap()
+                .config
+                .setup
+                .unwrap()
+                .is_remembered()
+        );
+        set_setup(&dir, &gated).unwrap();
         assert_eq!(Project::open(&dir).unwrap().config.setup, Some(gated));
     }
 
@@ -569,6 +593,7 @@ text = "Third."
             output: "Duo".to_owned(),
             buffer_frames: Some(512),
             date: "2026-11-23".to_owned(),
+            from: None,
         };
         set_calibration(&dir, 14, &info).unwrap();
         let config = crate::project::read_config(&dir).unwrap();
@@ -578,11 +603,23 @@ text = "Third."
         // A buffer size not known now removes the old one.
         let unknown = CalibrationInfo {
             buffer_frames: None,
-            ..info
+            ..info.clone()
         };
         set_calibration(&dir, 15, &unknown).unwrap();
         let config = crate::project::read_config(&dir).unwrap();
         assert_eq!(config.calibration, Some(unknown));
+
+        // A copied offset says so; measuring again drops the mark.
+        let copied = CalibrationInfo {
+            from: Some(crate::project::REMEMBERED.to_owned()),
+            ..info.clone()
+        };
+        set_calibration(&dir, -29, &copied).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert!(config.calibration.unwrap().is_remembered());
+        set_calibration(&dir, -30, &info).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.calibration, Some(info));
     }
 
     #[test]

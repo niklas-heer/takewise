@@ -106,6 +106,9 @@ pub struct Panel {
     meter_retry_at: f64,
     /// Why the latency calibration is stale, if it is.
     pub calibration: Option<String>,
+    /// That the latency in use was copied from an earlier measurement, if
+    /// it was (see `remembered.rs`).
+    pub remembered: Option<String>,
     pub film_slider: Entity<SliderState>,
     pub monitor_slider: Entity<SliderState>,
 }
@@ -129,6 +132,7 @@ impl Panel {
             metering: None,
             meter_retry_at: 0.0,
             calibration: None,
+            remembered: None,
             film_slider: slider(FILM_DB, film_db, cx),
             monitor_slider: slider(MONITOR_DB, monitor_db, cx),
         }
@@ -494,14 +498,26 @@ impl RecordingWindow {
                 },
             ))
             .child(self.monitor_switch())
-            .when_some(self.panel.calibration.clone(), |el, stale| {
-                el.child(
-                    div()
-                        .text_color(rgb(colors::WARN))
-                        .child(format!("Latency: {stale}.")),
-                )
-            })
+            .children(self.latency_notes())
             .into_any_element()
+    }
+
+    /// What the panel says about the latency: why its calibration is
+    /// stale, and that it came from an earlier measurement.
+    fn latency_notes(&self) -> Vec<AnyElement> {
+        let stale = self.panel.calibration.as_ref().map(|stale| {
+            div()
+                .text_color(rgb(colors::WARN))
+                .child(format!("Latency: {stale}."))
+                .into_any_element()
+        });
+        let remembered = self.panel.remembered.clone().map(|note| {
+            div()
+                .text_color(rgb(colors::DIM))
+                .child(note)
+                .into_any_element()
+        });
+        stale.into_iter().chain(remembered).collect()
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -149,6 +149,8 @@ Takewise records at 48 kHz from an input running at that rate. For an input set 
 
 Press C, and Takewise walks you through your devices, flagging speakers and Bluetooth headphones. Then it listens while you read a sentence and tells you how far to turn the gain on your interface. Next it records five seconds of silence and rates how far your voice stands above the room's noise; that recording is kept as room tone for the export's noise reduction. When the latency hasn't been measured for these devices, a last step does it: hold your headphones against the microphone and press Space, and beeps play for about 15 seconds while Takewise measures where they land (`takewise calibrate --write` does the same from the command line).
 
+Takewise remembers both for your next project. A latency measured on exactly the same input, output and buffer size is reused, and the panel says it came from an earlier measurement. A setup check from today on the same devices is adopted with its room tone. On Bluetooth headphones, whose delay can change after reconnecting, press C to measure again if takes sound late.
+
 ### Export for your editor
 
 <p align="center"><img src="docs/images/export.png" alt="The demo project's export/narration.wav drawn as one strip from 0:00 to 1:00, 60.0 s, as long as the film, at −16.0 LUFS and a true peak of −1.5 dBTP: six takes, each shaded where the manifest places it and labeled orbit, coast, capsule, storm, ocean and desert, with silence between them." width="830"><br><sub>The demo's export, its takes spoken by macOS <code>say</code>: one file as long as the film, each line's take where <code>export/manifest.json</code> places it.</sub></p>
