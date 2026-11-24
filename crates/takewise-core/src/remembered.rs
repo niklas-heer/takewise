@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::edit::{set_calibration, set_setup};
+use crate::edit::{set_calibration_when, set_setup};
 use crate::error::{Error, Result, io};
 use crate::fsutil::write_atomic;
 use crate::project::{CalibrationInfo, ProjectConfig, REMEMBERED, SetupInfo};
@@ -234,6 +234,11 @@ pub enum LatencySync {
 ///    measurement is remembered for the route (a later day, or another
 ///    offset from the same day): the newer one is copied in its place, so
 ///    measuring again in one project reaches the others.
+///
+/// `config` is the project as the caller read it, which may be a while
+/// ago (the window's copy). Whether the project's calibration gives way is
+/// decided again from the file, under the project lock that writes the
+/// copy: a measurement stored in the project since is never replaced.
 pub fn sync_latency(
     path: &Path,
     dir: &Path,
@@ -245,7 +250,6 @@ pub fn sync_latency(
         .as_ref()
         .filter(|cal| !cal.is_remembered())
         .and_then(|cal| RememberedLatency::of(config.input.latency_offset_ms, cal));
-    let fits = config.calibration.is_some() && calibration_stale(config, route).is_none();
     let found = update(path, |remembered, _| {
         if let Some(own) = own {
             match remembered.latency.iter_mut().find(|k| k.same_route(&own)) {
@@ -256,13 +260,19 @@ pub fn sync_latency(
         }
         Ok(remembered.latency.iter().find(|k| k.fits(route)).cloned())
     })?;
-    match found {
-        Some(remembered) if !fits || superseded(config, &remembered) => {
-            set_calibration(dir, remembered.latency_offset_ms, &remembered.calibration())?;
-            Ok(LatencySync::Applied(remembered))
-        }
-        _ => Ok(LatencySync::Unchanged),
-    }
+    let Some(remembered) = found else {
+        return Ok(LatencySync::Unchanged);
+    };
+    let applied = set_calibration_when(dir, |on_disk| {
+        let fits = on_disk.calibration.is_some() && calibration_stale(on_disk, route).is_none();
+        (!fits || superseded(on_disk, &remembered))
+            .then(|| (remembered.latency_offset_ms, remembered.calibration()))
+    })?;
+    Ok(if applied {
+        LatencySync::Applied(remembered)
+    } else {
+        LatencySync::Unchanged
+    })
 }
 
 /// Whether the project's calibration is a copy that `remembered`, the
@@ -406,6 +416,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::edit::set_calibration;
     use crate::project::{FilmInfo, Project, read_config};
     use crate::room::{RoomInput, room_tones, save_room_tone};
     use crate::takes::read_take_wav;
@@ -653,6 +664,49 @@ mod tests {
         // The older own measurement does not replace the newer remembered one.
         let remembered = read(&home.remembered).unwrap();
         assert_eq!(remembered.latency[0].latency_offset_ms, -29);
+    }
+
+    #[test]
+    fn a_stale_view_of_the_project_does_not_replace_a_measurement_made_since() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        remember_latency(&home.remembered, -29, &measured("2026-11-23")).unwrap();
+        let dir = project(&tmp, "open.takewise");
+        // The window read the project while it had no calibration.
+        let stale = read_config(&dir).unwrap();
+        assert_eq!(stale.calibration, None);
+        // Then `takewise calibrate --write` measured in the project.
+        set_calibration(&dir, -35, &measured("2026-11-24")).unwrap();
+
+        // The window syncs with what it read: the project's own
+        // measurement, which is on disk by now, stays.
+        assert_eq!(
+            sync_latency(&home.remembered, &dir, &stale, &route(512)).unwrap(),
+            LatencySync::Unchanged
+        );
+        let config = read_config(&dir).unwrap();
+        assert_eq!(config.input.latency_offset_ms, -35);
+        let cal = config.calibration.unwrap();
+        assert!(!cal.is_remembered(), "{cal:?}");
+        assert_eq!(cal.date, "2026-11-24");
+
+        // A copy that was already replaced on disk is not written twice
+        // either: the view that still has the older copy changes nothing.
+        let other = project(&tmp, "copied.takewise");
+        let config = read_config(&other).unwrap();
+        sync_latency(&home.remembered, &other, &config, &route(512)).unwrap();
+        let old_copy = read_config(&other).unwrap();
+        remember_latency(&home.remembered, -31, &measured("2026-11-24")).unwrap();
+        sync_latency(&home.remembered, &other, &old_copy, &route(512)).unwrap();
+        let before = fs::read(other.join(crate::project::PROJECT_FILE)).unwrap();
+        assert_eq!(
+            sync_latency(&home.remembered, &other, &old_copy, &route(512)).unwrap(),
+            LatencySync::Unchanged
+        );
+        assert_eq!(
+            fs::read(other.join(crate::project::PROJECT_FILE)).unwrap(),
+            before
+        );
     }
 
     #[test]

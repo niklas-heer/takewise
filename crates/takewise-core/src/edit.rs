@@ -174,25 +174,49 @@ pub fn set_latency_offset(dir: &Path, offset_ms: i32) -> Result<()> {
 /// Sets `[input] latency_offset_ms` together with the `[calibration]` it
 /// was measured on, in one write under the lock.
 pub fn set_calibration(dir: &Path, offset_ms: i32, info: &CalibrationInfo) -> Result<()> {
-    edit_project(dir, |doc| {
-        let input = table(doc, "input")?;
-        set_value(
-            input,
-            "latency_offset_ms",
-            Some(Value::from(i64::from(offset_ms))),
-        );
-        let cal = table(doc, "calibration")?;
-        set_value(cal, "input", Some(Value::from(info.input.as_str())));
-        set_value(cal, "output", Some(Value::from(info.output.as_str())));
-        set_value(
-            cal,
-            "buffer_frames",
-            info.buffer_frames.map(|n| Value::from(i64::from(n))),
-        );
-        set_value(cal, "date", Some(Value::from(info.date.as_str())));
-        set_value(cal, "from", info.from.as_deref().map(Value::from));
-        Ok(())
+    edit_project(dir, |doc| write_calibration(doc, offset_ms, info))
+}
+
+/// [`set_calibration`], decided under the lock: `decide` gets the project
+/// as it is on disk then, not as a caller read it some time ago, and
+/// returns the offset and calibration to write, or `None` to leave the
+/// file as it is. Returns whether it was written.
+pub fn set_calibration_when(
+    dir: &Path,
+    decide: impl FnOnce(&crate::ProjectConfig) -> Option<(i32, CalibrationInfo)>,
+) -> Result<bool> {
+    edit_project_when(dir, |text, doc| {
+        let config: crate::ProjectConfig = toml::from_str(text).map_err(|err| err.to_string())?;
+        let Some((offset_ms, info)) = decide(&config) else {
+            return Ok(false);
+        };
+        write_calibration(doc, offset_ms, &info)?;
+        Ok(true)
     })
+}
+
+fn write_calibration(
+    doc: &mut DocumentMut,
+    offset_ms: i32,
+    info: &CalibrationInfo,
+) -> Result<(), String> {
+    let input = table(doc, "input")?;
+    set_value(
+        input,
+        "latency_offset_ms",
+        Some(Value::from(i64::from(offset_ms))),
+    );
+    let cal = table(doc, "calibration")?;
+    set_value(cal, "input", Some(Value::from(info.input.as_str())));
+    set_value(cal, "output", Some(Value::from(info.output.as_str())));
+    set_value(
+        cal,
+        "buffer_frames",
+        info.buffer_frames.map(|n| Value::from(i64::from(n))),
+    );
+    set_value(cal, "date", Some(Value::from(info.date.as_str())));
+    set_value(cal, "from", info.from.as_deref().map(Value::from));
+    Ok(())
 }
 
 /// Writes the setup check's result as `[setup]` under the lock, keeping
@@ -293,6 +317,17 @@ fn edit_project(
     dir: &Path,
     edit: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
 ) -> Result<()> {
+    edit_project_when(dir, |_, doc| edit(doc).map(|()| true)).map(drop)
+}
+
+/// [`edit_project`] for an edit that depends on what the file holds:
+/// `edit` also gets the file's text as read under the lock, and says
+/// whether to write its change (`false`: the file is left as it is).
+/// Returns whether the file was written.
+fn edit_project_when(
+    dir: &Path,
+    edit: impl FnOnce(&str, &mut DocumentMut) -> Result<bool, String>,
+) -> Result<bool> {
     let path = dir.join(PROJECT_FILE);
     let _guard = lock(dir)?;
     let text = fs::read_to_string(&path).map_err(io(&path))?;
@@ -303,10 +338,13 @@ fn edit_project(
     let mut doc: DocumentMut = text
         .parse()
         .map_err(|err: toml_edit::TomlError| parse_error(err.to_string()))?;
-    edit(&mut doc).map_err(parse_error)?;
+    if !edit(&text, &mut doc).map_err(parse_error)? {
+        return Ok(false);
+    }
     let text = doc.to_string();
     toml::from_str::<crate::ProjectConfig>(&text).map_err(|err| parse_error(err.to_string()))?;
-    write_atomic(&path, text.as_bytes())
+    write_atomic(&path, text.as_bytes())?;
+    Ok(true)
 }
 
 /// The table `name`, created when missing.
