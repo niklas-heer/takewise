@@ -157,7 +157,10 @@ pub struct ManifestLine {
     /// Detected speech start and end in film seconds, clamped to the film;
     /// a `speech-cropped` warning gives the unclamped values. The start is
     /// where the check's early-start rule measures it, after a breath set
-    /// apart from the words.
+    /// apart from the words. A piece of a passage without speech of its
+    /// own, joined to its neighbours (`passage-piece-without-speech`), has
+    /// an empty range: where the speech after it begins, or else where the
+    /// speech before it ends.
     pub speech_film_s: [f64; 2],
     /// The transcribed words in film seconds, from the take's latest check
     /// against the line as it is now; absent when there is none.
@@ -213,30 +216,32 @@ struct ManifestFilm<'a> {
     modified: &'a str,
 }
 
-/// A line's take, placed on its own.
-struct Placed {
+/// A line's take as it was picked: read, analyzed and laid on the film, not
+/// yet trimmed to its speech. Whether it needs speech of its own is decided
+/// once the seam runs are known (see [`Run::trim`]).
+struct Loaded {
+    /// Its manifest entry; the ranges and the speech are filled in when it
+    /// is trimmed.
     line: ManifestLine,
     /// The line's place in the script.
     index: usize,
-    /// The take at 48 kHz, in 24-bit units.
+    /// The take at 48 kHz, in 24-bit units; moved into its [`Run`].
     samples: Vec<f64>,
     take: u32,
     /// The piece of a passage the take is.
     piece: Option<PassagePiece>,
     /// The take's pre-roll noise floor, for matching a room tone.
     floor_dbfs: f64,
-    /// The destination sample of the take's first sample, before cropping.
+    /// The destination sample of the take's first sample.
     offset: i64,
-    /// Source start and destination start and end, after cropping.
-    src: usize,
-    dest: (usize, usize),
-    /// The speech without its margins in destination samples, cropped.
-    speech: (usize, usize),
+    /// The film time of the take's first sample.
+    start_film_s: f64,
+    /// The detected speech in seconds into the take, its start where the
+    /// check's early-start rule measures it; `None` when the take holds no
+    /// speech.
+    speech: Option<(f64, f64)>,
     /// The take was recorded against different text than the line has now.
     old_text: bool,
-    /// The unclamped speech in film seconds, when part of it lies outside
-    /// the film.
-    cropped_speech: Option<(f64, f64)>,
 }
 
 /// One stretch of audio to be mixed in: a take, or a seam run, the takes of
@@ -279,6 +284,9 @@ struct Part {
     until: usize,
     old_text: bool,
     cropped_speech: Option<(f64, f64)>,
+    /// The line's piece of the passage holds no speech; its `speech` is
+    /// then the empty range where the speech beside it begins (or ends).
+    silent: bool,
     /// `clean` only: why noise reduction was skipped for this take.
     nr_skipped: Option<String>,
 }
@@ -295,7 +303,7 @@ struct Tail {
 }
 
 impl Tail {
-    fn of(p: &Placed) -> Option<Tail> {
+    fn of(p: &Loaded) -> Option<Tail> {
         let piece = p.piece.clone()?;
         Some(Tail {
             index: p.index,
@@ -305,14 +313,15 @@ impl Tail {
         })
     }
 
-    /// When `p` continues the run that ends in this take: the run's new
-    /// tail, and how many samples (at most one) `p`'s own placement lies
-    /// before its place in the run. It continues the run as the next line's
-    /// take and the next piece of the same passage, beginning where this
-    /// piece ends, with `joined` samples of the run before it and its own
-    /// placement within a sample of the run's: a line moved since it was
-    /// recorded lies elsewhere.
-    fn continued_by(&self, p: &Placed, joined: usize) -> Option<(Tail, i64)> {
+    /// The run's new tail when `p` continues the run that ends in this
+    /// take. It continues the run as the next line's take and the next
+    /// piece of the same passage, beginning where this piece ends, with
+    /// `joined` samples of the run before it and its own placement within a
+    /// sample of its place in the run: a line moved since it was recorded
+    /// lies elsewhere. Whether the piece holds speech does not matter: the
+    /// narrator may have read its line early or late, into the piece
+    /// beside it.
+    fn continued_by(&self, p: &Loaded, joined: usize) -> Option<Tail> {
         let piece = p.piece.as_ref()?;
         let next = p.index == self.index + 1
             && piece.id == self.piece.id
@@ -331,60 +340,219 @@ impl Tail {
             piece: piece.clone(),
             ..*self
         };
-        (next && whole && shift.abs() <= 1).then_some((tail, shift))
+        (next && whole && shift.abs() <= 1).then_some(tail)
     }
 }
 
-impl Unit {
-    fn single(p: Placed) -> Unit {
-        Unit {
-            parts: vec![Part {
-                line: p.line,
-                take: p.take,
+/// A line's take in a [`Run`]: where it begins in the run's samples, and
+/// its length.
+struct Member {
+    /// The take, its samples moved into the run.
+    take: Loaded,
+    start: usize,
+    len: usize,
+}
+
+/// The takes that will be mixed as one stretch of audio, before trimming:
+/// a take alone, or a seam run (see [`Unit`]).
+struct Run {
+    /// In script order; never empty.
+    members: Vec<Member>,
+    /// The take, or the pieces one after the other.
+    samples: Vec<f64>,
+    /// The take the run ends in, when it is a piece of a passage.
+    tail: Option<Tail>,
+}
+
+/// Why a line's take cannot be exported: a refusal code and the reason for
+/// the message.
+type Refused = (&'static str, &'static str);
+
+const NO_SPEECH: Refused = ("no-speech", "chosen takes with no speech detected");
+const NOTHING_IN_FILM: Refused = (
+    "no-speech",
+    "chosen takes whose speech lies outside the film",
+);
+const SPEECH_OUTSIDE_FILM: Refused = (
+    "speech-outside-film",
+    "chosen takes whose speech lies entirely outside the film",
+);
+
+impl Run {
+    fn of(mut p: Loaded) -> Run {
+        let samples = std::mem::take(&mut p.samples);
+        Run {
+            tail: Tail::of(&p),
+            members: vec![Member {
                 start: 0,
-                len: p.samples.len(),
-                speech: p.speech,
-                until: p.speech.1,
-                old_text: p.old_text,
-                cropped_speech: p.cropped_speech,
-                nr_skipped: None,
+                len: samples.len(),
+                take: p,
             }],
-            samples: p.samples,
-            floor_dbfs: p.floor_dbfs,
-            src: p.src,
-            dest: p.dest,
-            fade_room: (usize::MAX, usize::MAX),
+            samples,
         }
     }
 
-    /// Joins `p` to the end of the run: its samples follow the run's, and
-    /// the run now ends where `p`'s range does, `shift` samples from where
-    /// `p` alone would end.
-    fn join(&mut self, mut p: Placed, shift: i64, film_len: usize) {
-        let moved = |n: usize| {
-            let n = i64::try_from(n).unwrap_or(i64::MAX).saturating_add(shift);
-            to_usize(n).min(film_len)
+    /// Joins `p` to the end of the run, whose new tail it is: its samples
+    /// follow the run's.
+    fn join(&mut self, mut p: Loaded, tail: Tail) {
+        let start = self.samples.len();
+        self.samples.append(&mut p.samples);
+        self.members.push(Member {
+            start,
+            len: self.samples.len() - start,
+            take: p,
+        });
+        self.tail = Some(tail);
+    }
+
+    /// Trims the run to its speech and places it in the film, or says why
+    /// which of its lines cannot be exported.
+    ///
+    /// A take on its own needs speech. A seam run needs it in one of its
+    /// pieces and is trimmed at its outer speech bounds, 150 ms before the
+    /// first speech and after the last: a piece without any is kept where
+    /// it is in the run, since its line's words are in the piece beside it
+    /// when the narrator read them early or late, and is marked `silent`
+    /// for a warning.
+    fn trim(self, rate: u32, duration: f64) -> std::result::Result<Unit, Vec<(String, Refused)>> {
+        let Run {
+            members, samples, ..
+        } = self;
+        let film_len = seconds_to_samples(duration, rate).max(0);
+        let anchor = members.first().map_or(0, |member| member.take.offset);
+        let floor_dbfs = members
+            .first()
+            .map_or(f64::NEG_INFINITY, |member| member.take.floor_dbfs);
+        // Each member's speech in the run's samples.
+        let spoken: Vec<Option<(i64, i64)>> = members
+            .iter()
+            .map(|member| {
+                let start = i64::try_from(member.start).unwrap_or(i64::MAX);
+                member.take.speech.map(|(from, to)| {
+                    (
+                        start.saturating_add(seconds_to_samples(from, rate)),
+                        start.saturating_add(seconds_to_samples(to, rate)),
+                    )
+                })
+            })
+            .collect();
+        let outer = (
+            spoken.iter().flatten().next().map(|speech| speech.0),
+            spoken.iter().flatten().last().map(|speech| speech.1),
+        );
+        let ids = |members: &[Member], which: &dyn Fn(&Member) -> bool, why: Refused| {
+            members
+                .iter()
+                .filter(|member| which(member))
+                .map(|member| (member.take.line.id.clone(), why))
+                .collect::<Vec<_>>()
         };
-        self.dest.1 = moved(p.dest.1).max(self.dest.0);
-        let speech = (moved(p.speech.0), moved(p.speech.1).min(self.dest.1));
-        if let Some(last) = self.parts.last_mut() {
-            last.until = speech.0.max(last.speech.1);
-            last.line.seam_with = Some(p.line.id.clone());
+        let (Some(first), Some(last)) = outer else {
+            // No speech anywhere: every line of it lacks a usable take.
+            return Err(ids(&members, &|_| true, NO_SPEECH));
+        };
+        let outside = |member: &Member| {
+            let start = member.take.start_film_s;
+            member
+                .take
+                .speech
+                .is_some_and(|(from, to)| start + to <= 0.0 || start + from >= duration)
+        };
+        let refused = ids(&members, &outside, SPEECH_OUTSIDE_FILM);
+        if !refused.is_empty() {
+            return Err(refused);
         }
-        self.parts.push(Part {
-            line: p.line,
-            take: p.take,
-            start: self.samples.len(),
-            len: p.samples.len(),
-            speech,
-            until: speech.1,
-            old_text: p.old_text,
-            cropped_speech: p.cropped_speech,
+
+        let len = i64::try_from(samples.len()).unwrap_or(i64::MAX);
+        let margin = seconds_to_samples(MARGIN_S, rate);
+        let mut src0 = (first - margin).max(0);
+        let mut src1 = (last + margin).min(len);
+        let (mut dest0, mut dest1) = (anchor + src0, anchor + src1);
+        if dest0 < 0 {
+            src0 -= dest0;
+            dest0 = 0;
+        }
+        if dest1 > film_len {
+            src1 -= dest1 - film_len;
+            dest1 = film_len;
+        }
+        if src1 <= src0 {
+            let spoken = |member: &Member| member.take.speech.is_some();
+            return Err(ids(&members, &spoken, NOTHING_IN_FILM));
+        }
+
+        // Each line's speech in destination samples, cropped to the film.
+        let in_film = |sample: i64| to_usize((anchor + sample).clamp(0, film_len));
+        let speech = spoken
+            .iter()
+            .map(|speech| speech.map(|(from, to)| (in_film(from), in_film(to))))
+            .collect();
+        Ok(Unit {
+            parts: parts(members, speech, in_film(last), rate, duration),
+            samples,
+            floor_dbfs,
+            src: to_usize(src0),
+            dest: (to_usize(dest0), to_usize(dest1)),
+            fade_room: (usize::MAX, usize::MAX),
+        })
+    }
+}
+
+/// Each line's share of a run: `speech` is each member's speech in
+/// destination samples, and `end` where the run's last speech ends. A
+/// member without speech gets the empty range where the speech after it
+/// begins, or else where the speech before it ends.
+fn parts(
+    members: Vec<Member>,
+    mut speech: Vec<Option<(usize, usize)>>,
+    end: usize,
+    rate: u32,
+    duration: f64,
+) -> Vec<Part> {
+    let mut beside = end;
+    for range in speech.iter_mut().rev() {
+        match range {
+            Some((from, _)) => beside = *from,
+            None => *range = Some((beside, beside)),
+        }
+    }
+    let next_ids: Vec<Option<String>> = (1..=members.len())
+        .map(|next| members.get(next).map(|member| member.take.line.id.clone()))
+        .collect();
+    let mut parts = Vec::with_capacity(members.len());
+    for (k, member) in members.into_iter().enumerate() {
+        let Member { take, start, len } = member;
+        let (from, to) = speech.get(k).copied().flatten().unwrap_or_default();
+        let next = speech.get(k + 1).copied().flatten();
+        let mut line = take.line;
+        let mut cropped_speech = None;
+        if let Some((s0, s1)) = take.speech {
+            let film = (take.start_film_s + s0, take.start_film_s + s1);
+            let clamped = (film.0.max(0.0), film.1.min(duration));
+            cropped_speech = (clamped != film).then_some(film);
+            line.speech_film_s = [clamped.0, clamped.1];
+        } else {
+            let at = from as f64 / f64::from(rate);
+            line.speech_film_s = [at, at];
+        }
+        line.seam_with = next_ids.get(k).cloned().flatten();
+        parts.push(Part {
+            line,
+            take: take.take,
+            start,
+            len,
+            speech: (from, to),
+            until: next.map_or(to, |next| next.0.max(to)),
+            old_text: take.old_text,
+            cropped_speech,
+            silent: take.speech.is_none(),
             nr_skipped: None,
         });
-        self.samples.append(&mut p.samples);
     }
+    parts
+}
 
+impl Unit {
     /// The speech from the first line's start to the last line's end,
     /// without the margins, in destination samples.
     fn speech(&self) -> (usize, usize) {
@@ -410,30 +578,24 @@ impl Unit {
     }
 }
 
-/// The units to mix, gathered from the placed takes in script order: each
+/// The runs to mix, gathered from the picked takes in script order: each
 /// take alone, or joined to the take before it when it continues that one's
 /// passage (see [`Tail::continued_by`]).
 #[derive(Default)]
-struct Units {
-    units: Vec<Unit>,
-    /// The take the last unit ends in, when it is a piece of a passage.
-    tail: Option<Tail>,
-}
+struct Runs(Vec<Run>);
 
-impl Units {
-    /// Adds the next placed take. A piece is joined as soon as it is
-    /// placed, so a run's audio is held once, not also piece by piece.
-    fn push(&mut self, p: Placed, film_len: usize) {
-        let seam = match (&self.tail, self.units.last()) {
-            (Some(tail), Some(unit)) => tail.continued_by(&p, unit.samples.len()),
-            _ => None,
-        };
-        if let (Some((next, shift)), Some(unit)) = (seam, self.units.last_mut()) {
-            self.tail = Some(next);
-            unit.join(p, shift, film_len);
-        } else {
-            self.tail = Tail::of(&p);
-            self.units.push(Unit::single(p));
+impl Runs {
+    /// Adds the next picked take. A piece is joined as soon as it is
+    /// picked, so a run's audio is held once, not also piece by piece.
+    fn push(&mut self, p: Loaded) {
+        let seam = self.0.last().and_then(|run| {
+            run.tail
+                .as_ref()
+                .and_then(|tail| tail.continued_by(&p, run.samples.len()))
+        });
+        match (seam, self.0.last_mut()) {
+            (Some(tail), Some(run)) => run.join(p, tail),
+            _ => self.0.push(Run::of(p)),
         }
     }
 }
@@ -862,8 +1024,9 @@ fn loudness_warning(report: &ExportSettings) -> Option<ExportWarning> {
 
 /// Places each line's take, or collects why export refuses: script
 /// problems, lines without a usable take, overlapping speech. Joins the
-/// pieces of a passage that follow each other, splits the margins of
-/// neighbours and returns `tight-gap` warnings.
+/// pieces of a passage that follow each other before it asks each stretch
+/// for its speech and trims it, splits the margins of neighbours and
+/// returns `tight-gap` warnings.
 fn gather(
     project: &Project,
     ledger: &Ledger,
@@ -883,13 +1046,25 @@ fn gather(
     }
 
     let rate = project.config.sample_rate;
-    let film_len = to_usize(seconds_to_samples(project.film_duration(), rate));
     let mut refusals = Refusals::default();
-    let mut placed = Units::default();
+    // The seam runs first: only then is it known which takes need speech
+    // of their own, and where each stretch is trimmed.
+    let mut runs = Runs::default();
     for (index, line) in project.script.lines.iter().enumerate() {
-        match place(project, ledger, state, use_proposed, index, line) {
-            Ok(p) => placed.push(p, film_len),
+        match load(project, ledger, state, use_proposed, index, line) {
+            Ok(p) => runs.push(p),
             Err((code, message)) => refusals.add(code, &line.id, message),
+        }
+    }
+    let mut units = Vec::with_capacity(runs.0.len());
+    for run in runs.0 {
+        match run.trim(rate, project.film_duration()) {
+            Ok(unit) => units.push(unit),
+            Err(refused) => {
+                for (line, (code, message)) in refused {
+                    refusals.add(code, &line, message);
+                }
+            }
         }
     }
     for (code, (lines, message)) in refusals.0 {
@@ -900,7 +1075,6 @@ fn gather(
             message,
         });
     }
-    let mut units = placed.units;
     let tight = split_margins(&mut units, rate);
     refused.extend(overlaps(&units));
     (units, tight, refused)
@@ -1120,16 +1294,17 @@ fn analyze_placed(project: &Project, samples: &[i32], rate: u32, take: &TakeStat
     analyze_take(samples, rate, preroll_s, take.passage.as_ref())
 }
 
-/// Picks a line's take, finds its speech and places it in the film, or says
-/// why it cannot (a refusal code and the reason for the message).
-fn place(
+/// Picks a line's take, reads it, finds its speech and lays it on the film,
+/// or says why it cannot. A take without speech is not refused here: it
+/// may be a piece of a seam run (see [`Run::trim`]).
+fn load(
     project: &Project,
     ledger: &Ledger,
     state: &State,
     use_proposed: bool,
     index: usize,
     line: &Line,
-) -> std::result::Result<Placed, (&'static str, &'static str)> {
+) -> std::result::Result<Loaded, Refused> {
     let rate = project.config.sample_rate;
     let line_state = state.lines.iter().find(|l| l.id == line.id);
     // `fallback`: no choice, so the proposed take stands in for one.
@@ -1157,67 +1332,24 @@ fn place(
         ));
     }
     let analysis = analyze_placed(project, &samples, rate, take);
-    let (_, speech_end) = analysis
-        .speech
-        .ok_or(("no-speech", "chosen takes with no speech detected"))?;
     // The speech starts where the check measured it: after a breath set
     // apart from the words.
     let check = current_check(project, ledger, line, take_no);
-    let speech_start = speech_onset(&analysis, check.and_then(|c| c.transcript.as_deref()))
-        .ok_or(("no-speech", "chosen takes with no speech detected"))?;
-
-    let film_len = seconds_to_samples(project.film_duration(), rate).max(0);
-    let len = i64::try_from(samples.len()).unwrap_or(i64::MAX);
-    let margin = seconds_to_samples(MARGIN_S, rate);
-    let mut src0 = (seconds_to_samples(speech_start, rate) - margin).max(0);
-    let mut src1 = (seconds_to_samples(speech_end, rate) + margin).min(len);
-    let take_start_film = line.start + take.line_offset_s;
-    let speech_film = (take_start_film + speech_start, take_start_film + speech_end);
-    let duration = project.film_duration();
-    if speech_film.1 <= 0.0 || speech_film.0 >= duration {
-        return Err((
-            "speech-outside-film",
-            "chosen takes whose speech lies entirely outside the film",
-        ));
-    }
-    let offset = seconds_to_samples(take_start_film, rate);
-    let (mut dest0, mut dest1) = (offset + src0, offset + src1);
-    if dest0 < 0 {
-        src0 -= dest0;
-        dest0 = 0;
-    }
-    if dest1 > film_len {
-        src1 -= dest1 - film_len;
-        dest1 = film_len;
-    }
-    if src1 <= src0 {
-        return Err((
-            "no-speech",
-            "chosen takes whose speech lies outside the film",
-        ));
-    }
-    let speech_dest = (
-        (offset + seconds_to_samples(speech_start, rate)).clamp(0, film_len),
-        (offset + seconds_to_samples(speech_end, rate)).clamp(0, film_len),
-    );
-    let clamped = (speech_film.0.max(0.0), speech_film.1.min(duration));
-    let cropped_speech = (clamped != speech_film).then_some(speech_film);
-    let (src0, src1, dest0, dest1) = (
-        to_usize(src0),
-        to_usize(src1),
-        to_usize(dest0),
-        to_usize(dest1),
-    );
-    Ok(Placed {
+    let speech = analysis.speech.and_then(|(_, end)| {
+        let onset = speech_onset(&analysis, check.and_then(|c| c.transcript.as_deref()))?;
+        Some((onset, end))
+    });
+    let start_film_s = line.start + take.line_offset_s;
+    Ok(Loaded {
         line: ManifestLine {
             id: line.id.clone(),
             text: line.text.clone(),
             take_file: take.file.clone(),
             chosen_by: by,
-            source_samples: [to_u64(src0), to_u64(src1)],
-            dest_samples: [to_u64(dest0), to_u64(dest1)],
-            speech_film_s: [clamped.0, clamped.1],
-            words_film_s: check.and_then(|c| words_film_s(c, take_start_film)),
+            source_samples: [0, 0],
+            dest_samples: [0, 0],
+            speech_film_s: [0.0, 0.0],
+            words_film_s: check.and_then(|c| words_film_s(c, start_film_s)),
             noise_reduction: None,
             seam_with: None,
         },
@@ -1226,12 +1358,10 @@ fn place(
         take: take_no,
         piece: take.passage.clone(),
         floor_dbfs: analysis.noise_floor_dbfs,
-        offset,
-        src: src0,
-        dest: (dest0, dest1),
-        speech: (to_usize(speech_dest.0), to_usize(speech_dest.1)),
+        offset: seconds_to_samples(start_film_s, rate),
+        start_film_s,
+        speech,
         old_text: take.recorded_against_old_text,
-        cropped_speech,
     })
 }
 
@@ -1289,6 +1419,16 @@ fn warnings(units: &[Unit], film_duration: f64) -> Vec<ExportWarning> {
                 message: format!(
                     "the speech of {} runs from {start:.3} s to {end:.3} s, partly outside the film (0 s to {film_duration:.3} s); the part outside is cropped",
                     p.line.take_file
+                ),
+            });
+        }
+        if p.silent {
+            warnings.push(ExportWarning {
+                code: "passage-piece-without-speech",
+                line: Some(p.line.id.clone()),
+                message: format!(
+                    "{} holds no speech: {} was not spoken in its own piece of the passage, perhaps early or late, in the piece of the line before or after; the pieces are exported as one stretch, as they were recorded, so listen to the passage there",
+                    p.line.take_file, p.line.id
                 ),
             });
         }
@@ -1361,7 +1501,12 @@ fn overlaps(units: &[Unit]) -> Vec<Refusal> {
     let mut refused = Vec::new();
     for (i, &(unit, a)) in parts.iter().enumerate() {
         for &(other, b) in parts.iter().skip(i + 1) {
-            if unit == other || a.speech.0 >= b.until || b.speech.0 >= a.until {
+            // A piece without speech answers for no audio of its own: the
+            // lines beside it cover the pause it lies in.
+            if unit == other || a.silent || b.silent {
+                continue;
+            }
+            if a.speech.0 >= b.until || b.speech.0 >= a.until {
                 continue;
             }
             let (a_id, b_id) = (&a.line.id, &b.line.id);
@@ -2665,6 +2810,143 @@ text = "Four."
             b.dest_samples[0] + FADE,
             d.dest_samples[1] - FADE,
         );
+    }
+
+    /// [`PASSAGE`] read in one go, but line b early, right after a and
+    /// before the first cut: b's own piece holds only the room.
+    fn b_read_early(dir: &Path) -> (crate::passage::Passage, Vec<i32>) {
+        let mut audio = noise(16.0);
+        for (from, to) in [(10.0, 11.6), (11.9, 12.8), (16.5, 18.6), (19.5, 21.5)] {
+            burst(&mut audio, from - PASSAGE_FIRST_S, to - PASSAGE_FIRST_S);
+        }
+        let passage = record_passage(dir, &["a", "b", "c", "d"], &audio);
+        // Both of b's cuts lie in the long pause after its words.
+        let pieces = passage.pieces().unwrap();
+        let film = |sample: u64| PASSAGE_FIRST_S + sample as f64 / f64::from(RATE);
+        assert!(film(pieces[1].start) > 12.9 && film(pieces[1].end) < 16.4);
+        (passage, audio)
+    }
+
+    #[test]
+    fn a_continuous_read_exports_though_one_piece_holds_no_speech() {
+        let (_tmp, dir) = setup(PASSAGE);
+        let (passage, audio) = b_read_early(&dir);
+        crate::passage::choose_passage(&dir, &passage.id, "narrator").unwrap();
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [
+                ("a", Some("b")),
+                ("b", Some("c")),
+                ("c", Some("d")),
+                ("d", None)
+            ]
+        );
+        // b is named in a warning instead of refusing the export.
+        let warned: Vec<_> = report
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.line.as_deref()))
+            .collect();
+        assert_eq!(warned, [("passage-piece-without-speech", Some("b"))]);
+        assert!(
+            report.warnings[0].message.starts_with("takes/b/001.wav"),
+            "{report:?}"
+        );
+
+        // The run is trimmed at its outer speech only, and is the passage
+        // as it was read, b's words where the narrator spoke them.
+        let (a, b, d) = (line(&report, "a"), line(&report, "b"), line(&report, "d"));
+        assert_eq!(a.dest_samples[0], 480_000 - 7_200);
+        assert_eq!(d.dest_samples[1], 1_032_000 + 7_200);
+        assert_eq!(a.dest_samples[1], b.dest_samples[0]);
+        let out = narration(&dir);
+        assert_as_recorded(
+            &out,
+            &audio,
+            a.dest_samples[0] + FADE,
+            d.dest_samples[1] - FADE,
+        );
+        // b's speech is empty, at the speech that follows its piece.
+        assert!((b.speech_film_s[0] - 16.5).abs() < 0.02, "{b:?}");
+        assert!((b.speech_film_s[0] - b.speech_film_s[1]).abs() < f64::EPSILON);
+        let m = manifest(&dir);
+        assert_eq!(m["warnings"][0]["code"], "passage-piece-without-speech");
+        assert_eq!(m["warnings"][0]["line"], "b");
+    }
+
+    #[test]
+    fn a_piece_without_speech_needs_a_neighbour_of_its_passage() {
+        let (_tmp, dir) = setup(PASSAGE);
+        b_read_early(&dir);
+        // a is read again on its own; b, c and d stay the passage's.
+        let alone = take(&dir, "a", Some((2.0, 3.0)));
+        choose(&dir, &alone);
+        for id in ["b", "c", "d"] {
+            crate::takes::choose_take(&dir, id, 1, "narrator").unwrap();
+        }
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [("a", None), ("b", Some("c")), ("c", Some("d")), ("d", None)]
+        );
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        assert_eq!(report.warnings[0].code, "passage-piece-without-speech");
+        // The run begins 150 ms before c's speech, the first there is:
+        // nothing of b's piece is left in it.
+        let (b, c) = (line(&report, "b"), line(&report, "c"));
+        assert_eq!(b.dest_samples, [c.dest_samples[0]; 2]);
+        let starts = c.dest_samples[0];
+        assert!(starts.abs_diff(792_000 - 7_200) <= 480, "{starts}");
+
+        // c is read again too: b's piece now stands alone, and a take on
+        // its own must hold speech.
+        let alone = take(&dir, "c", Some((2.1, 3.0)));
+        choose(&dir, &alone);
+        let report = run(&dir, false);
+        assert_eq!(refused_codes(&report), vec!["no-speech"]);
+        assert_eq!(report.refused[0].lines, ["b"]);
+    }
+
+    #[test]
+    fn a_run_without_any_speech_is_refused_for_all_its_lines() {
+        let (_tmp, dir) = setup(PASSAGE);
+        // Two consecutive pieces of one passage, 3 s of room each.
+        let project = Project::open(&dir).unwrap();
+        for (index, (id, from)) in [("a", 0u32), ("b", 144_000)].into_iter().enumerate() {
+            let snapshot = project.snapshot(id).unwrap();
+            let first_film_s = PASSAGE_FIRST_S + f64::from(from) / f64::from(RATE);
+            let input = RecordedInput {
+                sample_rate: RATE,
+                device: "Test Mic".to_owned(),
+                channel: 1,
+                line_offset_s: first_film_s - snapshot.start,
+                snapshot,
+                dropouts: None,
+                film_shift_ms: None,
+                passage: Some(PassagePiece {
+                    id: "feed".to_owned(),
+                    index: u32::try_from(index).unwrap(),
+                    count: 2,
+                    from_sample: u64::from(from),
+                    to_sample: u64::from(from) + 144_000,
+                    preroll_floor_dbfs: -65.0,
+                }),
+            };
+            let partial = begin_take(&dir, id, &input).unwrap();
+            write_take_wav(&partial.wav, &noise(3.0), RATE).unwrap();
+            choose(&dir, &commit_take(&dir, partial).unwrap());
+        }
+        let report = run(&dir, false);
+        let no_speech: Vec<_> = report
+            .refused
+            .iter()
+            .filter(|refusal| refusal.code == "no-speech")
+            .collect();
+        assert_eq!(no_speech.len(), 1, "{report:?}");
+        assert_eq!(no_speech[0].lines, ["a", "b"]);
     }
 
     #[test]

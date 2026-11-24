@@ -222,6 +222,7 @@ Warnings mean the file was written but is worth a look; the same list is the man
 - `recorded-against-old-text`: the take was recorded before the line's text changed.
 - `speech-cropped`: part of the take's speech lies outside the film.
 - `tight-gap`: two lines' speech is less than 20 ms apart.
+- `passage-piece-without-speech`: the line's take is a piece of a passage that holds no speech, exported as one stretch with its neighbours (`seam_with`): the narrator read the line early or late, so its words are in the piece before or after it. The narration has them as they were read; the line's `speech_film_s` is an empty range. Have the narrator listen to the passage, and re-record the line if its words are missing.
 - `noise-reduction-skipped` (`clean`): no room tone matches the take (none on its input, channel and day, or the gain changed), or the take or the room tone is digital silence. Run the setup check's room step, then export again.
 - `loudness-target-missed` (`clean`, no `line`): the limiter's 6 dB cap kept the narration below −16 LUFS (`loudness_target_reached: false`).
 
