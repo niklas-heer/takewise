@@ -478,6 +478,13 @@ pub fn cut(
 ) -> Cuts {
     let analysis = analyze(samples, sample_rate, preroll_s);
     let floor = analysis.noise_floor_dbfs;
+    if samples.is_empty() {
+        // Nothing to cut, and no sample a boundary could lie at.
+        return Cuts {
+            cuts: Vec::new(),
+            preroll_floor_dbfs: floor,
+        };
+    }
     let frames = &analysis.frames;
     let silent: Vec<bool> = frames
         .levels_dbfs
@@ -1264,6 +1271,19 @@ text = "Later."
 
     fn two_lines() -> Vec<Snapshot> {
         vec![snap(10.0, 13.0), snap(13.5, 16.0)]
+    }
+
+    #[test]
+    fn a_passage_without_audio_has_no_cuts() {
+        // Nothing was captured, and by the film time the capture would
+        // have begun at, the second line had already started.
+        for lines in [
+            two_lines(),
+            vec![snap(1.0, 2.0), snap(2.5, 4.0), snap(4.5, 6.0)],
+        ] {
+            let cuts = cut(&[], RATE, FIRST, &lines, 3.0);
+            assert_eq!(cuts.cuts, [], "{lines:?}");
+        }
     }
 
     #[test]
