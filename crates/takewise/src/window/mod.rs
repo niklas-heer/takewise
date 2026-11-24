@@ -561,11 +561,11 @@ pub struct RecordingWindow {
     /// The connected inputs as last checked.
     inputs: Vec<AvailableInput>,
     panel: panel::Panel,
-    /// The levels' sliders, the levels in dB as set now, and when they last
-    /// changed while not yet written to `project.toml`.
+    /// The levels' sliders, the levels in dB as set now, and those changed
+    /// here and not yet written to `project.toml`.
     levels: levels::Levels,
     volumes: levels::Volumes,
-    volumes_changed_at: Option<f64>,
+    unsaved: levels::Unsaved,
     peak_meter: meter::PeakMeter,
     /// Peaks of takes committed in this session, for the "clipped" mark
     /// until their check says.
@@ -675,7 +675,7 @@ impl RecordingWindow {
             panel: panel::Panel::new(),
             levels,
             volumes,
-            volumes_changed_at: None,
+            unsaved: levels::Unsaved::default(),
             peak_meter: meter::PeakMeter::default(),
             take_peaks: HashMap::new(),
             defaults_path: None,
@@ -698,6 +698,8 @@ impl RecordingWindow {
             rescue_root: None,
             close_refused: None,
         };
+        // The levels in use, within their ranges, are what takes play at.
+        view.volumes.write_into(&mut view.project.config);
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
         view.recover();

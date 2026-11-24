@@ -3098,6 +3098,115 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui_kit::test]
+fn a_level_changed_on_disk_is_kept_and_heard(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]); // d
+    record_take(cx, &f);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+
+    // The film here, the voice by an agent before the film was saved.
+    press(cx, f.window, &["-"]);
+    let edit = tw::Volumes {
+        voice_gain_db: Some(-7.0),
+        film_gain_db: Some(-30.0),
+        ..tw::Volumes::default()
+    };
+    tw::set_volumes(&f.dir, edit).expect("agent edit");
+    f.view.update(cx, |view, _| view.reload());
+    f.view.read_with(cx, |view, _| {
+        assert_eq!(view.volumes.film, -13.0, "the unsaved change stays");
+        assert_eq!(view.volumes.voice, -7.0, "the file's voice level is taken");
+    });
+    let gains = f.media.0.borrow().take.as_ref().map(|t| t.gains_db.clone());
+    assert_eq!(
+        gains.and_then(|g| g.last().copied()),
+        Some(-7.0),
+        "and heard"
+    );
+
+    f.media.set_now(201.0);
+    frame(cx, f.window);
+    let saved = config(&f.dir);
+    assert_eq!(saved.record.film_gain_db, -13.0);
+    assert_eq!(saved.record.voice_gain_db, -7.0, "not overwritten");
+
+    // A film level from the file is heard too, and the next playback
+    // starts at the voice level from the file.
+    let edit = tw::Volumes {
+        film_gain_db: Some(-20.0),
+        voice_gain_db: Some(-9.0),
+        ..tw::Volumes::default()
+    };
+    tw::set_volumes(&f.dir, edit).expect("agent edit");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(-20.0));
+    press(cx, f.window, &["p", "p"]);
+    frame(cx, f.window);
+    let gains = f.media.0.borrow().take.as_ref().map(|t| t.gains_db.clone());
+    assert_eq!(gains, Some(vec![-9.0]));
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(-20.0));
+}
+
+#[gpui_kit::test]
+fn a_level_that_cannot_be_saved_is_tried_again(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let path = f.dir.join("project.toml");
+    let good = fs::read_to_string(&path).expect("project.toml");
+    fs::write(&path, format!("{good}\n[[[ broken")).expect("break it");
+    press(cx, f.window, &["-"]);
+    f.media.set_now(101.0);
+    frame(cx, f.window);
+    assert!(
+        message(cx, &f.view).starts_with("Could not save the levels; trying again"),
+        "{}",
+        message(cx, &f.view)
+    );
+    fs::write(&path, &good).expect("mend it");
+    f.media.set_now(102.0);
+    frame(cx, f.window);
+    assert_eq!(config(&f.dir).record.film_gain_db, -12.0, "waits to retry");
+    f.media.set_now(103.1);
+    frame(cx, f.window);
+    assert_eq!(config(&f.dir).record.film_gain_db, -13.0, "not lost");
+    assert_eq!(message(cx, &f.view), "Saved the levels.");
+
+    // Closing writes what has not rested yet.
+    press(cx, f.window, &["-"]);
+    f.view.update(cx, |view, _| view.shutdown());
+    assert_eq!(config(&f.dir).record.film_gain_db, -14.0);
+}
+
+#[gpui_kit::test]
+fn levels_out_of_range_in_the_file_are_clamped(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        let edit = tw::Volumes {
+            film_gain_db: Some(12.0),
+            voice_gain_db: Some(5.0),
+            monitor_db: Some(-99.0),
+        };
+        tw::set_volumes(dir, edit).expect("levels");
+        commit_outside(dir, "d");
+    });
+    f.view.read_with(cx, |view, _| {
+        assert_eq!(
+            (view.volumes.film, view.volumes.voice, view.volumes.monitor),
+            (0.0, 0.0, -60.0)
+        );
+    });
+    press(cx, f.window, &["down", "down", "down"]); // d
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(0.0));
+    let gains = f.media.0.borrow().take.as_ref().map(|t| t.gains_db.clone());
+    assert_eq!(gains, Some(vec![0.0]));
+}
+
 /// −0.4 dBFS: near clipping, not clipped.
 const LOUD: i32 = 8_000_000;
 

@@ -3,7 +3,8 @@
 //! while monitoring can run. Each is a slider with its value in dB; the
 //! film and monitor keys move them too. A change applies at once, also
 //! during a take or a playback, and is written to `project.toml` once it
-//! rested a moment, between takes.
+//! rested a moment, between takes: only the levels changed here, so a
+//! level an agent changed in the file meanwhile is kept, and heard.
 
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::{Slider, SliderIndicator, SliderThumb, SliderTrack};
@@ -27,6 +28,8 @@ pub const STEP_DB: f64 = 1.0;
 /// How long a level change waits before it is written to `project.toml`
 /// (a dragged slider writes once).
 pub const SAVE_DELAY_S: f64 = 0.5;
+/// How long a level save that failed waits before it is tried again.
+pub const SAVE_RETRY_S: f64 = 2.0;
 
 /// One of the levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +43,8 @@ pub enum Level {
 }
 
 impl Level {
+    pub const ALL: [Level; 3] = [Level::Film, Level::Voice, Level::Monitor];
+
     pub fn range(self) -> (f64, f64) {
         match self {
             Self::Film => FILM_DB,
@@ -53,6 +58,17 @@ impl Level {
             Self::Film => "Film",
             Self::Voice => "Voice",
             Self::Monitor => "Monitor",
+        }
+    }
+
+    /// `db` as this level can be set: within its range, or `default` when
+    /// it is no number at all.
+    fn fit(self, db: f64, default: f64) -> f64 {
+        let (min, max) = self.range();
+        if db.is_finite() {
+            db.clamp(min, max)
+        } else {
+            default
         }
     }
 
@@ -75,11 +91,15 @@ pub struct Volumes {
 }
 
 impl Volumes {
+    /// The levels in `config`, each within its range (a file can say
+    /// anything).
     pub fn of(config: &ProjectConfig) -> Self {
+        let record = tw::RecordConfig::default();
+        let monitor = tw::MonitorConfig::default();
         Self {
-            film: config.record.film_gain_db,
-            voice: config.record.voice_gain_db,
-            monitor: config.monitor.volume_db,
+            film: Level::Film.fit(config.record.film_gain_db, record.film_gain_db),
+            voice: Level::Voice.fit(config.record.voice_gain_db, record.voice_gain_db),
+            monitor: Level::Monitor.fit(config.monitor.volume_db, monitor.volume_db),
         }
     }
 
@@ -99,10 +119,35 @@ impl Volumes {
         }
     }
 
-    fn write_into(self, config: &mut ProjectConfig) {
+    pub fn write_into(self, config: &mut ProjectConfig) {
         config.record.film_gain_db = self.film;
         config.record.voice_gain_db = self.voice;
         config.monitor.volume_db = self.monitor;
+    }
+}
+
+/// Level changes that `project.toml` does not have yet.
+#[derive(Debug, Default)]
+pub struct Unsaved {
+    /// The levels changed in the window since they were last written.
+    levels: Vec<Level>,
+    /// When the last of them changed.
+    changed_at: f64,
+    /// When a write that failed may be tried again; whether one failed.
+    retry_at: f64,
+    failed: bool,
+}
+
+impl Unsaved {
+    fn note(&mut self, level: Level, now: f64) {
+        if !self.levels.contains(&level) {
+            self.levels.push(level);
+        }
+        self.changed_at = now;
+    }
+
+    pub fn contains(&self, level: Level) -> bool {
+        self.levels.contains(&level)
     }
 }
 
@@ -223,38 +268,74 @@ impl RecordingWindow {
         self.recorder
             .set_playback_levels(self.volumes.film, self.volumes.voice);
         self.volumes.write_into(&mut self.project.config);
-        self.volumes_changed_at = Some(self.media.host_now_s());
+        self.unsaved.note(level, self.media.host_now_s());
     }
 
-    /// Writes changed levels to `project.toml` once they rested a moment,
-    /// never during a take (or at once with `now`).
+    /// Writes the levels changed here to `project.toml` once they rested a
+    /// moment, never during a take; with `now` at once (the window
+    /// closing). A write that fails keeps them, says so once, and is tried
+    /// again every [`SAVE_RETRY_S`].
     pub(super) fn save_volumes(&mut self, now: bool) {
-        let Some(changed) = self.volumes_changed_at else {
-            return;
-        };
-        let rested = self.media.host_now_s() - changed >= SAVE_DELAY_S;
-        if self.recorder.is_recording() || !(now || rested) {
+        if self.unsaved.levels.is_empty() || self.recorder.is_recording() {
             return;
         }
-        self.volumes_changed_at = None;
-        let volumes = tw::Volumes {
-            film_gain_db: Some(self.volumes.film),
-            voice_gain_db: Some(self.volumes.voice),
-            monitor_db: Some(self.volumes.monitor),
+        let at = self.media.host_now_s();
+        let due = at - self.unsaved.changed_at >= SAVE_DELAY_S && at >= self.unsaved.retry_at;
+        if !(now || due) {
+            return;
+        }
+        let changed = |level: Level| {
+            self.unsaved
+                .contains(level)
+                .then_some(self.volumes.get(level))
         };
-        if let Err(err) = tw::set_volumes(&self.dir, volumes) {
-            self.message = Some(format!("Could not save the levels: {err}"));
+        let volumes = tw::Volumes {
+            film_gain_db: changed(Level::Film),
+            voice_gain_db: changed(Level::Voice),
+            monitor_db: changed(Level::Monitor),
+        };
+        match tw::set_volumes(&self.dir, volumes) {
+            Ok(()) => {
+                if self.unsaved.failed {
+                    self.message = Some("Saved the levels.".to_owned());
+                }
+                self.unsaved = Unsaved::default();
+            }
+            Err(err) => {
+                let said = format!("Could not save the levels; trying again: {err}");
+                if now {
+                    eprintln!("takewise: {said}");
+                }
+                if !self.unsaved.failed {
+                    self.message = Some(said);
+                }
+                self.unsaved.failed = true;
+                self.unsaved.retry_at = at + SAVE_RETRY_S;
+            }
         }
     }
 
-    /// After a reload: unsaved level changes stay; otherwise the file's
-    /// values (an agent may have edited them) are taken.
+    /// After a reload: the levels changed here and not yet saved stay; the
+    /// others take the file's values (an agent may have edited them), and
+    /// those are heard at once: the film, a take playing, and a playback
+    /// about to start.
     pub(super) fn sync_volumes(&mut self) {
-        if self.volumes_changed_at.is_some() {
-            self.volumes.write_into(&mut self.project.config);
-        } else {
-            self.volumes = Volumes::of(&self.project.config);
+        let file = Volumes::of(&self.project.config);
+        let before = self.volumes;
+        for level in Level::ALL {
+            if !self.unsaved.contains(level) {
+                self.volumes.set(level, file.get(level));
+            }
         }
+        self.volumes.write_into(&mut self.project.config);
+        if (self.volumes.film - before.film).abs() > f64::EPSILON {
+            self.media.film_set_gain_db(self.volumes.film);
+        }
+        if (self.volumes.voice - before.voice).abs() > f64::EPSILON {
+            self.media.take_set_gain_db(self.volumes.voice);
+        }
+        self.recorder
+            .set_playback_levels(self.volumes.film, self.volumes.voice);
     }
 
     /// The levels block under the takes.
