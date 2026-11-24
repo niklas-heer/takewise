@@ -86,6 +86,7 @@ latency_offset_ms = 0                       # manual correction from the loopbac
 preroll_s = 3.0                             # 3-2-1, a second for each digit
 tail_s = 1.5
 film_gain_db = -12.0                        # film audio level in the headphones while recording
+voice_gain_db = 0.0                         # level of takes played back with P and Shift+P (0 at most); export ignores it
 passage_gap_s = 1.0                         # lines closer than this form one passage (see "Passages")
 
 [check]

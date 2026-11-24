@@ -326,8 +326,12 @@ impl RecordingWindow {
             return;
         }
         self.volumes_changed_at = None;
-        if let Err(err) = tw::set_volumes(&self.dir, Some(self.film_gain_db), Some(self.monitor_db))
-        {
+        let volumes = tw::Volumes {
+            film_gain_db: Some(self.film_gain_db),
+            voice_gain_db: None,
+            monitor_db: Some(self.monitor_db),
+        };
+        if let Err(err) = tw::set_volumes(&self.dir, volumes) {
             self.message = Some(format!("Could not save the volume: {err}"));
         }
     }

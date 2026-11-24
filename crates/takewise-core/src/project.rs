@@ -248,6 +248,10 @@ pub struct RecordConfig {
     pub preroll_s: f64,
     pub tail_s: f64,
     pub film_gain_db: f64,
+    /// The level takes and passages play at when the narrator listens to
+    /// them in the window (P, Shift+P), in dB; 0 at most, since the player
+    /// cannot amplify. Export never uses it.
+    pub voice_gain_db: f64,
     /// Consecutive lines belong to one passage while each line's slot ends
     /// less than this many seconds before the next line starts (see
     /// [`Script::passages`]); 0 makes every line a passage of its own.
@@ -261,6 +265,7 @@ impl Default for RecordConfig {
             preroll_s: 3.0,
             tail_s: 1.5,
             film_gain_db: -12.0,
+            voice_gain_db: 0.0,
             passage_gap_s: 1.0,
         }
     }
@@ -454,6 +459,7 @@ mod tests {
         assert!((opened.config.record.preroll_s - 3.0).abs() < f64::EPSILON);
         assert!((opened.config.record.tail_s - 1.5).abs() < f64::EPSILON);
         assert!((opened.config.record.film_gain_db + 12.0).abs() < f64::EPSILON);
+        assert!(opened.config.record.voice_gain_db.abs() < f64::EPSILON);
         assert!((opened.config.record.passage_gap_s - 1.0).abs() < f64::EPSILON);
         assert_eq!(opened.config.check.language, "en");
         assert_eq!(opened.config.check.whisper_model, "ggml-large-v3-turbo.bin");
@@ -477,6 +483,10 @@ mod tests {
         assert_eq!(config.setup, None);
         assert_eq!(config.input.latency_offset_ms, 12);
         assert!((config.record.passage_gap_s - 1.0).abs() < f64::EPSILON);
+        assert!(
+            config.record.voice_gain_db.abs() < f64::EPSILON,
+            "takes play at full level in projects made before 0.2.1"
+        );
 
         // A new project's file has none of the new tables either.
         let dir = tmp.path().join("new");

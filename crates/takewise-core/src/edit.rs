@@ -325,15 +325,31 @@ pub fn set_route(dir: &Path, input: Option<(&str, u16)>, output: Option<&str>) -
     })
 }
 
-/// Sets `[record] film_gain_db` and/or `[monitor] volume_db` under the
-/// lock, keeping the file's comments and layout. `None` leaves that value
-/// as it is.
-pub fn set_volumes(dir: &Path, film_gain_db: Option<f64>, monitor_db: Option<f64>) -> Result<()> {
+/// The levels [`set_volumes`] writes; `None` leaves that value as it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Volumes {
+    /// `[record] film_gain_db`
+    pub film_gain_db: Option<f64>,
+    /// `[record] voice_gain_db`
+    pub voice_gain_db: Option<f64>,
+    /// `[monitor] volume_db`
+    pub monitor_db: Option<f64>,
+}
+
+/// Sets the levels in `volumes` under the lock, keeping the file's
+/// comments and layout.
+pub fn set_volumes(dir: &Path, volumes: Volumes) -> Result<()> {
     edit_project(dir, |doc| {
-        if let Some(db) = film_gain_db {
-            set_value(table(doc, "record")?, "film_gain_db", Some(Value::from(db)));
+        let record = [
+            ("film_gain_db", volumes.film_gain_db),
+            ("voice_gain_db", volumes.voice_gain_db),
+        ];
+        for (key, db) in record {
+            if let Some(db) = db {
+                set_value(table(doc, "record")?, key, Some(Value::from(db)));
+            }
         }
-        if let Some(db) = monitor_db {
+        if let Some(db) = volumes.monitor_db {
             set_value(table(doc, "monitor")?, "volume_db", Some(Value::from(db)));
         }
         Ok(())
@@ -690,15 +706,26 @@ text = "Third."
     }
 
     #[test]
-    fn set_volumes_writes_film_and_monitor_levels() {
+    fn set_volumes_writes_film_voice_and_monitor_levels() {
         let (_tmp, dir) = project();
-        set_volumes(&dir, Some(-9.0), None).unwrap();
+        let film = Volumes {
+            film_gain_db: Some(-9.0),
+            ..Volumes::default()
+        };
+        set_volumes(&dir, film).unwrap();
         let config = crate::project::read_config(&dir).unwrap();
         assert!((config.record.film_gain_db + 9.0).abs() < f64::EPSILON);
+        assert!(config.record.voice_gain_db.abs() < f64::EPSILON);
         assert!((config.monitor.volume_db + 6.0).abs() < f64::EPSILON);
-        set_volumes(&dir, None, Some(3.0)).unwrap();
+        let others = Volumes {
+            voice_gain_db: Some(-4.0),
+            monitor_db: Some(3.0),
+            ..Volumes::default()
+        };
+        set_volumes(&dir, others).unwrap();
         let config = crate::project::read_config(&dir).unwrap();
         assert!((config.record.film_gain_db + 9.0).abs() < f64::EPSILON);
+        assert!((config.record.voice_gain_db + 4.0).abs() < f64::EPSILON);
         assert!((config.monitor.volume_db - 3.0).abs() < f64::EPSILON);
         assert!(!config.monitor.enabled, "enabled keeps its default");
     }
