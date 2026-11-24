@@ -8,7 +8,7 @@ This guide walks one project through the whole loop. A test (`crates/takewise/te
 
 - Add `--json` to any command: it prints one JSON object, `{"ok":true,"data":…}` or `{"ok":false,"error":{"code":…,"message":…},"data":…}`.
 - Exit codes: 0 success, 1 a finding (`data` says what: an export that refuses, `status --strict` with open lines, a failed `doctor` check), 2 a usage or setup error (`error.code` says which, such as `missing-model` or `script-changed`).
-- Never edit `takes.jsonl` or anything under `takes/`. Takes are only ever added; choices and judgments are new events written by `choose` and `judge`.
+- Never edit `takes.jsonl` or anything under `takes/`. Takes are only ever added; choices and judgments are new events written by `choose` and `judge`. If you read `takes.jsonl` yourself, open it anew each time instead of following an open file: `choose --passage` replaces the file with a longer copy (every earlier byte kept), which a file held open does not show.
 - Write `script.toml` freely before recording. Once takes exist, change one field at a time with `takewise script set … --expect <script_version>`, so an edit made against a script the narrator changed meanwhile is refused instead of lost.
 - Flag, don't decide: checks and judgments rank takes; only `choose` (yours or the narrator's) picks one.
 - Work through the `takewise` command, never the app's windows: `takewise record <dir>` opens the recording window for the narrator.
