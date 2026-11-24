@@ -41,7 +41,7 @@ takewise models install
 takewise doctor
 ```
 
-The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones delay the film's sound and aren't supported for recording. The Mac's built-in microphone and its headphone jack are enough for a first try. The app is signed and notarized.
+The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones add a delay that can change after reconnecting, which the latency measurement corrects but wired headphones avoid. The Mac's built-in microphone and its headphone jack are enough for a first try. The app is signed and notarized.
 
 The speech model (`ggml-large-v3-turbo.bin`, 1.5 GB) is downloaded once, from whisper.cpp's repository on Hugging Face and is installed only when its SHA-256 matches the one pinned in Takewise. The recording window offers the same download with a button. After that, nothing needs the network.
 
@@ -127,9 +127,9 @@ The window shows the film, the line to read, its note for the narrator and the n
 
 Read one line at a time, each sentence gets its own count-in and loses the intonation that joins it to the next. So lines that follow each other closely form a *passage*, and you can read a passage in one go.
 
-- **Shift+Space** records from the current line through the end of its passage: one take, one count-in. The prompter moves to each line when the film reaches its start, and the take stops by itself 1.5 s after the last line's slot, or when you press Space.
+- **Shift+Space** records from the current line through the end of its passage: one take, one count-in. The prompter moves to each line when the film reaches its start, keeping the line you just read dimmed above it for a moment in case you run late, and the take stops by itself 1.5 s after the last line's slot, or when you press Space.
 - The recording is kept whole and cut, in the pauses between the sentences, into one take per line. Each of those is checked, chosen and replaced like any other take, so you can still pick up a single line with Space. The cuts follow the cues within about a second, so missing or extra words on both sides of a cut after a passage take mean the read ran off the cues there; the passage file itself is intact (Shift+P plays it, and a passage chosen whole exports as you read it).
-- **Shift+P** plays the whole passage against the film, so you hear the flow. **Shift+Enter** chooses the passage for every line it has a take of.
+- **Shift+P** plays the passage against the film from the selected take's line to the passage's end (from its first line, the whole passage), so you hear the flow. **Shift+Enter** chooses the passage for every line it has a take of.
 - The export keeps chosen takes of one passage together, as you read them: the breaths and pauses between the sentences stay, and only the passage's outer edges are trimmed. A line you picked up on its own is spliced in as any take is.
 
 Which lines belong together is a rule, not a setting per line: a line joins the one before it when it starts less than `[record] passage_gap_s` (1.0 s) after that line's slot ends. Sentences a few tenths of a second apart are grouped, and a deliberate pause for the picture or the music ends the passage. The line list shows each passage with a thin bar beside its lines.
@@ -160,7 +160,7 @@ Takewise records at 48 kHz from an input running at that rate. For an input set 
 
 Press C, and Takewise walks you through your devices, flagging speakers and Bluetooth headphones. Then it listens while you read a sentence and tells you how far to turn the gain on your interface. Next it records five seconds of silence and rates how far your voice stands above the room's noise; that recording is kept as room tone for the export's noise reduction. When the latency hasn't been measured for these devices, a last step does it: hold your headphones against the microphone and press Space, and beeps play for about 15 seconds while Takewise measures where they land (`takewise calibrate --write` does the same from the command line).
 
-Takewise remembers both for your next project. A latency measured on exactly the same input, output and buffer size is reused, and the panel says it came from an earlier measurement. A setup check from today on the same devices is adopted with its room tone. On Bluetooth headphones, whose delay can change after reconnecting, press C to measure again if takes sound late.
+Takewise remembers both for your next project. A latency measured on exactly the same input, output and buffer size is reused, and the panel says it came from an earlier measurement. A setup check from today on the same devices is adopted with its room tone. On Bluetooth headphones, whose delay can change after reconnecting, press L to measure the latency again (15 s) if takes sound late; L runs only the latency step, whenever you like.
 
 ### Export for your editor
 
@@ -219,13 +219,14 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 | Shift+Enter | Choose the selected take's passage for every line it has a take of |
 | R | Record another take of the current line |
 | P | Play the line in context, the selected take locked to the film (needs a take) |
-| Shift+P | Play the selected take's whole passage, locked to the film |
+| Shift+P | Play the selected take's passage locked to the film, from that take's line to the passage's end |
 | M | Set the line's start to the playhead while the film plays (during a take of one line, or P) |
 | E | Edit the line's text (Enter saves, Esc cancels) |
 | ↑ / ↓ | Previous or next line |
 | ← / → | Previous or next take |
 | A | The audio panel: input, channel, output, volume, meters |
 | C | The setup check |
+| L | Measure the latency again: the setup check's latency step alone (15 s) |
 | − / + | Film quieter or louder |
 | K | Clear the clipping light |
 | I | Install the speech model, while it is missing |

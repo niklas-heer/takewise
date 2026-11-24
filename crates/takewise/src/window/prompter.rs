@@ -2,6 +2,11 @@
 //! current line large with the pace guide filling it, the next line dimmed,
 //! and any message or reason recording is blocked.
 //!
+//! During a passage take a row above the current line holds the line just
+//! read for a moment after the prompter moved on, so a reader who runs a
+//! little late can finish it. The row is kept, empty, for the whole take,
+//! so the current line never moves while it is read.
+//!
 //! Up to three rows of the line show at full size. A longer line scrolls
 //! smoothly so the row with the pace fill's current word stays in the
 //! middle; the first and last rows hold still, and a retake starts from the
@@ -22,6 +27,8 @@ pub const VISIBLE_ROWS: usize = 3;
 const ROW_PX: f32 = 44.0;
 /// The height of the message row under the prompter, kept when empty.
 const MESSAGE_ROW_PX: f32 = 20.0;
+/// The height of the row for the line just read, during a passage take.
+const PASSED_ROW_PX: f32 = 24.0;
 /// How long one scroll step eases.
 pub const SCROLL_S: f64 = 0.2;
 
@@ -106,6 +113,17 @@ pub fn filled_bytes(reading: Reading<'_>, film_s: f64) -> usize {
     byte_index(reading.text, chars)
 }
 
+/// The row above the current line for the line just read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Passed<'a> {
+    /// No row: no passage take runs.
+    Off,
+    /// The row is kept, empty, during a passage take.
+    Empty,
+    /// The line just read, shown in the row.
+    Line(&'a str),
+}
+
 /// The line to read and its slot.
 #[derive(Debug, Clone, Copy)]
 pub struct Reading<'a> {
@@ -121,6 +139,8 @@ pub struct Prompter<'a> {
     pub reading: Option<Reading<'a>>,
     pub note: Option<&'a str>,
     pub next: Option<&'a str>,
+    /// The row above the current line for the line just read.
+    pub passed: Passed<'a>,
     /// The input level and the held peak in dBFS.
     pub level_dbfs: Option<f64>,
     pub hold_dbfs: Option<f64>,
@@ -277,7 +297,7 @@ impl Prompter<'_> {
                         .child(format!("Recording is off. {blocked}")),
                 )
             })
-            .child(current)
+            .child(with_passed(current, self.passed))
             .when_some(self.note, |el, note| {
                 el.child(
                     div()
@@ -308,6 +328,31 @@ impl Prompter<'_> {
             .into_any_element();
         (element, layout)
     }
+}
+
+/// The current line, with the row for the line just read above it during
+/// a passage take: one dimmed row, cut short with an ellipsis.
+fn with_passed(current: AnyElement, passed: Passed<'_>) -> AnyElement {
+    let text = match passed {
+        Passed::Off => return current,
+        Passed::Empty => None,
+        Passed::Line(text) => Some(text.to_owned()),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .h(px(PASSED_ROW_PX))
+                .line_height(px(PASSED_ROW_PX))
+                .text_size(px(18.))
+                .text_color(rgb(colors::FAINT))
+                .truncate()
+                .children(text),
+        )
+        .child(current)
+        .into_any_element()
 }
 
 #[cfg(test)]

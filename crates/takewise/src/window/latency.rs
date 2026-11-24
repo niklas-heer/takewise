@@ -109,8 +109,17 @@ impl RecordingWindow {
         };
         self.end_calibration();
         let outcome = result.and_then(|measurement| self.store_calibration(&measurement));
-        if let Some(setup) = &mut self.setup {
-            setup.latency = Some(outcome);
+        let Some(setup) = &mut self.setup else {
+            return;
+        };
+        match outcome {
+            // Opened with L: done once a measurement is stored.
+            Ok(stored) if setup.latency_only => {
+                self.setup = None;
+                self.message = Some(format!("Latency measured: {stored}"));
+            }
+            Ok(stored) => setup.latency = Some(Ok(format!("{stored} Press Enter to finish."))),
+            Err(err) => setup.latency = Some(Err(err)),
         }
     }
 
@@ -186,7 +195,7 @@ impl RecordingWindow {
         self.reload();
         self.check_inputs();
         Ok(format!(
-            "{placed}. Stored latency_offset_ms = {offset} for {} and {}. Press Enter to finish.",
+            "{placed}. Stored latency_offset_ms = {offset} for {} and {}.",
             measurement.input, measurement.output
         ))
     }
@@ -213,7 +222,12 @@ impl RecordingWindow {
             Some(Err(err)) => {
                 body.push(line(format!("Not calibrated: {err}."), colors::WARN));
                 body.push(line(
-                    "Press Space to measure again, or Enter to finish without it.".to_owned(),
+                    if setup.latency_only {
+                        "Press Space to measure again, or Esc to close."
+                    } else {
+                        "Press Space to measure again, or Enter to finish without it."
+                    }
+                    .to_owned(),
                     colors::DIM,
                 ));
             }

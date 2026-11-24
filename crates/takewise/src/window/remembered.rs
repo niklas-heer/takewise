@@ -16,7 +16,7 @@ use takewise_core::{CalibrationInfo, Route, SetupInfo};
 use super::RecordingWindow;
 
 /// What the panel adds for a remembered latency on a Bluetooth output.
-pub const BLUETOOTH_HINT: &str = "Bluetooth delay can change after reconnecting; press C to measure again (15 s) if takes sound late.";
+pub const BLUETOOTH_HINT: &str = "Bluetooth delay can change after reconnecting; press L to measure it again (15 s) if takes sound late.";
 
 impl RecordingWindow {
     /// Uses the settings file `settings` (none: no defaults, nothing

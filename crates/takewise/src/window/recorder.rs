@@ -53,6 +53,10 @@ const END_TOLERANCE_S: f64 = 0.25;
 const FILM_START_TIMEOUT_S: f64 = 1.0;
 /// A film shift larger than this after the take started is recorded.
 const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
+/// How long, in film time, the prompter keeps the line just read in view
+/// after a passage take moved on to the next line, so a reader running a
+/// little late can finish it.
+pub const PASSED_S: f64 = 1.5;
 /// A passage's sidecar is rewritten when its first sample's film time moved
 /// by more than this (the film started late, so the take follows it).
 const SIDECAR_TOLERANCE_S: f64 = 0.0005;
@@ -122,8 +126,12 @@ pub struct Recorder {
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
     unsaved_retry_at: f64,
-    /// Which line the last passage take was reading when it stopped (from
-    /// 0, and its id), until the next take starts.
+    /// Why saving a take or passage failed last, while any waits.
+    save_error: Option<String>,
+    /// Which line the last passage take rests on (from 0, and its id),
+    /// until the next take starts: the line it was reading when the
+    /// narrator stopped it, or its first line when it ran to its end, so
+    /// Shift+Space picks it up there or reads it again whole.
     read_last: Option<(usize, String)>,
     /// Passages that could not be published yet; kept in memory and retried.
     unsaved_passages: Vec<Stopped>,
@@ -316,6 +324,7 @@ impl Recorder {
             tap_broken: false,
             unsaved: Vec::new(),
             unsaved_retry_at: 0.0,
+            save_error: None,
             read_last: None,
             unsaved_passages: Vec::new(),
             uncut: Vec::new(),
@@ -343,6 +352,38 @@ impl Recorder {
     /// saved or cut into their takes.
     pub fn has_unsaved(&self) -> bool {
         !self.unsaved.is_empty() || !self.unsaved_passages.is_empty() || !self.uncut.is_empty()
+    }
+
+    /// How many stopped takes and passages have audio only in memory: not
+    /// saved, and not complete on disk either, where a repair would find
+    /// it after the window closed. Closing now would lose them.
+    pub fn in_memory_only(&self) -> (usize, usize) {
+        let on_disk = |complete: bool, files: Option<(&Path, &Path)>| {
+            complete && files.is_some_and(|(wav, meta)| wav.is_file() && meta.is_file())
+        };
+        let takes = self
+            .unsaved
+            .iter()
+            .filter(|unsaved| {
+                let files = unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
+                !on_disk(unsaved.complete, files)
+            })
+            .count();
+        let passages = self
+            .unsaved_passages
+            .iter()
+            .filter(|stopped| {
+                let unsaved = &stopped.unsaved;
+                let files = unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
+                !on_disk(unsaved.complete, files)
+            })
+            .count();
+        (takes, passages)
+    }
+
+    /// Why saving failed last, while a take or passage waits to be saved.
+    pub fn save_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
     }
 
     pub fn is_recording(&self) -> bool {
@@ -396,6 +437,19 @@ impl Recorder {
     /// Whether a passage take is being recorded.
     pub fn is_recording_passage(&self) -> bool {
         matches!(&self.phase, Phase::Recording(take) if take.passage.is_some())
+    }
+
+    /// During a passage take, the text of the line read before the one
+    /// being read, for [`PASSED_S`] of film after the film reached the
+    /// line being read.
+    pub fn passed_line(&self, media: &dyn Media) -> Option<&str> {
+        let Phase::Recording(take) = &self.phase else {
+            return None;
+        };
+        let passage = take.passage.as_ref()?;
+        let before = passage.input.lines.get(passage.reading.checked_sub(1)?)?;
+        let since = take.clock.film_at(media.host_now_s())? - passage.line()?.snapshot.start;
+        (since < PASSED_S).then_some(before.snapshot.text.as_str())
     }
 
     /// Which line of a passage take is being read (from 0), and that
@@ -687,20 +741,27 @@ impl Recorder {
     /// into its takes on a worker thread: they are reported by a later
     /// [`Recorder::tick`].
     pub fn finish_take(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
-        self.stop_take(media, dir, None)
+        self.stop_take(media, dir, None, false)
     }
 
     /// [`Recorder::finish_take`], with `why` the take stopped when it was
-    /// not the narrator who stopped it.
-    fn stop_take(&mut self, media: &mut dyn Media, dir: &Path, why: Option<String>) -> Update {
+    /// not the narrator who stopped it, and whether it ran to its end.
+    fn stop_take(
+        &mut self,
+        media: &mut dyn Media,
+        dir: &Path,
+        why: Option<String>,
+        ran_to_end: bool,
+    ) -> Update {
         let Phase::Recording(take) = mem::replace(&mut self.phase, Phase::Idle) else {
             return Update::default();
         };
         media.stop_capture();
         let mut take = *take;
         self.read_last = take.passage.as_ref().and_then(|passage| {
-            let line = passage.line()?;
-            Some((passage.reading, line.id.clone()))
+            let reading = if ran_to_end { 0 } else { passage.reading };
+            let line = passage.input.lines.get(reading)?;
+            Some((reading, line.id.clone()))
         });
         let written = take.writer.finish();
         // Stopped after audio arrived but before a frame scheduled the film:
@@ -791,6 +852,7 @@ impl Recorder {
                     "The take of {} could not be saved ({err}); it is kept in memory and saving is retried.",
                     unsaved.line
                 );
+                self.save_error = Some(err);
                 self.unsaved.push(unsaved);
                 Update {
                     message: Some(message),
@@ -843,6 +905,7 @@ impl Recorder {
                     "The passage could not be saved ({err}); it is kept in memory and saving is retried."
                 );
                 let message = join(stopped.notes.clone(), Some(message)).unwrap_or_default();
+                self.save_error = Some(err);
                 self.unsaved_passages.push(stopped);
                 message
             }
@@ -945,7 +1008,10 @@ impl Recorder {
                     stopped.notes = join(Some(note), stopped.notes.take());
                     self.uncut.push(stopped.published(id));
                 }
-                Err(_) => self.unsaved_passages.push(stopped),
+                Err(err) => {
+                    self.save_error = Some(err);
+                    self.unsaved_passages.push(stopped);
+                }
             }
         }
         for uncut in self.uncut.iter_mut().filter(|uncut| uncut.worker.is_none()) {
@@ -967,15 +1033,24 @@ impl Recorder {
                     update.committed = Some(committed);
                 }
                 Ok(saved) => update.message = join(update.message.take(), saved.note),
-                Err(_) => left.push(unsaved),
+                Err(err) => {
+                    self.save_error = Some(err);
+                    left.push(unsaved);
+                }
             }
         }
         self.unsaved = left;
+        if self.unsaved.is_empty() && self.unsaved_passages.is_empty() {
+            self.save_error = None;
+        }
         update
     }
 
     /// Plays line `idx` in context: pre-roll, the take locked to the film,
-    /// and the tail. Starts once the take has loaded.
+    /// and the tail. Starts once the take has loaded. A piece of a passage
+    /// plays through its own end and the tail, as it ends at the cut before
+    /// the next line, which can lie past the slot's tail; it can even begin
+    /// there, when the line's slot was shortened after the recording.
     pub fn start_playback(
         &mut self,
         media: &mut dyn Media,
@@ -1004,11 +1079,20 @@ impl Recorder {
         media.open_take(&project.dir.join(&take.file))?;
         let rec = &project.config.record;
         let plan = plan_take(line.start, snapshot.end, rec.preroll_s, rec.tail_s);
+        let take_first_film_s = line.start + take.line_offset_s;
+        let stop_film_s = take
+            .passage
+            .as_ref()
+            .map_or(plan.capture_stop_film_s, |piece| {
+                let samples = piece.to_sample.saturating_sub(piece.from_sample);
+                let end_s = take_first_film_s + samples as f64 / f64::from(RECORD_RATE);
+                plan.capture_stop_film_s.max(end_s + rec.tail_s)
+            });
         self.phase = Phase::Playing(Playback {
             film_from_s: plan.film_from_s,
             hold_s: plan.hold_first_frame_s,
-            stop_film_s: plan.capture_stop_film_s,
-            take_first_film_s: line.start + take.line_offset_s,
+            stop_film_s,
+            take_first_film_s,
             film_gain_db: rec.film_gain_db,
             opened_host_s: media.host_now_s(),
             started: None,
@@ -1016,10 +1100,14 @@ impl Recorder {
         Ok(())
     }
 
-    /// Plays the passage a take was cut from, whole and in context: the
-    /// passage file locked to the film from its own first sample (holding
-    /// the film's first frame when that lies before the film), to the
-    /// passage's end. Starts once the file has loaded.
+    /// Plays the passage a take was cut from in context, from that take's
+    /// line to the passage's end: the passage file locked to the film. From
+    /// the passage's first piece, the film starts at the passage's first
+    /// sample (holding the film's first frame when that lies before the
+    /// film); from a later piece, it starts one pre-roll before that
+    /// piece's line as recorded (or before the piece, when it begins
+    /// earlier), and the passage plays from the sample the film starts at.
+    /// Starts once the file has loaded.
     pub fn start_passage_playback(
         &mut self,
         media: &mut dyn Media,
@@ -1041,12 +1129,27 @@ impl Recorder {
         if !path.is_file() {
             return Err(format!("The passage's file {file} is missing."));
         }
+        let rate = f64::from(passage.input.sample_rate.max(1));
+        let line = passage
+            .input
+            .lines
+            .get(piece.index as usize)
+            .filter(|_| !piece.is_first());
+        let (film_from_s, hold_s) = match line {
+            None => (first_film_s.max(0.0), (-first_film_s).max(0.0)),
+            Some(line) => {
+                let piece_film_s = first_film_s + piece.from_sample as f64 / rate;
+                let from = line.snapshot.start.min(piece_film_s);
+                let plan = plan_take(from, from, project.config.record.preroll_s, 0.0);
+                (plan.film_from_s, plan.hold_first_frame_s)
+            }
+        };
         self.end_warmup(media);
         media.open_take(&path)?;
-        let length_s = samples as f64 / f64::from(passage.input.sample_rate.max(1));
+        let length_s = samples as f64 / rate;
         self.phase = Phase::Playing(Playback {
-            film_from_s: first_film_s.max(0.0),
-            hold_s: (-first_film_s).max(0.0),
+            film_from_s,
+            hold_s,
             stop_film_s: first_film_s + length_s,
             take_first_film_s: first_film_s,
             film_gain_db: project.config.record.film_gain_db,
@@ -1126,8 +1229,9 @@ impl Recorder {
                         ..Update::default()
                     };
                 }
+                let ran_to_end = failure.is_none();
                 let why = failure.map(|failure| format!("Recording stopped: {failure}"));
-                self.stop_take(media, dir, why)
+                self.stop_take(media, dir, why, ran_to_end)
             }
             Phase::Playing(playback) => match playback.started {
                 Some(tb) if tb.film_at(now) >= playback.stop_film_s => {

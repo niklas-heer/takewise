@@ -5,7 +5,9 @@
 //! so and C opens it; it never opens during a take. Its captures are clips
 //! of the meter's capture, never takes. The latency step runs the loopback
 //! calibration in the window (see `latency.rs`) when the project has none
-//! for the devices in use.
+//! for the devices in use. L opens the latency step alone, to measure again
+//! at any time (a Bluetooth output whose delay changed after reconnecting),
+//! and closes once a measurement is stored.
 
 use gpui_kit::{
     AnyElement, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -48,6 +50,8 @@ pub struct Setup {
     pub error: Option<String>,
     /// The latency step's outcome: what was stored, or why nothing was.
     pub latency: Option<Result<String, String>>,
+    /// Opened with L: only the latency step, closed once it stored one.
+    pub latency_only: bool,
 }
 
 impl Setup {
@@ -60,6 +64,7 @@ impl Setup {
             save_error: None,
             error: None,
             latency: None,
+            latency_only: false,
         }
     }
 }
@@ -96,6 +101,29 @@ impl RecordingWindow {
         }
         self.recorder.stop_playback(&mut *self.media);
         self.setup = Some(Setup::new());
+    }
+
+    /// L: opens the setup check at its latency step alone, to measure the
+    /// latency again whatever is stored; whenever the film has an output to
+    /// play the beeps through. Refused during a take.
+    pub(super) fn measure_latency(&mut self) {
+        if self.recorder.is_recording() {
+            self.message = Some("Finish the take first, then press L.".to_owned());
+            return;
+        }
+        if self.current_route().output.is_none() {
+            self.message = Some(
+                "No output to play the beeps through: connect your headphones, then press L."
+                    .to_owned(),
+            );
+            return;
+        }
+        self.recorder.stop_playback(&mut *self.media);
+        self.setup = Some(Setup {
+            step: Step::Latency,
+            latency_only: true,
+            ..Setup::new()
+        });
     }
 
     pub(super) fn close_setup(&mut self) {
@@ -171,6 +199,7 @@ impl RecordingWindow {
             Step::Room => {
                 setup.error = Some("Record the room first: press Space and stay quiet.".into());
             }
+            Step::Latency if setup.latency_only => self.close_setup(),
             Step::Latency => self.finish_setup(),
         }
     }
@@ -185,7 +214,7 @@ impl RecordingWindow {
         self.message = Some(match (calibrated, needed) {
             (true, _) => "Setup check saved; the latency is calibrated.".to_owned(),
             (false, Some(_)) => {
-                "Setup check saved; the latency is not calibrated for these devices yet (C to run it)."
+                "Setup check saved; the latency is not calibrated for these devices yet (L to measure it)."
                     .to_owned()
             }
             (false, None) => "Setup check saved.".to_owned(),
@@ -302,7 +331,7 @@ impl RecordingWindow {
         let output = self.output_in_use()?;
         match (output.transport, output.output_source) {
             (Transport::Bluetooth, _) => Some(
-                "Bluetooth headphones delay the film's sound and are not supported for recording; use wired headphones.",
+                "Bluetooth headphones add delay that can change after reconnecting; Takewise corrects it with the latency measurement (L). Wired headphones are more reliable.",
             ),
             (_, OutputSource::Speakers) => {
                 Some("Film sound from speakers will leak into your takes; use wired headphones.")
@@ -404,6 +433,7 @@ impl RecordingWindow {
                 "Space listen · Enter next · A audio panel · Esc close",
             ),
             Step::Room => ("3 · Room", "Space listen · Enter next · Esc close"),
+            Step::Latency if setup.latency_only => ("Latency", "Space measure · Esc close"),
             Step::Latency => ("4 · Latency", "Space calibrate · Enter done · Esc close"),
         };
         Some(

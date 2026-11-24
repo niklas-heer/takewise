@@ -4,6 +4,7 @@
 //! host 100.4, so its first sample (host 100.0) lies at film 0.6.
 
 use super::*;
+use crate::window::prompter::Passed;
 
 /// Three sentences close together (one passage), a pause for the picture,
 /// then two more.
@@ -229,14 +230,27 @@ fn shift_space_records_a_passage_as_one_file_and_a_take_per_line(cx: &mut TestAp
         "{shown}"
     );
     f.view.read_with(cx, |view, _| {
-        assert_eq!(view.line, 2, "the line read last stays current");
+        assert_eq!(
+            view.line, 0,
+            "a passage read to its end goes back to its first line"
+        );
         assert_eq!(view.take, Some(1), "its new take is selected");
         let take = &view.line_state().expect("line").takes[0];
         assert_eq!(
             super::super::takes::passage_mark(take).as_deref(),
-            Some("passage 3/3")
+            Some("passage 1/3")
         );
     });
+    // So Shift+Space reads the whole passage again.
+    f.media.set_now(200.0);
+    press(cx, f.window, &["shift-space"]);
+    let reading = f.view.read_with(cx, |view, _| {
+        view.recorder
+            .passage_reading()
+            .map(|(index, id)| (index, id.to_owned()))
+    });
+    assert_eq!(reading, Some((0, "a".to_owned())));
+    press(cx, f.window, &["space"]);
 }
 
 /// A passage whose first line is long enough to scroll.
@@ -321,6 +335,69 @@ fn the_prompter_follows_the_passage_and_starts_each_line_at_the_top(cx: &mut Tes
     press(cx, f.window, &["space"]);
     assert!(!recording(cx, &f));
     cut(cx, &f);
+}
+
+#[gpui_kit::test]
+fn the_prompter_keeps_the_line_just_read_in_view_for_a_moment(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    read_from_a(cx, &f, "shift-space", 0.7);
+    // The prompter's text, the line kept above it, and how far the pace
+    // guide filled the text.
+    let shown = |cx: &mut TestAppContext, film_s: f64| {
+        at_film(cx, &f, film_s);
+        f.view.read_with(cx, |view, _| {
+            let reading = view.prompter_line().expect("a line");
+            (
+                reading.text.to_owned(),
+                match view.prompter_passed() {
+                    Passed::Off => None,
+                    Passed::Empty => Some(String::new()),
+                    Passed::Line(text) => Some(text.to_owned()),
+                },
+                super::super::prompter::filled_bytes(reading, film_s),
+            )
+        })
+    };
+    let first = Some("First sentence.".to_owned());
+    let empty = Some(String::new());
+    // While a is read, its row above is kept, empty.
+    let (text, passed, _) = shown(cx, 4.0);
+    assert_eq!((text.as_str(), passed), ("First sentence.", empty.clone()));
+    // At b's cue b is current, its pace guide filling from the cue, and a
+    // stays above it, for 1.5 s of film.
+    let (text, passed, filled) = shown(cx, 5.41);
+    assert_eq!(
+        (text.as_str(), passed.clone(), filled),
+        ("Second sentence.", first.clone(), 0)
+    );
+    let (text, passed, filled) = shown(cx, 6.85);
+    assert_eq!((text.as_str(), passed), ("Second sentence.", first));
+    assert!(filled > 0, "{filled}");
+    let (_, passed, _) = shown(cx, 6.95);
+    assert_eq!(passed, empty, "the row stays, empty");
+    // c follows b the same way.
+    let (text, passed, _) = shown(cx, 7.85);
+    assert_eq!(
+        (text.as_str(), passed),
+        ("Third sentence.", Some("Second sentence.".to_owned()))
+    );
+    press(cx, f.window, &["space"]);
+    cut(cx, &f);
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.prompter_passed() == Passed::Off)
+    );
+
+    // A take of one line has no such row.
+    press(cx, f.window, &["down"]); // d
+    begin(cx, &f, 300.0);
+    assert!(recording(cx, &f));
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.prompter_passed() == Passed::Off)
+    );
+    f.media.set_now(300.5);
+    press(cx, f.window, &["space"]);
 }
 
 #[gpui_kit::test]
@@ -457,6 +534,39 @@ fn shift_p_plays_the_whole_passage_locked_to_the_film(cx: &mut TestAppContext) {
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
     press(cx, f.window, &["shift-p"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+
+    // From b's take, the film starts one pre-roll before b's piece, which
+    // begins in the pause before b's start, and the passage file plays
+    // from the sample the film starts at; both at host 300.3, to the
+    // passage's end (film 11.3).
+    let b_first = 5.4 + recorded(&f.dir)[1].2.line_offset_s;
+    assert!(b_first < 5.4, "{b_first}");
+    let from = b_first - 2.0;
+    press(cx, f.window, &["down"]);
+    f.media.set_now(300.0);
+    press(cx, f.window, &["shift-p"]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().opened_takes.last(), Some(&wav));
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, from) && close(host_s, 300.3),
+        "{film_s} {host_s}"
+    );
+    let (from_s, at_host_s) = *f.media.0.borrow().take_plays.last().expect("a play");
+    assert!(
+        close(from_s, from - FIRST_FILM_S) && close(at_host_s, 300.3),
+        "{from_s} {at_host_s}"
+    );
+    let end_host = 300.3 + 11.3 - from;
+    for (now, playing) in [(end_host - 0.1, true), (end_host + 0.1, false)] {
+        f.media.set_now(now);
+        frame(cx, f.window);
+        assert_eq!(
+            f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+            playing,
+            "at host {now}"
+        );
+    }
 }
 
 #[gpui_kit::test]
@@ -467,7 +577,7 @@ fn p_plays_a_later_piece_from_its_own_start(cx: &mut TestAppContext) {
     // b's take begins at the cut before it, after the film's start point
     // (b's pre-roll from film 3.4): it starts later, from its beginning.
     let b_first = 5.4 + takes[1].2.line_offset_s;
-    press(cx, f.window, &["up"]); // b
+    press(cx, f.window, &["down"]); // b
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     let (film_s, host_s) = last_play(&f);
@@ -495,11 +605,67 @@ fn p_plays_a_later_piece_from_its_own_start(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn p_plays_a_piece_through_its_end_past_its_slot(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // b (start 1.0) ends its slot where c starts (1.5), so play in context
+    // of a take of one line stops at film 3.0, the tail after it. This
+    // piece begins after that, at film 3.5, and lasts 1 s.
+    let snapshot = Project::open(&f.dir)
+        .expect("project")
+        .snapshot("b")
+        .expect("snapshot");
+    let input = RecordedInput {
+        sample_rate: 48_000,
+        device: DEVICE.to_owned(),
+        channel: 1,
+        line_offset_s: 2.5,
+        snapshot,
+        dropouts: None,
+        film_shift_ms: None,
+        passage: Some(tw::PassagePiece {
+            id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            index: 1,
+            count: 2,
+            from_sample: 48_000,
+            to_sample: 96_000,
+            preroll_floor_dbfs: -70.0,
+        }),
+    };
+    let partial = tw::begin_take(&f.dir, "b", &input).expect("begin");
+    tw::write_take_wav(&partial.wav, &vec![0; 48_000], 48_000).expect("wav");
+    tw::commit_take(&f.dir, partial).expect("commit");
+    f.view.update(cx, |view, _| view.reload());
+
+    press(cx, f.window, &["down"]); // b
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    // The film plays from 0.0 at host 201.3 (after holding its first frame
+    // through b's short pre-roll); the piece starts at film 3.5.
+    let (from_s, at_host_s) = f.media.0.borrow().take_plays[0];
+    assert!(
+        close(from_s, 0.0) && close(at_host_s, 204.8),
+        "{from_s} {at_host_s}"
+    );
+    // It plays through the piece's end (film 4.5) and the tail: to film
+    // 6.0, host 207.3.
+    for (now, playing) in [(204.5, true), (207.2, true), (207.4, false)] {
+        f.media.set_now(now);
+        frame(cx, f.window);
+        assert_eq!(
+            f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+            playing,
+            "at host {now}"
+        );
+    }
+}
+
+#[gpui_kit::test]
 fn shift_enter_chooses_the_passage_for_every_line(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     record_passage(cx, &f);
     // Line b is read once more on its own: its take 2.
-    press(cx, f.window, &["up"]);
+    press(cx, f.window, &["down"]);
     begin(cx, &f, 300.0);
     f.media.set_now(300.5);
     press(cx, f.window, &["space"]);
@@ -602,6 +768,32 @@ fn a_passage_that_cannot_be_begun_on_disk_is_written_when_it_stops(cx: &mut Test
     let wavs = passage_files(&f.dir, ".wav");
     let (samples, _) = tw::read_take_wav(&wavs[0]).expect("the passage");
     assert_eq!(samples.len(), 69 * 4800, "written from memory");
+}
+
+#[gpui_kit::test]
+fn the_window_stays_open_while_a_passage_is_only_in_memory(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    // A file where the passages' directory belongs: the passage can be
+    // neither begun nor published.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/.passages"), b"").expect("blocker");
+    read_from_a(cx, &f, "shift-space", 7.5);
+    f.media.set_now(host(7.5));
+    press(cx, f.window, &["space"]);
+    assert!(!recording(cx, &f));
+
+    assert!(!VisualTestContext::from_window(f.window, cx).simulate_close());
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.starts_with("Not closing: 1 passage is only in memory"),
+        "{shown}"
+    );
+
+    fs::remove_file(f.dir.join("takes/.passages")).expect("unblock");
+    f.media.set_now(host(20.0));
+    cut(cx, &f);
+    assert_eq!(recorded_takes(&f.dir), takes_of(&["a", "b"]));
+    assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
 }
 
 #[gpui_kit::test]

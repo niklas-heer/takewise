@@ -2,7 +2,7 @@
 //!
 //! Shift+Space records from the current line through the end of its
 //! passage in one go; the prompter and the current line follow the line
-//! being read. Shift+P plays the selected take's passage whole, and
+//! being read. Shift+P plays the selected take's passage from its line, and
 //! Shift+Enter chooses that passage for every line it has a take of. The
 //! recording itself is the recorder's; the passage on disk is
 //! `takewise_core::passage`'s.
@@ -35,8 +35,9 @@ impl RecordingWindow {
     /// During a passage take, when the line being read moved on: the
     /// prompter starts the new line at the top, and the current line
     /// follows it (so the line list shows it, and the film rests there
-    /// after the take). The line a take stopped on is followed too, when
-    /// it moved on in the frame that stopped it.
+    /// after the take). When the take stops, the current line goes to the
+    /// line it rests on: the one being read when the narrator stopped it,
+    /// or the line it started on when it ran to its end.
     pub(super) fn follow_reading(&mut self) {
         let reading = self
             .recorder
@@ -96,8 +97,9 @@ impl RecordingWindow {
         })
     }
 
-    /// Shift+P: plays the selected take's passage whole, locked to the
-    /// film; stops a playback that runs.
+    /// Shift+P: plays the selected take's passage, locked to the film,
+    /// from the selected take's line (a pre-roll before it) to the
+    /// passage's end; stops a playback that runs.
     pub(super) fn play_passage(&mut self, _: &PlayPassage, _: &mut Window, cx: &mut Context<Self>) {
         cx.notify();
         if self.recorder.is_recording() {
