@@ -1,18 +1,28 @@
-//! The recording session: takes, play in context, the input meter and the
-//! timing that places captured samples on the film. Free of GPUI; the window
-//! calls it from key actions and once per rendered frame.
+//! The recording session: takes of a line and of a passage, play in
+//! context, the input meter and the timing that places captured samples on
+//! the film. Free of GPUI; the window calls it from key actions and once per
+//! rendered frame.
+//!
+//! A passage take (several lines in one go) runs like a line take: one
+//! capture, one film playback, the same writer and lock. It streams into the
+//! passage's partial files, and when it stops the passage is published in
+//! the frame (the commit point) and cut into one take per line on a worker
+//! thread, which holds the audio's lock until the takes are there.
 
 use std::mem;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use takewise_core::passage::{self, Latency};
 use takewise_core::takes::FULL_SCALE;
 use takewise_core::timing::film_shift_s;
 use takewise_core::{
-    Dropout, PartialTake, Project, ProjectConfig, RECORD_RATE, RecordPlan, RecordedInput, Route,
-    Snapshot, TakeRef, TakeState, Timebase, WavLock, begin_take, commit_take,
-    finish_interrupted_commit, line_offset_s, plan_take, sample_film_time, update_take_meta,
-    write_take_wav,
+    Dropout, PartialPassage, PartialTake, PassageInput, PassageLine, PassagePiece, Project,
+    ProjectConfig, RECORD_RATE, RecordPlan, RecordedInput, Route, Snapshot, TakeRef, TakeState,
+    Timebase, UnsavedPassage, WavLock, begin_passage, begin_take, commit_take,
+    finish_interrupted_commit, line_offset_s, passage_file, plan_take, read_passage,
+    sample_film_time, save_passage, update_passage_meta, update_take_meta, write_take_wav,
 };
 use takewise_media::CaptureBuffer;
 
@@ -43,6 +53,9 @@ const END_TOLERANCE_S: f64 = 0.25;
 const FILM_START_TIMEOUT_S: f64 = 1.0;
 /// A film shift larger than this after the take started is recorded.
 const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
+/// A passage's sidecar is rewritten when its first sample's film time moved
+/// by more than this (the film started late, so the take follows it).
+const SIDECAR_TOLERANCE_S: f64 = 0.0005;
 
 /// The latency offset in ms that places takes on `route`: the calibrated
 /// `latency_offset_ms` when `[calibration]` names exactly this input, this
@@ -69,6 +82,19 @@ pub struct Update {
     /// The committed take's highest peak in dBFS, for the "clipped" mark
     /// until its check says.
     pub peak_dbfs: Option<f64>,
+    /// The takes a passage was cut into, once they are all there.
+    pub passage: Option<PassageTakes>,
+}
+
+/// The takes of a passage recorded in one go.
+#[derive(Debug)]
+pub struct PassageTakes {
+    /// The take of each line that got one, in script order, with its
+    /// highest peak in dBFS.
+    pub takes: Vec<(TakeRef, Option<f64>)>,
+    /// The passage's lines without a take: the recording stopped before
+    /// they were read.
+    pub unread: Vec<String>,
 }
 
 pub struct Recorder {
@@ -96,6 +122,60 @@ pub struct Recorder {
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
     unsaved_retry_at: f64,
+    /// Which line the last passage take was reading when it stopped (from
+    /// 0, and its id), until the next take starts.
+    read_last: Option<(usize, String)>,
+    /// Passages that could not be published yet; kept in memory and retried.
+    unsaved_passages: Vec<Stopped>,
+    /// Published passages whose takes are being cut, or wait to be cut
+    /// again.
+    uncut: Vec<Uncut>,
+}
+
+/// A stopped passage that is not published yet.
+struct Stopped {
+    unsaved: UnsavedPassage,
+    /// What to say with its takes: why it stopped, dropouts, a film that
+    /// stalled.
+    notes: Option<String>,
+}
+
+impl Stopped {
+    /// The passage once it is published as `id`: its audio stays locked,
+    /// and in memory for the peaks of its takes, until they are cut.
+    fn published(self, id: String) -> Uncut {
+        Uncut {
+            id,
+            samples: Arc::new(self.unsaved.samples),
+            _lock: self.unsaved.lock,
+            notes: self.notes,
+            worker: None,
+            failed: false,
+        }
+    }
+}
+
+/// A published passage whose takes are not all cut yet.
+struct Uncut {
+    id: String,
+    /// The passage's audio, for the peaks of its takes.
+    samples: Arc<Vec<i32>>,
+    /// The audio's lock, held from the recording until the takes are cut.
+    _lock: Option<WavLock>,
+    /// What to say with its takes.
+    notes: Option<String>,
+    /// The worker cutting it, while one runs.
+    worker: Option<Receiver<Result<Cut, String>>>,
+    /// Whether a failed cut was already shown.
+    failed: bool,
+}
+
+/// What a worker cut a passage into.
+struct Cut {
+    takes: Vec<(TakeRef, Option<f64>)>,
+    unread: Vec<String>,
+    /// Another process is writing some of the takes: look again.
+    pending: bool,
 }
 
 /// A stopped take that is not on disk yet.
@@ -156,6 +236,56 @@ struct Take {
     tail_s: f64,
     /// Host time at which the film reached its end, once it did.
     film_ended_host_s: Option<f64>,
+    /// The passage, when the take records one: several lines in one go.
+    passage: Option<PassageTake>,
+}
+
+/// What a passage take has beyond a line take: its lines, the one being
+/// read and its files. The take's own `line`, `snapshot`, `note` and `next`
+/// are those of its first line.
+struct PassageTake {
+    /// What the passage's sidecar says: the device, the latency and the
+    /// lines from the one the take started on to the passage's end, as they
+    /// were when it started. Where it lies on the film is filled in once
+    /// its first sample is placed.
+    input: PassageInput,
+    /// Each line's note.
+    notes: Vec<Option<String>>,
+    /// The line being read: the last one whose start the film reached.
+    reading: usize,
+    /// The text of the line after the passage, shown as next under its
+    /// last line.
+    after: Option<String>,
+    /// The passage on disk: begun once the first buffer places it.
+    partial: Option<PartialPassage>,
+    /// The first sample's film time as the sidecar on disk has it.
+    sidecar_first_film_s: Option<f64>,
+}
+
+impl PassageTake {
+    /// The line being read.
+    fn line(&self) -> Option<&PassageLine> {
+        self.input.lines.get(self.reading)
+    }
+
+    /// Moves on to each line whose start the film reached.
+    fn follow(&mut self, film_s: f64) {
+        while self
+            .input
+            .lines
+            .get(self.reading + 1)
+            .is_some_and(|next| film_s >= next.snapshot.start)
+        {
+            self.reading += 1;
+        }
+    }
+}
+
+impl Take {
+    /// The line being read, during a passage take.
+    fn cue(&self) -> Option<&PassageLine> {
+        self.passage.as_ref()?.line()
+    }
 }
 
 struct Playback {
@@ -186,6 +316,9 @@ impl Recorder {
             tap_broken: false,
             unsaved: Vec::new(),
             unsaved_retry_at: 0.0,
+            read_last: None,
+            unsaved_passages: Vec::new(),
+            uncut: Vec::new(),
         }
     }
 
@@ -206,9 +339,10 @@ impl Recorder {
         }
     }
 
-    /// Whether stopped takes still wait to be saved.
+    /// Whether stopped takes still wait to be saved, or passages to be
+    /// saved or cut into their takes.
     pub fn has_unsaved(&self) -> bool {
-        !self.unsaved.is_empty()
+        !self.unsaved.is_empty() || !self.unsaved_passages.is_empty() || !self.uncut.is_empty()
     }
 
     pub fn is_recording(&self) -> bool {
@@ -219,29 +353,63 @@ impl Recorder {
         matches!(self.phase, Phase::Playing(_))
     }
 
-    /// The line being recorded.
+    /// The line being recorded: during a passage take, the one being read.
     pub fn recording_line(&self) -> Option<&str> {
         match &self.phase {
-            Phase::Recording(take) => Some(&take.line),
+            Phase::Recording(take) => Some(take.cue().map_or(&take.line, |cue| &cue.id)),
             _ => None,
         }
     }
 
-    /// The line as the take being recorded started with it.
+    /// The line as the take being recorded started with it: during a
+    /// passage take, the one being read.
     pub fn recording_snapshot(&self) -> Option<&Snapshot> {
         match &self.phase {
-            Phase::Recording(take) => Some(&take.snapshot),
+            Phase::Recording(take) => Some(take.cue().map_or(&take.snapshot, |cue| &cue.snapshot)),
             _ => None,
         }
     }
 
     /// The line's note and the next line's text as the take being recorded
-    /// started with them.
+    /// started with them: during a passage take, those of the line being
+    /// read.
     pub fn recording_cues(&self) -> Option<(Option<&str>, Option<&str>)> {
-        match &self.phase {
-            Phase::Recording(take) => Some((take.note.as_deref(), take.next.as_deref())),
-            _ => None,
-        }
+        let Phase::Recording(take) = &self.phase else {
+            return None;
+        };
+        let Some(passage) = &take.passage else {
+            return Some((take.note.as_deref(), take.next.as_deref()));
+        };
+        let note = passage
+            .notes
+            .get(passage.reading)
+            .and_then(Option::as_deref);
+        let next = passage
+            .input
+            .lines
+            .get(passage.reading + 1)
+            .map(|line| line.snapshot.text.as_str())
+            .or(passage.after.as_deref());
+        Some((note, next))
+    }
+
+    /// Whether a passage take is being recorded.
+    pub fn is_recording_passage(&self) -> bool {
+        matches!(&self.phase, Phase::Recording(take) if take.passage.is_some())
+    }
+
+    /// Which line of a passage take is being read (from 0), and that
+    /// line's id; after the take, the line it stopped on, until the next
+    /// take starts.
+    pub fn passage_reading(&self) -> Option<(usize, &str)> {
+        let Phase::Recording(take) = &self.phase else {
+            return self
+                .read_last
+                .as_ref()
+                .map(|(index, id)| (*index, id.as_str()));
+        };
+        let passage = take.passage.as_ref()?;
+        Some((passage.reading, &passage.line()?.id))
     }
 
     /// The input level in dBFS, while buffers arrive.
@@ -395,12 +563,18 @@ impl Recorder {
     /// (holding its first frame when the line starts within the pre-roll),
     /// with the count-in. The latency offset applies only when `route`, the
     /// route in use, is the one `[calibration]` measured.
+    ///
+    /// With `whole_passage` the take runs from line `idx` through the end
+    /// of its passage in one go: one capture and one film playback, the
+    /// pre-roll and count-in only before the first line, the lines as they
+    /// are now. With one line left in the passage it is a take of that line.
     pub fn start_take(
         &mut self,
         media: &mut dyn Media,
         project: &Project,
         idx: usize,
         route: &Route,
+        whole_passage: bool,
     ) -> Result<(), String> {
         if !matches!(self.phase, Phase::Idle) {
             return Err("A take or playback is already running.".to_owned());
@@ -422,11 +596,52 @@ impl Recorder {
             .snapshot(&line.id)
             .ok_or("The line is no longer in the script.")?;
         let latency_s = media.input_latency_s(&device)?;
+        let offset_ms = f64::from(effective_latency_offset(&project.config, route));
+        let rec = &project.config.record;
+        let lines = &project.script.lines;
+        // With one line left in the passage, it is a take of that line.
+        let passage = project
+            .passage_of(idx)
+            .filter(|passage| whole_passage && passage.end > idx + 1)
+            .map(|passage| PassageTake {
+                input: PassageInput {
+                    sample_rate: RECORD_RATE,
+                    device: device.clone(),
+                    channel: input.channel,
+                    latency: Latency {
+                        input_s: latency_s,
+                        offset_ms,
+                    },
+                    preroll_s: rec.preroll_s,
+                    lines: (idx..passage.end)
+                        .filter_map(|at| {
+                            let id = &lines.get(at)?.id;
+                            Some(PassageLine {
+                                id: id.clone(),
+                                snapshot: project.snapshot(id)?,
+                            })
+                        })
+                        .collect(),
+                    first_sample_film_s: None,
+                    dropouts: None,
+                    film_shift_ms: None,
+                },
+                notes: (idx..passage.end)
+                    .map(|at| lines.get(at).and_then(|line| line.note.clone()))
+                    .collect(),
+                reading: 0,
+                after: lines.get(passage.end).map(|line| line.text.clone()),
+                partial: None,
+                sidecar_first_film_s: None,
+            });
+        let slot_end = passage
+            .as_ref()
+            .and_then(|passage| passage.input.lines.last())
+            .map_or(snapshot.end, |last| last.snapshot.end);
         self.end_warmup(media);
         self.stop_meter(media);
 
-        let rec = &project.config.record;
-        let plan = plan_take(line.start, snapshot.end, rec.preroll_s, rec.tail_s);
+        let plan = plan_take(line.start, slot_end, rec.preroll_s, rec.tail_s);
         let (tx, rx) = mpsc::channel();
         if let Err(err) = media.start_capture(&device, input.channel, tx) {
             media.film_seek(self.park_s);
@@ -435,20 +650,17 @@ impl Recorder {
         media.film_set_muted(false);
         media.film_set_gain_db(rec.film_gain_db);
         self.level = None;
+        self.read_last = None;
         self.phase = Phase::Recording(Box::new(Take {
             line: line.id.clone(),
             line_start: line.start,
             snapshot,
             note: line.note.clone(),
-            next: project
-                .script
-                .lines
-                .get(idx + 1)
-                .map(|next| next.text.clone()),
+            next: lines.get(idx + 1).map(|next| next.text.clone()),
             device,
             channel: input.channel,
             latency_s,
-            offset_ms: f64::from(effective_latency_offset(&project.config, route)),
+            offset_ms,
             plan,
             capture_started_host_s: media.host_now_s(),
             clock: FilmClock::new(),
@@ -460,6 +672,7 @@ impl Recorder {
             film_end_s: project.film_duration(),
             tail_s: rec.tail_s,
             film_ended_host_s: None,
+            passage,
         }));
         Ok(())
     }
@@ -469,115 +682,98 @@ impl Recorder {
     /// or was stopped before it was, is placed where the film would have
     /// played, and flagged. When the take cannot be saved, it is kept in
     /// memory and saving is retried; the error says so.
+    ///
+    /// A passage take is published here (the commit point) and then cut
+    /// into its takes on a worker thread: they are reported by a later
+    /// [`Recorder::tick`].
     pub fn finish_take(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
+        self.stop_take(media, dir, None)
+    }
+
+    /// [`Recorder::finish_take`], with `why` the take stopped when it was
+    /// not the narrator who stopped it.
+    fn stop_take(&mut self, media: &mut dyn Media, dir: &Path, why: Option<String>) -> Update {
         let Phase::Recording(take) = mem::replace(&mut self.phase, Phase::Idle) else {
             return Update::default();
         };
         media.stop_capture();
-        let Take {
-            line,
-            line_start,
-            snapshot,
-            device,
-            channel,
-            latency_s,
-            offset_ms,
-            plan,
-            capture_started_host_s,
-            mut clock,
-            writer,
-            partial,
-            film_ended_host_s,
-            ..
-        } = *take;
-        let written = writer.finish();
+        let mut take = *take;
+        self.read_last = take.passage.as_ref().and_then(|passage| {
+            let line = passage.line()?;
+            Some((passage.reading, line.id.clone()))
+        });
+        let written = take.writer.finish();
         // Stopped after audio arrived but before a frame scheduled the film:
         // the audio is placed by the mapping the film would have had, had it
         // been scheduled when the first buffer arrived.
-        let estimated = !written.samples.is_empty() && !clock.placed();
+        let estimated = !written.samples.is_empty() && !take.clock.placed();
         if estimated {
-            let first = written.first_host_s.unwrap_or(capture_started_host_s);
-            clock.assume(first, plan.film_from_s, plan.hold_first_frame_s);
+            let first = written.first_host_s.unwrap_or(take.capture_started_host_s);
+            let plan = take.plan;
+            take.clock
+                .assume(first, plan.film_from_s, plan.hold_first_frame_s);
         }
-        let unplayed_s = clock.unplayed_lateness_s(media, media.host_now_s());
+        let unplayed_s = take.clock.unplayed_lateness_s(media, media.host_now_s());
         media.film_pause();
         media.film_seek(self.park_s);
         self.level = None;
         if written.samples.is_empty() {
-            return Update::default();
+            return Update {
+                message: why,
+                ..Update::default()
+            };
         }
-        // Placed with the film's timebase as read back (a late start moves
-        // the take), by the same mapping the calibration measures.
-        let first_film_s = written.first_host_s.and_then(|host| {
-            sample_film_time(clock.history(), host, 0, RECORD_RATE, latency_s, offset_ms)
-        });
-        // Measured strictly before the film's end, so the player halting
-        // there is no shift.
-        let film_shift_ms = written.first_host_s.and_then(|host| {
-            let from = host - latency_s;
-            let to = (from + written.samples.len() as f64 / f64::from(RECORD_RATE))
-                .min(film_ended_host_s.unwrap_or(f64::INFINITY));
-            // A film that never played leaves the take on its schedule,
-            // off by how late the film was when the take stopped.
-            let ms = unplayed_s.unwrap_or_else(|| film_shift_s(clock.history(), from, to)) * 1000.0;
-            (ms > FILM_SHIFT_TOLERANCE_MS).then_some(ms)
-        });
-        let dropouts = dropout_note(&written.dropouts, first_film_s);
+        let mut placement = place(&take, &written, estimated, unplayed_s);
+        if let Some(passage) = take.passage.take() {
+            placement.notes = join(why, placement.notes);
+            return self.publish_passage(dir, passage, written, placement);
+        }
+        let mut update = self.commit_line(dir, take, written, placement);
+        update.message = join(why, update.message);
+        update
+    }
+
+    /// Commits a stopped take of one line, or keeps it to retry.
+    fn commit_line(
+        &mut self,
+        dir: &Path,
+        take: Take,
+        written: Written,
+        placement: Placement,
+    ) -> Update {
         let take_peak = peak_dbfs(&written.samples);
-        let shift_note = if estimated {
-            Some("Stopped before the film started; placement estimated.".to_owned())
-        } else {
-            film_shift_ms.map(|ms| {
-                if unplayed_s.is_some() {
-                format!(
-                    "The film did not play during the take; its placement may be off by {ms:.0} ms."
-                )
-                } else {
-                    format!(
-                        "The film stalled during the take; placement may be off by {ms:.0} ms."
-                    )
-                }
-            })
-        };
         // The take keeps its film position: placed against the line's slot
         // as it is now, which M or an agent may have moved during the take.
         // The text stays the one read during the take, so an edit made
         // meanwhile shows the take as recorded against old text.
-        let snapshot = match Project::open(dir).ok().and_then(|p| p.snapshot(&line)) {
+        let snapshot = match Project::open(dir).ok().and_then(|p| p.snapshot(&take.line)) {
             Some(now) => Snapshot {
-                text: snapshot.text,
+                text: take.snapshot.text,
                 ..now
             },
-            None => snapshot,
+            None => take.snapshot,
         };
-        let first_film_s = first_film_s.unwrap_or(line_start);
         #[allow(clippy::cast_possible_truncation)]
         let input = RecordedInput {
             sample_rate: RECORD_RATE,
-            device,
-            channel,
-            line_offset_s: line_offset_s(first_film_s, snapshot.start),
+            device: take.device,
+            channel: take.channel,
+            line_offset_s: line_offset_s(placement.first_film_s, snapshot.start),
             snapshot,
             dropouts: Some(written.dropouts.len().min(u32::MAX as usize) as u32),
-            film_shift_ms,
+            film_shift_ms: placement.film_shift_ms,
             passage: None,
         };
-        let Written {
-            samples,
-            complete,
-            lock,
-            ..
-        } = written;
         let unsaved = Unsaved {
-            line,
+            line: take.line,
             input,
-            samples,
-            partial,
-            lock,
-            complete,
+            samples: written.samples,
+            partial: take.partial,
+            lock: written.lock,
+            complete: written.complete,
         };
         let mut update = self.save(dir, unsaved);
-        update.message = join(join(update.message, dropouts), shift_note);
+        update.message = join(update.message, placement.notes);
         update.peak_dbfs = update.committed.as_ref().map(|_| take_peak);
         update
     }
@@ -588,7 +784,7 @@ impl Recorder {
             Ok(saved) => Update {
                 committed: Some(saved.take),
                 message: saved.note,
-                peak_dbfs: None,
+                ..Update::default()
             },
             Err(err) => {
                 let message = format!(
@@ -597,28 +793,164 @@ impl Recorder {
                 );
                 self.unsaved.push(unsaved);
                 Update {
-                    committed: None,
                     message: Some(message),
-                    peak_dbfs: None,
+                    ..Update::default()
                 }
             }
         }
     }
 
-    /// Tries once more to save the takes that could not be saved (when the
-    /// window closes).
+    /// Publishes a stopped passage take, the commit point, and has its
+    /// takes cut on a worker thread; one that cannot be published is kept
+    /// in memory and retried.
+    fn publish_passage(
+        &mut self,
+        dir: &Path,
+        passage: PassageTake,
+        written: Written,
+        placement: Placement,
+    ) -> Update {
+        let stopped = Stopped {
+            unsaved: UnsavedPassage {
+                input: PassageInput {
+                    first_sample_film_s: Some(placement.first_film_s),
+                    dropouts: Some(written.dropouts),
+                    film_shift_ms: placement.film_shift_ms,
+                    ..passage.input
+                },
+                samples: written.samples,
+                partial: passage.partial,
+                lock: written.lock,
+                complete: written.complete,
+            },
+            notes: placement.notes,
+        };
+        self.publish(dir, stopped)
+    }
+
+    /// Publishes a stopped passage and starts cutting it, or keeps it to
+    /// retry.
+    fn publish(&mut self, dir: &Path, mut stopped: Stopped) -> Update {
+        let message = match publish(dir, &mut stopped.unsaved) {
+            Ok(id) => {
+                let mut uncut = stopped.published(id);
+                start_cut(dir, &mut uncut);
+                self.uncut.push(uncut);
+                "Saved the passage; cutting it into takes…".to_owned()
+            }
+            Err(err) => {
+                let message = format!(
+                    "The passage could not be saved ({err}); it is kept in memory and saving is retried."
+                );
+                let message = join(stopped.notes.clone(), Some(message)).unwrap_or_default();
+                self.unsaved_passages.push(stopped);
+                message
+            }
+        };
+        Update {
+            message: Some(message),
+            ..Update::default()
+        }
+    }
+
+    /// Takes in the cuts that finished: reports the first passage whose
+    /// takes are all there and releases its audio; one that could not be
+    /// cut waits to be cut again.
+    fn collect_cuts(&mut self) -> Update {
+        let mut update = Update::default();
+        let mut left = Vec::new();
+        for mut uncut in mem::take(&mut self.uncut) {
+            let result = match &uncut.worker {
+                Some(worker) if update.passage.is_none() => match worker.try_recv() {
+                    Ok(result) => result,
+                    Err(TryRecvError::Empty) => {
+                        left.push(uncut);
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => Err("the worker stopped".to_owned()),
+                },
+                _ => {
+                    left.push(uncut);
+                    continue;
+                }
+            };
+            uncut.worker = None;
+            match cut_outcome(uncut, result) {
+                Ok(done) => {
+                    update.message = join(update.message.take(), done.message);
+                    update.passage = done.passage;
+                }
+                Err((uncut, message)) => {
+                    update.message = join(update.message.take(), message);
+                    left.push(uncut);
+                }
+            }
+        }
+        self.uncut = left;
+        update
+    }
+
+    /// Waits for the passages being cut and cuts those that wait for it
+    /// (when the window closes); what cannot be cut now is cut by the next
+    /// repair, from the published passage.
+    pub fn finish_cuts_now(&mut self, dir: &Path) -> Vec<Update> {
+        let mut updates = Vec::new();
+        let mut left = Vec::new();
+        for mut uncut in mem::take(&mut self.uncut) {
+            let result = match uncut.worker.take() {
+                Some(worker) => worker
+                    .recv()
+                    .unwrap_or_else(|_| Err("the worker stopped".to_owned())),
+                None => cut_passage(dir, &uncut.id, &uncut.samples),
+            };
+            match cut_outcome(uncut, result) {
+                Ok(done) => updates.push(done),
+                Err((uncut, message)) => {
+                    updates.push(Update {
+                        message,
+                        ..Update::default()
+                    });
+                    left.push(uncut);
+                }
+            }
+        }
+        self.uncut = left;
+        updates
+    }
+
+    /// Tries once more to save the takes and passages that could not be
+    /// saved (when the window closes).
     pub fn save_unsaved_now(&mut self, dir: &Path) -> Update {
         self.unsaved_retry_at = f64::NEG_INFINITY;
         self.retry_unsaved(dir, f64::NEG_INFINITY)
     }
 
-    /// Retries saving the takes that could not be saved; the first one
-    /// saved is reported.
+    /// Retries saving the takes that could not be saved (the first one
+    /// saved is reported), publishing the passages that could not be, and
+    /// cutting the passages whose cut failed.
     fn retry_unsaved(&mut self, dir: &Path, now: f64) -> Update {
-        if self.unsaved.is_empty() || now < self.unsaved_retry_at {
+        let waiting = !self.unsaved.is_empty()
+            || !self.unsaved_passages.is_empty()
+            || self.uncut.iter().any(|uncut| uncut.worker.is_none());
+        if !waiting || now < self.unsaved_retry_at {
             return Update::default();
         }
         self.unsaved_retry_at = now + SAVE_RETRY_S;
+        for mut stopped in mem::take(&mut self.unsaved_passages) {
+            // Silent while it still fails, as for a take: the first
+            // failure was shown.
+            match publish(dir, &mut stopped.unsaved) {
+                Ok(id) => {
+                    let note = "The passage that could not be saved is saved now.".to_owned();
+                    stopped.notes = join(Some(note), stopped.notes.take());
+                    self.uncut.push(stopped.published(id));
+                }
+                Err(_) => self.unsaved_passages.push(stopped),
+            }
+        }
+        for uncut in self.uncut.iter_mut().filter(|uncut| uncut.worker.is_none()) {
+            start_cut(dir, uncut);
+        }
         let mut update = Update::default();
         let mut left = Vec::new();
         for mut unsaved in mem::take(&mut self.unsaved) {
@@ -684,6 +1016,46 @@ impl Recorder {
         Ok(())
     }
 
+    /// Plays the passage a take was cut from, whole and in context: the
+    /// passage file locked to the film from its own first sample (holding
+    /// the film's first frame when that lies before the film), to the
+    /// passage's end. Starts once the file has loaded.
+    pub fn start_passage_playback(
+        &mut self,
+        media: &mut dyn Media,
+        project: &Project,
+        piece: &PassagePiece,
+    ) -> Result<(), String> {
+        if !matches!(self.phase, Phase::Idle) {
+            return Err("A take or playback is already running.".to_owned());
+        }
+        let passage = read_passage(&project.dir, &piece.id)
+            .map_err(|err| format!("Cannot play the passage: {err}"))?;
+        let file = passage.file();
+        let (Some(first_film_s), Some(samples)) =
+            (passage.input.first_sample_film_s, passage.samples)
+        else {
+            return Err(format!("The passage {file} is not placed on the film."));
+        };
+        let path = project.dir.join(&file);
+        if !path.is_file() {
+            return Err(format!("The passage's file {file} is missing."));
+        }
+        self.end_warmup(media);
+        media.open_take(&path)?;
+        let length_s = samples as f64 / f64::from(passage.input.sample_rate.max(1));
+        self.phase = Phase::Playing(Playback {
+            film_from_s: first_film_s.max(0.0),
+            hold_s: (-first_film_s).max(0.0),
+            stop_film_s: first_film_s + length_s,
+            take_first_film_s: first_film_s,
+            film_gain_db: project.config.record.film_gain_db,
+            opened_host_s: media.host_now_s(),
+            started: None,
+        });
+        Ok(())
+    }
+
     pub fn stop_playback(&mut self, media: &mut dyn Media) {
         if matches!(self.phase, Phase::Playing(_)) {
             self.phase = Phase::Idle;
@@ -715,12 +1087,28 @@ impl Recorder {
                 }
             }
         }
+        let cut = self.collect_cuts();
+        let update = self.tick_phase(media, dir, now);
+        Update {
+            committed: update.committed,
+            peak_dbfs: update.peak_dbfs,
+            passage: cut.passage,
+            message: join(update.message, cut.message),
+        }
+    }
+
+    /// The part of [`Recorder::tick`] that depends on what runs.
+    fn tick_phase(&mut self, media: &mut dyn Media, dir: &Path, now: f64) -> Update {
         match &mut self.phase {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
                 let progress = take.writer.progress();
                 let failure = start_film(take, media, &progress, now);
                 let mut message = begin_on_disk(take, dir, &progress);
+                if let (Some(passage), Some(film_s)) = (&mut take.passage, take.clock.film_at(now))
+                {
+                    passage.follow(film_s);
+                }
                 if let Some(err) = progress.error.as_ref().filter(|_| !take.write_error_shown) {
                     take.write_error_shown = true;
                     message = join(
@@ -738,18 +1126,8 @@ impl Recorder {
                         ..Update::default()
                     };
                 }
-                let finished = self.finish_take(media, dir);
-                Update {
-                    committed: finished.committed,
-                    peak_dbfs: finished.peak_dbfs,
-                    message: match failure {
-                        Some(failure) => join(
-                            Some(format!("Recording stopped: {failure}")),
-                            finished.message,
-                        ),
-                        None => finished.message,
-                    },
-                }
+                let why = failure.map(|failure| format!("Recording stopped: {failure}"));
+                self.stop_take(media, dir, why)
             }
             Phase::Playing(playback) => match playback.started {
                 Some(tb) if tb.film_at(now) >= playback.stop_film_s => {
@@ -906,8 +1284,72 @@ fn start_both(media: &mut dyn Media, playback: &Playback, now: f64) -> Result<Ti
     media.film_set_gain_db(playback.film_gain_db);
     let tb = media.film_play_at(playback.film_from_s, begin + playback.hold_s)?;
     let take_host = tb.host_anchor_s + (playback.take_first_film_s - tb.film_anchor_s);
-    media.take_play_at(begin - take_host, begin)?;
+    if take_host > begin {
+        // The take's first sample lies after the point the film starts
+        // from (a piece of a passage after its first): the take starts at
+        // its own host time, from its beginning.
+        media.take_play_at(0.0, take_host)?;
+    } else {
+        media.take_play_at(begin - take_host, begin)?;
+    }
     Ok(tb)
+}
+
+/// Where a stopped take lies on the film.
+struct Placement {
+    /// Film time of the take's first sample.
+    first_film_s: f64,
+    /// The take's `film_shift_ms`.
+    film_shift_ms: Option<f64>,
+    /// What to say of the take: its dropouts, a film that stalled.
+    notes: Option<String>,
+}
+
+/// Places a stopped take with the film's timebase as read back (a late
+/// start moves the take), by the same mapping the calibration measures.
+/// `estimated`: the film was never scheduled; `unplayed_s`: how far a film
+/// that never played was behind its schedule.
+fn place(take: &Take, written: &Written, estimated: bool, unplayed_s: Option<f64>) -> Placement {
+    let history = take.clock.history();
+    let first_film_s = written.first_host_s.and_then(|host| {
+        sample_film_time(
+            history,
+            host,
+            0,
+            RECORD_RATE,
+            take.latency_s,
+            take.offset_ms,
+        )
+    });
+    // Measured strictly before the film's end, so the player halting
+    // there is no shift.
+    let film_shift_ms = written.first_host_s.and_then(|host| {
+        let from = host - take.latency_s;
+        let to = (from + written.samples.len() as f64 / f64::from(RECORD_RATE))
+            .min(take.film_ended_host_s.unwrap_or(f64::INFINITY));
+        // A film that never played leaves the take on its schedule,
+        // off by how late the film was when the take stopped.
+        let ms = unplayed_s.unwrap_or_else(|| film_shift_s(history, from, to)) * 1000.0;
+        (ms > FILM_SHIFT_TOLERANCE_MS).then_some(ms)
+    });
+    let shift_note = if estimated {
+        Some("Stopped before the film started; placement estimated.".to_owned())
+    } else {
+        film_shift_ms.map(|ms| {
+            if unplayed_s.is_some() {
+                format!(
+                    "The film did not play during the take; its placement may be off by {ms:.0} ms."
+                )
+            } else {
+                format!("The film stalled during the take; placement may be off by {ms:.0} ms.")
+            }
+        })
+    };
+    Placement {
+        first_film_s: first_film_s.unwrap_or(take.line_start),
+        film_shift_ms,
+        notes: join(dropout_note(&written.dropouts, first_film_s), shift_note),
+    }
 }
 
 /// Film time of the take's first sample, whose buffer has callback host time
@@ -927,6 +1369,9 @@ fn first_sample_film_s(take: &Take, first_host_s: f64) -> Option<f64> {
 /// metadata and has the writer stream into the partial WAV. On failure the
 /// take goes on in memory; returns the message to show.
 fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<String> {
+    if take.passage.is_some() {
+        return begin_passage_on_disk(take, dir, progress);
+    }
     if take.partial.is_some() || take.begin_error.is_some() || !take.clock.started() {
         return None;
     }
@@ -955,6 +1400,133 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
             );
             take.begin_error = Some(err.to_string());
             Some(message)
+        }
+    }
+}
+
+/// Begins a passage take on disk once its first sample is placed: writes
+/// the sidecar and has the writer stream into the partial audio. The
+/// sidecar is written again when the film's timebase, as read back, moves
+/// the first sample, so a passage a crash interrupts is cut where it was
+/// recorded. On failure the take goes on in memory; returns the message to
+/// show.
+fn begin_passage_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<String> {
+    if take.begin_error.is_some() || !take.clock.started() {
+        return None;
+    }
+    let first = first_sample_film_s(take, progress.first_host_s?).unwrap_or(take.line_start);
+    let passage = take.passage.as_mut()?;
+    if passage
+        .sidecar_first_film_s
+        .is_some_and(|written| (written - first).abs() <= SIDECAR_TOLERANCE_S)
+    {
+        return None;
+    }
+    passage.input.first_sample_film_s = Some(first);
+    passage.sidecar_first_film_s = Some(first);
+    if let Some(partial) = &passage.partial {
+        // Left as it was when this fails: the sidecar is written once more
+        // when the take stops.
+        let _ = update_passage_meta(partial, &passage.input);
+        return None;
+    }
+    match begin_passage(dir, &passage.input) {
+        Ok(partial) => {
+            take.writer.open(partial.wav.clone());
+            passage.partial = Some(partial);
+            None
+        }
+        Err(err) => {
+            let message = format!(
+                "The passage cannot be started on disk ({err}); recording goes on, the audio is kept in memory and written when you stop."
+            );
+            take.begin_error = Some(err.to_string());
+            Some(message)
+        }
+    }
+}
+
+/// Publishes a stopped passage (see [`save_passage`]); returns its id. On
+/// failure the passage keeps everything, so this can be called again.
+fn publish(dir: &Path, unsaved: &mut UnsavedPassage) -> Result<String, String> {
+    #[cfg(test)]
+    if COMMITS_FAIL.get() {
+        return Err("the commit failed (test)".to_owned());
+    }
+    save_passage(dir, unsaved)
+        .map(|passage| passage.id)
+        .map_err(|err| err.to_string())
+}
+
+/// Starts a worker that cuts the published passage into its takes.
+/// Without a thread the passage waits to be cut at the next retry.
+fn start_cut(dir: &Path, uncut: &mut Uncut) {
+    let (done, worker) = mpsc::channel();
+    let (dir, id, samples) = (
+        dir.to_path_buf(),
+        uncut.id.clone(),
+        Arc::clone(&uncut.samples),
+    );
+    let spawned = std::thread::Builder::new()
+        .name("takewise-passage-cut".to_owned())
+        .spawn(move || {
+            let _ = done.send(cut_passage(&dir, &id, &samples));
+        });
+    uncut.worker = spawned.is_ok().then_some(worker);
+}
+
+/// Cuts the published passage `id` into one take per line (see
+/// [`passage::split`], which skips the takes that are already there) and
+/// measures each take's peak in `samples`, the passage's audio.
+fn cut_passage(dir: &Path, id: &str, samples: &[i32]) -> Result<Cut, String> {
+    let split = passage::split(dir, id).map_err(|err| err.to_string())?;
+    let pieces = read_passage(dir, id)
+        .ok()
+        .and_then(|passage| passage.pieces())
+        .unwrap_or_default();
+    let peak = |index: usize| {
+        let piece = pieces.get(index)?;
+        let range = usize::try_from(piece.start).ok()?..usize::try_from(piece.end).ok()?;
+        samples.get(range).map(peak_dbfs)
+    };
+    Ok(Cut {
+        pending: !split.pending.is_empty(),
+        takes: split
+            .takes
+            .into_iter()
+            .enumerate()
+            .map(|(index, take)| (take, peak(index)))
+            .collect(),
+        unread: split.lines_without_piece,
+    })
+}
+
+/// What a finished cut gives: the passage's takes (its audio's lock is
+/// released), or the passage to cut again and what to say.
+fn cut_outcome(
+    mut uncut: Uncut,
+    result: Result<Cut, String>,
+) -> Result<Update, (Uncut, Option<String>)> {
+    match result {
+        Ok(cut) if !cut.pending => Ok(Update {
+            passage: Some(PassageTakes {
+                takes: cut.takes,
+                unread: cut.unread,
+            }),
+            message: uncut.notes,
+            ..Update::default()
+        }),
+        // Another process is writing some of its takes: look again.
+        Ok(_) => Err((uncut, None)),
+        Err(err) => {
+            let message = (!uncut.failed).then(|| {
+                format!(
+                    "The passage is saved as {}, but could not be cut into takes ({err}); cutting is retried.",
+                    passage_file(&uncut.id)
+                )
+            });
+            uncut.failed = true;
+            Err((uncut, message))
         }
     }
 }

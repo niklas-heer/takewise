@@ -22,6 +22,8 @@ use super::checks::{Checker, Checks, SharedTranscriber, worker_tag};
 use super::clock::FilmClock;
 use super::{Media, RecordingWindow, bind_keys, load};
 
+mod passages;
+
 const DEVICE: &str = "Test Mic";
 const LATENCY_S: f64 = 0.05;
 
@@ -61,6 +63,10 @@ struct Fake {
     audible: Vec<(f64, f64)>,
     /// Host times of every pause.
     pauses: Vec<f64>,
+    /// Every file opened for playback, in order.
+    opened_takes: Vec<PathBuf>,
+    /// Every `take_play_at` call: (`take_s`, `host_s`).
+    take_plays: Vec<(f64, f64)>,
 }
 
 #[derive(Clone)]
@@ -111,6 +117,8 @@ impl FakeMedia {
             muted: false,
             audible: Vec::new(),
             pauses: Vec::new(),
+            opened_takes: Vec::new(),
+            take_plays: Vec::new(),
         })))
     }
 
@@ -244,13 +252,15 @@ impl Media for FakeMedia {
     fn capture_error(&self) -> Option<String> {
         self.0.borrow().capture_error.clone()
     }
-    fn open_take(&mut self, _: &Path) -> Result<(), String> {
+    fn open_take(&mut self, path: &Path) -> Result<(), String> {
+        self.0.borrow_mut().opened_takes.push(path.to_owned());
         Ok(())
     }
     fn take_ready(&self) -> bool {
         true
     }
-    fn take_play_at(&mut self, _: f64, _: f64) -> Result<(), String> {
+    fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {
+        self.0.borrow_mut().take_plays.push((take_s, host_s));
         Ok(())
     }
     fn stop_take(&mut self) {}

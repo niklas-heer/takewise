@@ -101,7 +101,7 @@ impl TakeWriter {
 
     /// Ends the thread after the capture stopped (every buffer is already
     /// in the channel) and returns what it captured.
-    pub fn finish(mut self) -> Written {
+    pub fn finish(&mut self) -> Written {
         let _ = self.control.send(Control::Stop);
         self.handle
             .take()

@@ -1,5 +1,6 @@
 //! The recording window (GPUI): the film with the line to read, the line
-//! and take lists, and the keys to record, play, choose, mark and edit.
+//! and take lists, and the keys to record, play, choose, mark and edit, a
+//! line at a time or a whole passage (with Shift, see `passage`).
 //!
 //! All writes go through `takewise-core`; the project lock is only held for
 //! those short writes, never while recording. The microphone is never
@@ -17,6 +18,7 @@ mod media;
 mod meter;
 mod model;
 mod panel;
+mod passage;
 mod prompter;
 mod recorder;
 mod remembered;
@@ -60,9 +62,12 @@ gpui_kit::actions!(
     takewise,
     [
         Record,
+        RecordPassage,
         Choose,
+        ChoosePassage,
         Retake,
         PlayInContext,
+        PlayPassage,
         MarkStart,
         Edit,
         PrevLine,
@@ -95,10 +100,10 @@ const EDITING: &str = "RecorderEditing";
 /// The key context while the setup check is open: Space and Enter drive it.
 const SETUP: &str = "RecorderSetup";
 /// The keys, along the window's bottom edge.
-const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · ,/. monitor · K clear clip";
+const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · ,/. monitor · K clear clip";
 /// The keys while monitoring is unavailable: the monitor volume keys are
 /// not advertised.
-const KEY_HINTS_NO_MONITOR: &str = "Space record/stop · Enter choose · R retake · P play in context · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · K clear clip";
+const KEY_HINTS_NO_MONITOR: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · K clear clip";
 /// How often the input devices are checked while idle.
 const INPUT_CHECK_S: f64 = 2.0;
 
@@ -118,9 +123,12 @@ pub(crate) mod colors {
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("space", Record, Some(CONTEXT)),
+        KeyBinding::new("shift-space", RecordPassage, Some(CONTEXT)),
         KeyBinding::new("enter", Choose, Some(CONTEXT)),
+        KeyBinding::new("shift-enter", ChoosePassage, Some(CONTEXT)),
         KeyBinding::new("r", Retake, Some(CONTEXT)),
         KeyBinding::new("p", PlayInContext, Some(CONTEXT)),
+        KeyBinding::new("shift-p", PlayPassage, Some(CONTEXT)),
         KeyBinding::new("m", MarkStart, Some(CONTEXT)),
         KeyBinding::new("e", Edit, Some(CONTEXT)),
         KeyBinding::new("up", PrevLine, Some(CONTEXT)),
@@ -450,6 +458,10 @@ pub struct RecordingWindow {
     /// the last frame (with the text it laid out).
     scroll: prompter::Scroll,
     text_layout: Option<(String, gpui_kit::TextLayout)>,
+    /// Which line of a passage take is being read (from 0), as last seen:
+    /// when it moves on, the prompter starts the next line at the top and
+    /// the current line follows it.
+    reading: Option<usize>,
     /// The line list's scroll position, and the current line it was last
     /// scrolled to show.
     lines_scroll: ScrollHandle,
@@ -564,6 +576,7 @@ impl RecordingWindow {
             defaults_path: None,
             scroll: prompter::Scroll::default(),
             text_layout: None,
+            reading: None,
             lines_scroll: ScrollHandle::new(),
             lines_shown: None,
             setup: None,
@@ -587,20 +600,17 @@ impl RecordingWindow {
     }
 
     /// Adopts takes left by a recording that ended without a commit (a
-    /// crash), as `takewise status --repair` would.
+    /// crash), and finishes and cuts a passage it left, as `takewise status
+    /// --repair` would.
     fn recover(&mut self) {
         match tw::repair(&self.dir) {
-            Ok(report) if !report.adopted.is_empty() => {
-                let takes: Vec<String> = report
-                    .adopted
-                    .iter()
-                    .map(|t| format!("{} take {}", t.line, t.take))
-                    .collect();
+            Ok(report)
+                if !report.adopted.is_empty()
+                    || !report.pieces.is_empty()
+                    || !report.passages_published.is_empty() =>
+            {
                 self.reload();
-                self.message = Some(format!(
-                    "Recovered {} from an interrupted recording.",
-                    takes.join(", ")
-                ));
+                self.message = Some(passage::recovered_note(&report));
             }
             Ok(_) => {}
             Err(err) => {
@@ -620,6 +630,10 @@ impl RecordingWindow {
         if self.recorder.has_unsaved() {
             let update = self.recorder.save_unsaved_now(&self.dir);
             self.show(update);
+            // A passage being cut into its takes is waited for.
+            for update in self.recorder.finish_cuts_now(&self.dir) {
+                self.show(update);
+            }
         }
         self.recorder.stop_playback(&mut *self.media);
         self.recorder.keep_meter(&mut *self.media, None);
@@ -880,6 +894,12 @@ impl RecordingWindow {
     }
 
     fn start_take(&mut self) {
+        self.begin_take(false);
+    }
+
+    /// Starts a take of the current line, or with `whole_passage` of the
+    /// lines from it through the end of its passage.
+    fn begin_take(&mut self, whole_passage: bool) {
         self.check_inputs();
         if self.blocked().is_some() {
             return;
@@ -889,12 +909,16 @@ impl RecordingWindow {
         self.scroll.reset();
         self.panel.picker = None;
         let route = self.current_route();
-        if let Err(err) =
-            self.recorder
-                .start_take(&mut *self.media, &self.project, self.line, &route)
-        {
+        if let Err(err) = self.recorder.start_take(
+            &mut *self.media,
+            &self.project,
+            self.line,
+            &route,
+            whole_passage,
+        ) {
             self.message = Some(err);
         }
+        self.reading = self.recorder.passage_reading().map(|(index, _)| index);
         self.pause_checks_while_recording();
     }
 
@@ -960,6 +984,7 @@ impl RecordingWindow {
         );
         let update = self.recorder.tick(&mut *self.media, &self.dir);
         self.show(update);
+        self.follow_reading();
         self.pause_checks_while_recording();
         self.tick_setup(now);
         self.tick_panel(now);
@@ -1049,6 +1074,8 @@ impl RecordingWindow {
             self.take_peaks.insert((take.line.clone(), take.take), peak);
         }
         let success = self.took(update.committed);
+        let passage = update.passage.map(|passage| self.took_passage(&passage));
+        let success = recorder::join(success, passage);
         if let Some(message) = recorder::join(success, update.message) {
             self.message = Some(message);
         }
@@ -1123,6 +1150,13 @@ impl RecordingWindow {
 
     fn mark(&mut self, _: &MarkStart, _: &mut Window, cx: &mut Context<Self>) {
         cx.notify();
+        if self.recorder.is_recording_passage() {
+            self.message = Some(
+                "M is off during a passage take: its lines keep the slots it started with."
+                    .to_owned(),
+            );
+            return;
+        }
         let Some(playhead) = self.recorder.playhead_s(&*self.media) else {
             self.message = Some(
                 "M sets the line's start while the film plays: record (Space) or play in context (P)."
@@ -1393,6 +1427,28 @@ fn audio_actions(
     }))
 }
 
+/// The keys for lines and takes: record, choose and play (with Shift the
+/// whole passage), mark, edit and the arrows.
+fn take_actions(
+    root: gpui_kit::Stateful<gpui_kit::Div>,
+    cx: &mut Context<RecordingWindow>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    root.on_action(cx.listener(RecordingWindow::record))
+        .on_action(cx.listener(RecordingWindow::record_passage))
+        .on_action(cx.listener(RecordingWindow::retake))
+        .on_action(cx.listener(RecordingWindow::choose))
+        .on_action(cx.listener(RecordingWindow::choose_passage))
+        .on_action(cx.listener(RecordingWindow::play))
+        .on_action(cx.listener(RecordingWindow::play_passage))
+        .on_action(cx.listener(RecordingWindow::mark))
+        .on_action(cx.listener(RecordingWindow::edit))
+        .on_action(cx.listener(RecordingWindow::cancel_edit))
+        .on_action(cx.listener(|view, _: &PrevLine, _, cx| view.move_line(-1, cx)))
+        .on_action(cx.listener(|view, _: &NextLine, _, cx| view.move_line(1, cx)))
+        .on_action(cx.listener(|view, _: &PrevTake, _, cx| view.move_take(-1, cx)))
+        .on_action(cx.listener(|view, _: &NextTake, _, cx| view.move_take(1, cx)))
+}
+
 impl Render for RecordingWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tick();
@@ -1443,14 +1499,7 @@ impl Render for RecordingWindow {
             .id("recording-window")
             .key_context(key_context)
             .track_focus(&self.focus);
-        audio_actions(root, cx)
-            .on_action(cx.listener(Self::record))
-            .on_action(cx.listener(Self::retake))
-            .on_action(cx.listener(Self::choose))
-            .on_action(cx.listener(Self::play))
-            .on_action(cx.listener(Self::mark))
-            .on_action(cx.listener(Self::edit))
-            .on_action(cx.listener(Self::cancel_edit))
+        take_actions(audio_actions(root, cx), cx)
             .on_action(cx.listener(|view, _: &InstallModel, _, cx| {
                 view.install_model();
                 cx.notify();
@@ -1459,10 +1508,6 @@ impl Render for RecordingWindow {
                 view.message = Some(crate::cli_install::install());
                 cx.notify();
             }))
-            .on_action(cx.listener(|view, _: &PrevLine, _, cx| view.move_line(-1, cx)))
-            .on_action(cx.listener(|view, _: &NextLine, _, cx| view.move_line(1, cx)))
-            .on_action(cx.listener(|view, _: &PrevTake, _, cx| view.move_take(-1, cx)))
-            .on_action(cx.listener(|view, _: &NextTake, _, cx| view.move_take(1, cx)))
             .size_full()
             .flex()
             .flex_col()
