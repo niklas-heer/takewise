@@ -362,6 +362,7 @@ fn commit(dir: &Path, line: &str, samples: &[i32], preroll_s: f64) -> Result<Tak
         snapshot,
         dropouts: Some(0),
         film_shift_ms: None,
+        passage: None,
     };
     let partial = tw::begin_take(dir, line, &input).map_err(|err| err.to_string())?;
     tw::write_take_wav(&partial.wav, samples, RECORD_RATE).map_err(|err| err.to_string())?;

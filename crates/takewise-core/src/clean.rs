@@ -211,6 +211,7 @@ mod tests {
             recovered: false,
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         }
     }
 

@@ -18,6 +18,17 @@
 //!    (a gated interface)
 //! 9. otherwise `keep`, with no reasons.
 //!
+//! A take cut from a passage (a piece, see [`crate::passage`]) is spoken in
+//! one flow with its neighbours, so rule 4 moves to the passage's edges:
+//! overrun is checked only on the last piece and early start only on the
+//! first. In their place, after rule 4 and before rule 5:
+//!
+//! - a piece after the first whose words start more than 1.0 s from its
+//!   line's start, in either direction → `listen` (`passage-drift`);
+//! - a piece beside a cut that found no pause → `listen`
+//!   (`passage-boundary`), since the words there may be split between the
+//!   two lines.
+//!
 //! Tolerances are absolute; a short line is held to the same word rules as a
 //! long one.
 
@@ -34,8 +45,46 @@ pub const EARLY_START_TOLERANCE_S: f64 = 0.3;
 /// transcribed word means the sound before it is a breath or a noise, not
 /// the first word.
 pub const BREATH_GAP_S: f64 = 0.12;
+/// The words of a piece after a passage's first may start this far from
+/// their line's start, in either direction, before it is drift.
+pub const PASSAGE_DRIFT_TOLERANCE_S: f64 = 1.0;
 /// A reason names at most this many words, then says how many more.
 const NAMED_WORDS: usize = 6;
+
+/// Where a take cut from a passage lies in it, for the timing rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieceContext {
+    /// The passage's first piece: it holds the pre-roll, and only it can
+    /// start early.
+    pub first: bool,
+    /// The passage's last piece: only it can overrun.
+    pub last: bool,
+    /// Which of the cuts around this piece found no pause, if any.
+    pub unpaused: Option<Boundary>,
+}
+
+/// The cuts around a piece of a passage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boundary {
+    /// The cut between this piece and the line before.
+    Before,
+    /// The cut between this piece and the next line.
+    After,
+    Both,
+}
+
+impl Boundary {
+    /// The boundaries named by whether the cut before and the cut after
+    /// are meant.
+    pub fn of(before: bool, after: bool) -> Option<Self> {
+        match (before, after) {
+            (true, true) => Some(Self::Both),
+            (true, false) => Some(Self::Before),
+            (false, true) => Some(Self::After),
+            (false, false) => None,
+        }
+    }
+}
 
 /// What transcription produced for a take.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +111,24 @@ pub fn build_checked(
     analysis: &Analysis,
     transcript: &Transcript,
     checker: &str,
+) -> Checked {
+    build_checked_piece(snapshot, line_offset_s, analysis, transcript, checker, None)
+}
+
+/// [`build_checked`] for a take that may be a piece of a passage: with
+/// `piece`, overrun counts only on the last piece and early start only on
+/// the first, a later piece whose words start more than
+/// [`PASSAGE_DRIFT_TOLERANCE_S`] from its line's start gets `passage-drift`,
+/// and a piece beside a cut without a pause gets `passage-boundary` (both
+/// `listen`). `analysis` is then made with the passage's pre-roll floor
+/// (see [`crate::speech::analyze_take`]).
+pub fn build_checked_piece(
+    snapshot: &Snapshot,
+    line_offset_s: f64,
+    analysis: &Analysis,
+    transcript: &Transcript,
+    checker: &str,
+    piece: Option<PieceContext>,
 ) -> Checked {
     let (heard, sounds) = split_sounds(transcript, analysis.speech);
     let word_diffs = heard
@@ -110,20 +177,8 @@ pub fn build_checked(
             Verdict::Retake,
         );
     }
-    if let Some(over) = overrun_s.filter(|&s| s > OVERRUN_TOLERANCE_S) {
-        add(
-            reason("overrun", format!("speech ends {over:.2} s after the slot")),
-            Verdict::Retake,
-        );
-    }
-    if let Some(early) = early_s.filter(|&s| s > EARLY_START_TOLERANCE_S) {
-        add(
-            reason(
-                "early-start",
-                format!("speech starts {early:.2} s before the line"),
-            ),
-            Verdict::Retake,
-        );
+    for (reason, rule_verdict) in timing_reasons(piece, overrun_s, early_s) {
+        add(reason, rule_verdict);
     }
     if let Transcript::Failed(error) = transcript {
         add(words_not_checked(error), Verdict::Listen);
@@ -165,6 +220,66 @@ pub fn build_checked(
     }
 }
 
+/// The timing findings (rule 4), in order: speech ending `overrun_s` past
+/// the slot and starting `early_s` before the line, both `retake` beyond
+/// their tolerances. Inside a passage the lines run into each other, so of
+/// its pieces only the last can overrun and only the first can start early;
+/// instead a later piece whose words start more than
+/// [`PASSAGE_DRIFT_TOLERANCE_S`] from its line's start, in either direction,
+/// and a piece beside a cut that found no pause, are `listen`.
+fn timing_reasons(
+    piece: Option<PieceContext>,
+    overrun_s: Option<f64>,
+    early_s: Option<f64>,
+) -> Vec<(Reason, Verdict)> {
+    let mut found = Vec::new();
+    let overrun_counts = piece.is_none_or(|p| p.last);
+    let early_counts = piece.is_none_or(|p| p.first);
+    if let Some(over) = overrun_s.filter(|&s| overrun_counts && s > OVERRUN_TOLERANCE_S) {
+        found.push((
+            reason("overrun", format!("speech ends {over:.2} s after the slot")),
+            Verdict::Retake,
+        ));
+    }
+    if let Some(early) = early_s.filter(|&s| early_counts && s > EARLY_START_TOLERANCE_S) {
+        found.push((
+            reason(
+                "early-start",
+                format!("speech starts {early:.2} s before the line"),
+            ),
+            Verdict::Retake,
+        ));
+    }
+    let Some(piece) = piece else {
+        return found;
+    };
+    if let Some(early) = early_s.filter(|&s| !piece.first && s.abs() > PASSAGE_DRIFT_TOLERANCE_S) {
+        let side = if early > 0.0 { "before" } else { "after" };
+        found.push((
+            reason(
+                "passage-drift",
+                format!("started {:.1} s {side} its cue", early.abs()),
+            ),
+            Verdict::Listen,
+        ));
+    }
+    if let Some(unpaused) = piece.unpaused {
+        let boundary = match unpaused {
+            Boundary::Both => "either boundary",
+            Boundary::Before => "the boundary with the line before",
+            Boundary::After => "the boundary with the next line",
+        };
+        found.push((
+            reason(
+                "passage-boundary",
+                format!("no pause found at {boundary}; the words may be split between lines"),
+            ),
+            Verdict::Listen,
+        ));
+    }
+    found
+}
+
 /// The noise rule: speech at `speech_level_dbfs` less than 30 dB above the
 /// pre-roll's floor, unless the pre-roll is digital silence (gated).
 fn background_noise(analysis: &Analysis, speech_level_dbfs: Option<f64>) -> Option<Reason> {
@@ -188,14 +303,16 @@ pub fn rebuild_checked(
     analysis: &Analysis,
     previous: &Checked,
     checker: &str,
+    piece: Option<PieceContext>,
 ) -> Option<Checked> {
     let words = previous.transcript.clone()?;
-    let mut rebuilt = build_checked(
+    let mut rebuilt = build_checked_piece(
         snapshot,
         line_offset_s,
         analysis,
         &Transcript::Words(words),
         checker,
+        piece,
     );
     if let Some(sound) = previous
         .reasons
@@ -518,6 +635,134 @@ mod tests {
         let analysis = voiced(&[(0.5, 0.56), (0.7, 3.5)]);
         let checked = check(&analysis, &words_from(LINE, 0.74));
         assert_eq!(checked.verdict, Verdict::Keep, "{:?}", checked.reasons);
+    }
+
+    fn check_piece(analysis: &Analysis, offset: f64, piece: PieceContext) -> Checked {
+        build_checked_piece(
+            &snapshot(),
+            offset,
+            analysis,
+            &words(LINE),
+            CHECKER,
+            Some(piece),
+        )
+    }
+
+    const INTERIOR: PieceContext = PieceContext {
+        first: false,
+        last: false,
+        unpaused: None,
+    };
+
+    #[test]
+    fn inside_a_passage_overrun_and_early_start_move_to_its_edges() {
+        // Speech from 0.5 s before the line to 0.4 s past its 3 s slot.
+        let analysis = voiced(&[(1.0, 4.9)]);
+        let offset = -1.5;
+        let alone = build_checked(&snapshot(), offset, &analysis, &words(LINE), CHECKER);
+        assert_eq!(codes(&alone), ["overrun", "early-start"]);
+
+        let inside = check_piece(&analysis, offset, INTERIOR);
+        assert_eq!(inside.verdict, Verdict::Keep, "{:?}", inside.reasons);
+        assert_eq!(codes(&inside), [""; 0]);
+        assert!(
+            (inside.overrun_s.unwrap() - 0.4).abs() < 1e-9,
+            "still measured"
+        );
+
+        let first = PieceContext {
+            first: true,
+            ..INTERIOR
+        };
+        assert_eq!(
+            codes(&check_piece(&analysis, offset, first)),
+            ["early-start"]
+        );
+        let last = PieceContext {
+            last: true,
+            ..INTERIOR
+        };
+        let checked = check_piece(&analysis, offset, last);
+        assert_eq!(checked.verdict, Verdict::Retake);
+        assert_eq!(codes(&checked), ["overrun"]);
+        // A passage of one piece is checked like a take of its own.
+        let only = PieceContext {
+            first: true,
+            last: true,
+            ..INTERIOR
+        };
+        assert_eq!(
+            codes(&check_piece(&analysis, offset, only)),
+            ["overrun", "early-start"]
+        );
+    }
+
+    #[test]
+    fn a_later_piece_far_from_its_cue_is_drift() {
+        // Speech starts 1.0 s into the take.
+        let analysis = analysis();
+        let early = check_piece(&analysis, -2.4, INTERIOR);
+        assert_eq!(early.verdict, Verdict::Listen);
+        assert_eq!(codes(&early), ["passage-drift"]);
+        assert_eq!(early.reasons[0].message, "started 1.4 s before its cue");
+        let late = check_piece(&analysis, 0.4, INTERIOR);
+        assert_eq!(codes(&late), ["passage-drift"]);
+        assert_eq!(late.reasons[0].message, "started 1.4 s after its cue");
+        // Up to a second either way is the narrator's own pace.
+        for offset in [-1.9, -0.1] {
+            let near = check_piece(&analysis, offset, INTERIOR);
+            assert_eq!(near.verdict, Verdict::Keep, "{offset}: {:?}", near.reasons);
+        }
+        // The first piece starts early instead; it never drifts.
+        let first = PieceContext {
+            first: true,
+            ..INTERIOR
+        };
+        assert_eq!(codes(&check_piece(&analysis, -2.4, first)), ["early-start"]);
+    }
+
+    #[test]
+    fn a_cut_without_a_pause_flags_both_its_pieces() {
+        let before = PieceContext {
+            unpaused: Boundary::of(false, true),
+            ..INTERIOR
+        };
+        let checked = check_piece(&analysis(), OFFSET, before);
+        assert_eq!(checked.verdict, Verdict::Listen);
+        assert_eq!(codes(&checked), ["passage-boundary"]);
+        assert_eq!(
+            checked.reasons[0].message,
+            "no pause found at the boundary with the next line; the words may be split between lines"
+        );
+        let after = PieceContext {
+            unpaused: Boundary::of(true, false),
+            ..INTERIOR
+        };
+        let checked = check_piece(&analysis(), OFFSET, after);
+        assert!(
+            checked.reasons[0]
+                .message
+                .starts_with("no pause found at the boundary with the line before;"),
+            "{:?}",
+            checked.reasons
+        );
+        // Words still decide first: a word lost at the boundary is a retake,
+        // and the boundary explains it.
+        let both = PieceContext {
+            unpaused: Boundary::of(true, true),
+            ..INTERIOR
+        };
+        let checked = build_checked_piece(
+            &snapshot(),
+            OFFSET,
+            &analysis(),
+            &words("Nobody misses a"),
+            CHECKER,
+            Some(both),
+        );
+        assert_eq!(checked.verdict, Verdict::Retake);
+        assert_eq!(codes(&checked), ["missing-words", "passage-boundary"]);
+        assert!(checked.reasons[1].message.contains("either boundary"));
     }
 
     #[test]

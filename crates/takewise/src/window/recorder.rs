@@ -560,6 +560,7 @@ impl Recorder {
             snapshot,
             dropouts: Some(written.dropouts.len().min(u32::MAX as usize) as u32),
             film_shift_ms,
+            passage: None,
         };
         let Written {
             samples,
@@ -940,6 +941,7 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
         snapshot: take.snapshot.clone(),
         dropouts: None,
         film_shift_ms: None,
+        passage: None,
     };
     match begin_take(dir, &take.line, &input) {
         Ok(partial) => {

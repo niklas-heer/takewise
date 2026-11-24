@@ -5,6 +5,8 @@
 //! sample is placed on the film with the timebase that was valid when it was
 //! captured, so a seek or restart while a buffer is in flight never shifts it.
 
+use serde::{Deserialize, Serialize};
+
 use crate::script::Script;
 
 /// A linear host-to-film mapping, as read from the player's timebase.
@@ -124,7 +126,7 @@ pub const GAP_TOLERANCE_S: f64 = 0.001;
 
 /// A stretch of captured audio that never arrived and was filled with
 /// silence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dropout {
     /// Index of the first silent sample in the take.
     pub at_sample: u64,

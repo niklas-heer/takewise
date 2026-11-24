@@ -22,8 +22,8 @@ use crate::ledger::{Checked, EventKind, Ledger, Verdict, read};
 use crate::project::{ExportConfig, ExportFormat, Processing, Project};
 use crate::render::{self, Loudness, MAX_TRUE_PEAK_DBTP, SOURCE_RATE, TARGET_LUFS, Target, UNIT};
 use crate::script::{Line, validate};
-use crate::speech::analyze;
-use crate::state::{State, fold};
+use crate::speech::{Analysis, analyze_take};
+use crate::state::{State, TakeState, fold};
 use crate::takes::read_take_wav;
 
 pub const EXPORT_DIR: &str = "export";
@@ -882,6 +882,13 @@ fn measure_or_remove(ffmpeg: &Ffmpeg, temp: &Path) -> Result<Loudness> {
     })
 }
 
+/// The analysis of a take to place: with the floor of its own pre-roll or,
+/// for a piece of a passage, of the passage's.
+fn analyze_placed(project: &Project, samples: &[i32], rate: u32, take: &TakeState) -> Analysis {
+    let preroll_s = project.config.record.preroll_s;
+    analyze_take(samples, rate, preroll_s, take.passage.as_ref())
+}
+
 /// Picks a line's take, finds its speech and places it in the film, or says
 /// why it cannot (a refusal code and the reason for the message).
 fn place(
@@ -917,7 +924,7 @@ fn place(
             "takes not recorded at the project's sample rate",
         ));
     }
-    let analysis = analyze(&samples, rate, project.config.record.preroll_s);
+    let analysis = analyze_placed(project, &samples, rate, take);
     let (_, speech_end) = analysis
         .speech
         .ok_or(("no-speech", "chosen takes with no speech detected"))?;
@@ -1233,6 +1240,7 @@ mod tests {
             snapshot: project.snapshot(line).unwrap(),
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = begin_take(dir, line, &input).unwrap();
         let mut audio = noise(5.0);
@@ -2131,6 +2139,7 @@ mod tests {
             snapshot: project.snapshot("hook").unwrap(),
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = begin_take(dir, "hook", &input).unwrap();
         let mut audio = noise(5.0);
@@ -2153,6 +2162,7 @@ mod tests {
             snapshot: project.snapshot("hook").unwrap(),
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = begin_take(dir, "hook", &input).unwrap();
         let tau = std::f64::consts::TAU;

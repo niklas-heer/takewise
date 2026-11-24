@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::lock;
-use crate::ledger::{self, Chosen, Event, EventKind, Judged, Ledger, Recorded, Snapshot, Verdict};
+use crate::ledger::{
+    self, Chosen, Event, EventKind, Judged, Ledger, PassagePiece, Recorded, Snapshot, Verdict,
+};
 use crate::project::Project;
 use crate::project::TAKES_DIR;
 use crate::script::is_valid_id;
@@ -34,13 +36,17 @@ pub struct RecordedInput {
     /// started (a stall or rate change), when more than 5 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub film_shift_ms: Option<f64>,
+    /// The piece of a passage this take is, when it was cut from one (see
+    /// [`crate::passage::split`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passage: Option<PassagePiece>,
 }
 
 /// A take's `NNN.json`: the recording input plus the name of the partial
 /// file the audio was recorded into, so that a commit interrupted between its
 /// two renames can be completed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct TakeMeta {
+pub(crate) struct TakeMeta {
     #[serde(flatten)]
     input: RecordedInput,
     /// `.<uuid>.wav.partial`, in the take's line directory.
@@ -73,9 +79,28 @@ pub struct RepairReport {
     /// `NNN.json` files without a `recorded` event whose audio is in neither
     /// `NNN.wav` nor the partial file they name; kept.
     pub metadata_without_audio: Vec<PathBuf>,
+    /// Passages published from a recording that ended without a commit (a
+    /// crash), by id.
+    pub passages_published: Vec<String>,
+    /// Takes cut from published passages that still lacked them.
+    pub pieces: Vec<TakeRef>,
+    /// Audio of passages that were interrupted before their first sample
+    /// was placed on the film, relative to the project; kept, since nothing
+    /// says where to cut them.
+    pub passages_unplaced: Vec<PathBuf>,
+    /// Passages that could not be finished or cut, and why; kept as they
+    /// are.
+    pub passages_failed: Vec<PassageFailure>,
 }
 
-fn line_dir(dir: &Path, line_id: &str) -> Result<PathBuf> {
+/// A passage a repair could not finish or cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PassageFailure {
+    pub passage: String,
+    pub error: String,
+}
+
+pub(crate) fn line_dir(dir: &Path, line_id: &str) -> Result<PathBuf> {
     if !is_valid_id(line_id) {
         return Err(Error::UnknownLine(line_id.to_owned()));
     }
@@ -88,26 +113,32 @@ pub fn begin_take(dir: &Path, line_id: &str, input: &RecordedInput) -> Result<Pa
     let line_dir = line_dir(dir, line_id)?;
     fs::create_dir_all(&line_dir).map_err(io(&line_dir))?;
     let id = uuid::Uuid::new_v4();
-    let meta = line_dir.join(format!(".{id}.json.partial"));
-    let wav_name = format!(".{id}.wav.partial");
-    let wav = line_dir.join(&wav_name);
-    let take_meta = TakeMeta {
-        input: input.clone(),
-        partial_wav: Some(wav_name),
-    };
-    let json = serde_json::to_vec_pretty(&take_meta).map_err(|err| Error::Parse {
-        path: meta.clone(),
-        message: err.to_string(),
-    })?;
-    write_synced(&meta, &json)?;
-    Ok(PartialTake {
+    let partial = PartialTake {
         line: line_id.to_owned(),
-        meta,
-        wav,
-    })
+        meta: line_dir.join(format!(".{id}.json.partial")),
+        wav: line_dir.join(format!(".{id}.wav.partial")),
+    };
+    write_partial_meta(&partial, input)?;
+    Ok(partial)
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Writes the partial metadata of `partial`, naming its partial audio.
+pub(crate) fn write_partial_meta(partial: &PartialTake, input: &RecordedInput) -> Result<()> {
+    let take_meta = TakeMeta {
+        input: input.clone(),
+        partial_wav: partial
+            .wav
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    };
+    let json = serde_json::to_vec_pretty(&take_meta).map_err(|err| Error::Parse {
+        path: partial.meta.clone(),
+        message: err.to_string(),
+    })?;
+    write_synced(&partial.meta, &json)
+}
+
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let mut file = fs::File::create(path).map_err(io(path))?;
     file.write_all(bytes).map_err(io(path))?;
@@ -138,7 +169,7 @@ pub fn update_take_meta(partial: &PartialTake, input: &RecordedInput) -> Result<
 }
 
 /// Numbers and publishes a partial take; the caller holds the project lock.
-fn publish_locked(
+pub(crate) fn publish_locked(
     dir: &Path,
     partial: &PartialTake,
     input: RecordedInput,
@@ -194,7 +225,7 @@ pub fn fail_commits_after_renames(renames: Option<u8>) {
 /// The failure [`fail_commits_after_renames`] asked for, after `renames`
 /// renames of a commit (`None`: when finishing an interrupted one).
 #[allow(clippy::unnecessary_wraps)]
-fn injected_fault(renames: impl Into<Option<u8>>, path: &Path) -> Result<()> {
+pub(crate) fn injected_fault(renames: impl Into<Option<u8>>, path: &Path) -> Result<()> {
     #[cfg(any(test, feature = "test-faults"))]
     if let Some(set) = FAIL_AFTER_RENAMES.get()
         && renames.into().is_none_or(|renames| renames == set)
@@ -261,6 +292,67 @@ pub fn finish_interrupted_commit(dir: &Path, partial: &PartialTake) -> Result<Op
     Ok(Some(take))
 }
 
+/// The take of `line` that is `piece` of its passage, when there is one:
+/// the take whose `recorded` event names the piece, or else one whose
+/// commit renamed its files and stopped before the event (found by the
+/// piece in its `NNN.json`), which is finished here. `partial_wav` is the
+/// piece's partial audio, which the caller holds locked, as is the project.
+pub(crate) fn existing_piece_locked(
+    dir: &Path,
+    line: &str,
+    piece: &PassagePiece,
+    partial_wav: &Path,
+) -> Result<Option<TakeRef>> {
+    let ledger = ledger::read(dir)?;
+    let recorded = ledger
+        .pieces(&piece.id)
+        .find(|(_, _, p)| p.index == piece.index);
+    if let Some((line, take, _)) = recorded {
+        return Ok(Some(TakeRef {
+            line: line.to_owned(),
+            take,
+        }));
+    }
+    let length = piece.to_sample.saturating_sub(piece.from_sample);
+    let whole = |wav: &Path| matches!(wav_header(wav), Ok((_, samples)) if samples == length);
+    for meta in scan(dir)?.unlogged_metadata_of(&ledger, line) {
+        let Ok(take_meta) = read_meta(&dir.join(&meta.path)) else {
+            continue;
+        };
+        let same = take_meta
+            .input
+            .passage
+            .as_ref()
+            .is_some_and(|p| p.id == piece.id && p.index == piece.index);
+        if !same {
+            continue;
+        }
+        let wav = dir.join(meta.path.with_extension("wav"));
+        if !wav.exists() {
+            // The commit stopped between its two renames.
+            if !whole(partial_wav) {
+                continue;
+            }
+            fs::rename(partial_wav, &wav).map_err(io(&wav))?;
+        }
+        let (sample_rate, samples) = wav_header(&wav)?;
+        let event = recorded_event(
+            line,
+            meta.take,
+            take_meta.input,
+            sample_rate,
+            samples,
+            false,
+        );
+        ledger::append_locked(dir, &event)?;
+        return Ok(Some(TakeRef {
+            line: line.to_owned(),
+            take: meta.take,
+        }));
+    }
+    Ok(None)
+}
+
 fn recorded_event(
     line: &str,
     take: u32,
@@ -283,11 +375,12 @@ fn recorded_event(
             recovered,
             dropouts: input.dropouts,
             film_shift_ms: input.film_shift_ms,
+            passage: input.passage,
         }),
     )
 }
 
-fn read_meta(path: &Path) -> Result<TakeMeta> {
+pub(crate) fn read_meta(path: &Path) -> Result<TakeMeta> {
     let bytes = fs::read(path).map_err(io(path))?;
     serde_json::from_slice(&bytes).map_err(|err| Error::Parse {
         path: path.to_path_buf(),
@@ -307,7 +400,7 @@ fn wav_error(path: &Path) -> impl FnOnce(hound::Error) -> Error {
 }
 
 /// The sample rate and length in samples (per channel) of a WAV file.
-fn wav_header(path: &Path) -> Result<(u32, u64)> {
+pub(crate) fn wav_header(path: &Path) -> Result<(u32, u64)> {
     let reader = hound::WavReader::open(path).map_err(wav_error(path))?;
     Ok((reader.spec().sample_rate, u64::from(reader.duration())))
 }
@@ -497,7 +590,7 @@ fn write_wav_lengths(file: &fs::File, data_len_at: u64, data_bytes: u64) -> std:
 /// Sets a WAV's lengths from its size on disk, as left by a crash while it
 /// was streamed: the data chunk (the last chunk) runs to the end of the file,
 /// in whole sample frames.
-fn fix_wav_lengths(file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn fix_wav_lengths(file: &fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt as _;
     let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a WAV file");
     let read_u32 = |at: u64| -> std::io::Result<u32> {
@@ -657,6 +750,18 @@ impl TakeFiles {
         })
     }
 
+    /// `NNN.json` files of `line` without a `recorded` event, with or
+    /// without their `NNN.wav`.
+    fn unlogged_metadata_of<'a>(
+        &'a self,
+        ledger: &'a Ledger,
+        line: &'a str,
+    ) -> impl Iterator<Item = &'a NumberedFile> {
+        self.numbered
+            .iter()
+            .filter(move |f| !f.is_wav && f.line == line && ledger.recorded(line, f.take).is_none())
+    }
+
     fn has_wav(&self, line: &str, take: u32) -> bool {
         self.numbered
             .iter()
@@ -682,7 +787,9 @@ pub(crate) fn interrupted_commit(dir: &Path, meta: &NumberedFile) -> Option<Path
     wav.is_file().then_some(wav)
 }
 
-/// Lists the files under `takes/`.
+/// Lists the take files under `takes/`: every line's directory. Directories
+/// whose name starts with a dot (`.passages`, `.room`) hold no takes and
+/// are left out.
 pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
     let takes = dir.join(TAKES_DIR);
     let mut files = TakeFiles::default();
@@ -697,6 +804,9 @@ pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
             continue;
         }
         let line = entry.file_name().to_string_lossy().into_owned();
+        if line.starts_with('.') {
+            continue;
+        }
         for file in fs::read_dir(entry.path()).map_err(io(entry.path()))? {
             let file = file.map_err(io(entry.path()))?;
             let name = file.file_name().to_string_lossy().into_owned();
@@ -729,7 +839,7 @@ pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
 }
 
 /// How a take's audio file is held.
-enum Hold {
+pub(crate) enum Hold {
     /// Locked here (released when dropped).
     Free(#[allow(dead_code)] fs::File),
     /// Locked by its recording window, which finishes the take itself.
@@ -740,7 +850,7 @@ enum Hold {
 
 /// Locks the audio at `path` without blocking. The recording window's lock
 /// follows the file through a commit's renames.
-fn hold(path: &Path) -> Hold {
+pub(crate) fn hold(path: &Path) -> Hold {
     let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else {
         return Hold::Unopened;
     };
@@ -756,8 +866,20 @@ fn hold(path: &Path) -> Hold {
 /// metadata and the audio, adopts takes whose recording ended without a
 /// commit (a crash: an unlocked `.partial` metadata and audio pair), and
 /// reports the rest. Audio a recording window still holds locked is left
-/// alone: the window finishes that commit itself. Never deletes anything.
+/// alone: the window finishes that commit itself. Then the passages: one
+/// whose recording ended without a commit is finished and published when
+/// its sidecar says where it lies on the film, and every published passage
+/// that lacks takes is cut into them (see [`crate::passage`]). Never
+/// deletes a take, a passage or anything a recording left behind.
 pub fn repair(dir: &Path) -> Result<RepairReport> {
+    // Takes first: a piece left half committed by a crash is adopted here,
+    // so cutting its passage below finds it instead of writing it twice.
+    let mut report = repair_takes(dir)?;
+    crate::passage::repair(dir, &mut report)?;
+    Ok(report)
+}
+
+fn repair_takes(dir: &Path) -> Result<RepairReport> {
     let _guard = lock(dir)?;
     let ledger = ledger::read(dir)?;
     let mut adopted = BTreeSet::new();
@@ -905,6 +1027,7 @@ mod tests {
             },
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         }
     }
 

@@ -143,6 +143,7 @@ mod tests {
             missing: false,
             recorded_against_old_text: false,
             clipped: None,
+            passage: None,
         }
     }
 

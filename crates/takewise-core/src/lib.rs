@@ -11,6 +11,7 @@ pub mod ffmpeg;
 pub mod fsutil;
 pub mod ledger;
 pub mod models;
+pub mod passage;
 pub mod permission;
 pub mod project;
 pub mod render;
@@ -42,8 +43,13 @@ pub use export::{
 };
 pub use fsutil::{ProjectLock, lock, write_atomic};
 pub use ledger::{
-    Checked, Chosen, Event, EventKind, Judged, Ledger, Reason, Recorded, Snapshot, Verdict, Word,
-    WordDiff, WordDiffKind, append, read,
+    Checked, Chosen, Event, EventKind, Judged, Ledger, PassagePiece, Reason, Recorded, Snapshot,
+    Verdict, Word, WordDiff, WordDiffKind, append, read,
+};
+pub use passage::{
+    PartialPassage, Passage, PassageChoice, PassageInput, PassageLine, UnsavedPassage,
+    begin_passage, choose_passage, passage_file, publish_passage, read_passage, save_passage,
+    update_passage_meta,
 };
 pub use permission::{MicPermission, mic_advice};
 pub use project::{
@@ -57,12 +63,12 @@ pub use route::{
 pub use run_check::{Unchecked, check_take, checker, unchecked_takes, words_not_checked_takes};
 pub use script::{Line, Problem, Script, validate};
 pub use session::{AvailableInput, RECORD_RATE, SessionState, can_record, check_input};
-pub use speech::{Analysis, analyze};
+pub use speech::{Analysis, analyze, analyze_take, analyze_with_floor};
 pub use state::{LineState, State, TakeState, fold};
 pub use takes::{
-    Judgment, PartialTake, PartialWav, RecordedInput, RepairReport, TakeRef, WavLock, begin_take,
-    choose_take, commit_take, finish_interrupted_commit, judge_take, read_take_wav, repair,
-    update_take_meta, write_take_wav,
+    Judgment, PartialTake, PartialWav, PassageFailure, RecordedInput, RepairReport, TakeRef,
+    WavLock, begin_take, choose_take, commit_take, finish_interrupted_commit, judge_take,
+    read_take_wav, repair, update_take_meta, write_take_wav,
 };
 pub use timing::{
     Assembler, Dropout, GAP_TOLERANCE_S, RecordPlan, Timebase, TimebaseHistory, clamp_mark,

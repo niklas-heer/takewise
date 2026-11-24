@@ -821,6 +821,7 @@ fn recorded_input_round_trips(cx: &mut TestAppContext) {
         snapshot,
         dropouts: None,
         film_shift_ms: None,
+        passage: None,
     };
     let partial = tw::begin_take(&f.dir, "a", &input).expect("begin");
     tw::write_take_wav(&partial.wav, &[0; 480], 48_000).expect("wav");
@@ -923,6 +924,7 @@ fn opening_the_window_adopts_a_crashed_take(cx: &mut TestAppContext) {
             snapshot,
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = tw::begin_take(dir, "a", &input).expect("begin");
         let mut wav = tw::PartialWav::create(&partial.wav, 48_000).expect("wav");

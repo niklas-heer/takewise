@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use serde::{Serialize, Serializer};
 
-use crate::ledger::{Checked, EventKind, Judged, Ledger, Recorded, Snapshot, Verdict};
+use crate::ledger::{
+    Checked, EventKind, Judged, Ledger, PassagePiece, Recorded, Snapshot, Verdict,
+};
 use crate::project::Project;
 use crate::script::{Problem, validate};
 use crate::takes::{TakeRef, interrupted_commit, scan};
@@ -18,7 +20,8 @@ pub struct State {
     pub lines: Vec<LineState>,
     /// Recorded takes whose line id is no longer in the script.
     pub orphans: Vec<TakeRef>,
-    /// Leftover `.partial` files, relative to the project.
+    /// Leftover `.partial` files, relative to the project: of takes, and
+    /// of passages under `takes/.passages/`.
     pub partials: Vec<PathBuf>,
     /// `NNN.wav` files without a `recorded` event, relative to the project.
     pub unadopted: Vec<PathBuf>,
@@ -77,6 +80,11 @@ pub struct TakeState {
     /// The latest check found samples at or above the clipping threshold;
     /// `None` when unchecked.
     pub clipped: Option<bool>,
+    /// The piece of a passage this take was cut from; absent on a take
+    /// recorded line by line. The passage's audio is
+    /// `takes/.passages/<id>.wav`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passage: Option<PassagePiece>,
 }
 
 // serde's `serialize_with` hands the field over by reference.
@@ -217,6 +225,7 @@ fn fold_take(
         clipped: latest_checked.map(|c| c.clipped_samples > 0),
         missing: !project.dir.join(&rec.file).is_file(),
         recorded_against_old_text: rec.snapshot.text != current.text,
+        passage: rec.passage.clone(),
     };
     let rank = Rank {
         take,
@@ -305,7 +314,8 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
     orphans.sort();
     orphans.dedup();
 
-    let (partials, unadopted) = recovery_notices(project, ledger, &mut notices);
+    let (mut partials, unadopted) = recovery_notices(project, ledger, &mut notices);
+    partials.extend(crate::passage::notices(project, ledger, &mut notices));
 
     State {
         lines,
@@ -570,6 +580,7 @@ text = "Today we start."
                 recovered: false,
                 dropouts: None,
                 film_shift_ms: None,
+                passage: None,
             }),
         );
         append(&project.dir, &event).unwrap();
@@ -1079,7 +1090,7 @@ text = "Today we start."
     }
 
     #[test]
-    fn fold_names_each_lines_passage() {
+    fn fold_names_each_lines_passage_and_each_takes_piece() {
         // Two sentences 0.5 s apart, then one after a pause of 2 s.
         const SCRIPT: &str = r#"
 [[line]]
@@ -1100,12 +1111,52 @@ start = 18.0
 text = "Three."
 "#;
         let (_tmp, project) = setup(SCRIPT);
+        recorded(&project, "one", 1);
+        let piece = PassagePiece {
+            id: "0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10".to_owned(),
+            index: 1,
+            count: 2,
+            from_sample: 297_600,
+            to_sample: 480_000,
+            preroll_floor_dbfs: -64.5,
+        };
+        let event = Event::new(
+            "two",
+            1,
+            EventKind::Recorded(Recorded {
+                file: "takes/two/001.wav".to_owned(),
+                sample_rate: 48_000,
+                samples: 182_400,
+                device: "Test Mic".to_owned(),
+                channel: 1,
+                line_offset_s: -0.3,
+                snapshot: snap(&project, "two"),
+                recovered: false,
+                dropouts: None,
+                film_shift_ms: None,
+                passage: Some(piece.clone()),
+            }),
+        );
+        append(&project.dir, &event).unwrap();
+
         let state = fold_now(&project);
         let passages: Vec<&str> = state.lines.iter().map(|l| l.passage.as_str()).collect();
         assert_eq!(passages, ["one", "one", "three"]);
-        assert_eq!(project.passage_of(1), Some(0..2));
+        assert_eq!(line(&state, "one").takes[0].passage, None);
+        assert_eq!(line(&state, "two").takes[0].passage, Some(piece));
+
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["lines"][1]["passage"], "one");
+        let take = &json["lines"][1]["takes"][0];
+        assert_eq!(take["passage"]["index"], 1);
+        assert_eq!(take["passage"]["count"], 2);
+        assert_eq!(take["passage"]["from_sample"], 297_600);
+        assert_eq!(take["passage"]["to_sample"], 480_000);
+        assert_eq!(take["passage"]["preroll_floor_dbfs"], -64.5);
+        assert!(
+            json["lines"][0]["takes"][0].get("passage").is_none(),
+            "a take recorded line by line has none"
+        );
 
         // `[record] passage_gap_s` moves the limit.
         let config = fs::read_to_string(project.dir.join("project.toml")).unwrap();
@@ -1130,6 +1181,7 @@ text = "Three."
             snapshot: snap(&project, "hook"),
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = crate::takes::begin_take(&project.dir, "hook", &input).unwrap();
         crate::takes::write_take_wav(&partial.wav, &[1; 10], 48_000).unwrap();
@@ -1173,6 +1225,7 @@ text = "Three."
                 snapshot: snap(&project, "hook"),
                 dropouts: None,
                 film_shift_ms: None,
+                passage: None,
             },
         )
         .unwrap();

@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::ledger::PassagePiece;
 use crate::takes::FULL_SCALE;
 
 /// The level reported for digital silence, about 24-bit PCM's dynamic range.
@@ -157,6 +158,60 @@ fn to_index(x: f64) -> usize {
 /// Finds speech by frame energy relative to the noise floor in the pre-roll,
 /// and measures peak, clipping and noise floor.
 pub fn analyze(samples: &[i32], sample_rate: u32, preroll_s: f64) -> Analysis {
+    let levels = frame_levels(samples, sample_rate);
+    let preroll_frames = to_index(preroll_s * f64::from(FRAMES_PER_SECOND));
+    let floor_frames = match levels.get(..preroll_frames) {
+        Some(frames) if !frames.is_empty() => frames,
+        _ => &levels[..],
+    };
+    let noise_floor = percentile(floor_frames, 0.2).unwrap_or(SILENCE_DBFS);
+    analyze_levels(samples, sample_rate, levels, noise_floor)
+}
+
+/// [`analyze`] with the noise floor given instead of measured: for a take
+/// that has no pre-roll of its own, such as a piece cut from a passage,
+/// whose floor is the one of the passage's pre-roll. The speech threshold
+/// and the reported `noise_floor_dbfs` both follow `noise_floor_dbfs`.
+pub fn analyze_with_floor(samples: &[i32], sample_rate: u32, noise_floor_dbfs: f64) -> Analysis {
+    let levels = frame_levels(samples, sample_rate);
+    analyze_levels(samples, sample_rate, levels, noise_floor_dbfs)
+}
+
+/// The analysis of a recorded take: [`analyze`] with the floor of its own
+/// pre-roll, or, for a piece cut from a passage (`piece`), with the floor
+/// of the passage's pre-roll. Checks, export and `clean` all call this, so
+/// they agree on a take's speech and its noise floor.
+pub fn analyze_take(
+    samples: &[i32],
+    sample_rate: u32,
+    preroll_s: f64,
+    piece: Option<&PassagePiece>,
+) -> Analysis {
+    match piece {
+        Some(piece) => analyze_with_floor(samples, sample_rate, piece.preroll_floor_dbfs),
+        None => analyze(samples, sample_rate, preroll_s),
+    }
+}
+
+/// The length of one analysis frame (10 ms) in samples.
+pub(crate) fn frame_len(sample_rate: u32) -> usize {
+    usize::try_from((sample_rate / FRAMES_PER_SECOND).max(1)).unwrap_or(1)
+}
+
+/// The RMS level of each 10 ms frame in dBFS.
+fn frame_levels(samples: &[i32], sample_rate: u32) -> Vec<f64> {
+    samples
+        .chunks(frame_len(sample_rate))
+        .map(rms_dbfs)
+        .collect()
+}
+
+fn analyze_levels(
+    samples: &[i32],
+    sample_rate: u32,
+    levels: Vec<f64>,
+    noise_floor: f64,
+) -> Analysis {
     let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
     let clip_level = f64::from(FULL_SCALE) * 10f64.powf(CLIP_DBFS / 20.0);
     let clipped = samples
@@ -164,14 +219,7 @@ pub fn analyze(samples: &[i32], sample_rate: u32, preroll_s: f64) -> Analysis {
         .filter(|s| f64::from(s.unsigned_abs()) >= clip_level)
         .count();
 
-    let frame_len = usize::try_from((sample_rate / FRAMES_PER_SECOND).max(1)).unwrap_or(1);
-    let levels: Vec<f64> = samples.chunks(frame_len).map(rms_dbfs).collect();
-    let preroll_frames = to_index(preroll_s * f64::from(FRAMES_PER_SECOND));
-    let floor_frames = match levels.get(..preroll_frames) {
-        Some(frames) if !frames.is_empty() => frames,
-        _ => &levels[..],
-    };
-    let noise_floor = percentile(floor_frames, 0.2).unwrap_or(SILENCE_DBFS);
+    let frame_len = frame_len(sample_rate);
     let threshold = (noise_floor + SPEECH_ABOVE_FLOOR_DB).max(SPEECH_MIN_DBFS);
 
     let speech = speech_runs(&levels, threshold).map(|(first, last)| {
@@ -292,6 +340,35 @@ mod tests {
     use super::*;
     use crate::takes::FULL_SCALE;
     use crate::testutil::{RATE, burst, burst_at, noise};
+
+    #[test]
+    fn a_given_floor_stands_in_for_a_missing_pre_roll() {
+        // A piece cut from a passage: speech from its first frames on, so
+        // its own "pre-roll" is speech and hides everything.
+        let mut piece = noise(3.0);
+        burst(&mut piece, 0.1, 2.0);
+        assert_eq!(analyze(&piece, RATE, 1.0).speech, None, "own pre-roll");
+        let floor = analyze(&noise(1.0), RATE, 1.0).noise_floor_dbfs;
+        let analysis = analyze_with_floor(&piece, RATE, floor);
+        let (start, end) = analysis.speech.expect("speech found");
+        assert!(close(start, 0.1) && close(end, 2.0), "{start}..{end}");
+        assert!((analysis.noise_floor_dbfs - floor).abs() < f64::EPSILON);
+        assert!((analysis.frames.threshold_dbfs - (floor + 12.0).max(-55.0)).abs() < 1e-9);
+
+        let passage = PassagePiece {
+            id: "p".to_owned(),
+            index: 1,
+            count: 2,
+            from_sample: 0,
+            to_sample: 0,
+            preroll_floor_dbfs: floor,
+        };
+        assert_eq!(analyze_take(&piece, RATE, 1.0, Some(&passage)), analysis);
+        assert_eq!(
+            analyze_take(&piece, RATE, 1.0, None),
+            analyze(&piece, RATE, 1.0)
+        );
+    }
 
     #[test]
     fn noise_at_both_ends_is_trimmed() {

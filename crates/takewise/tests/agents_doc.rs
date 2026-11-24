@@ -120,6 +120,7 @@ fn record_takes(dir: &Path) {
             snapshot: project.snapshot(&line.id).unwrap(),
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = begin_take(dir, &line.id, &input).unwrap();
         let mut audio = vec![0i32; 5 * RATE as usize];

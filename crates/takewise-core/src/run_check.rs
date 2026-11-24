@@ -16,11 +16,12 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::check::{Transcript, build_checked, rebuild_checked, words_not_checked};
+use crate::check::{Transcript, build_checked_piece, rebuild_checked, words_not_checked};
 use crate::error::{Error, Result};
 use crate::ledger::{self, Checked, Event, EventKind, Ledger, Snapshot};
+use crate::passage::piece_context;
 use crate::project::Project;
-use crate::speech::analyze;
+use crate::speech::analyze_take;
 use crate::takes::{TakeRef, read_take_wav};
 use crate::whisper::{PREPROCESSING, Transcriber, WhisperCli, keep_within};
 
@@ -65,22 +66,34 @@ pub fn check_take(
         })?;
     let wav = dir.join(&recorded.file);
     let (samples, rate) = read_take_wav(&wav)?;
-    let analysis = analyze(&samples, rate, project.config.record.preroll_s);
+    // A piece of a passage has no pre-roll of its own: its floor is the
+    // passage's, and its timing rules depend on where it lies in it.
+    let passage = recorded.passage.as_ref();
+    let analysis = analyze_take(&samples, rate, project.config.record.preroll_s, passage);
+    let piece = passage.map(|piece| piece_context(dir, piece));
     let by = checker(version, &transcriber.model());
     let reused = moved_slot_check(&ledger, take, &snapshot, &by).and_then(|previous| {
-        rebuild_checked(&snapshot, recorded.line_offset_s, &analysis, previous, &by)
+        rebuild_checked(
+            &snapshot,
+            recorded.line_offset_s,
+            &analysis,
+            previous,
+            &by,
+            piece,
+        )
     });
     let checked = reused.unwrap_or_else(|| {
         let transcript = match transcriber.transcribe(&wav) {
             Transcript::Words(words) => Transcript::Words(keep_within(words, analysis.speech)),
             failed @ Transcript::Failed(_) => failed,
         };
-        build_checked(
+        build_checked_piece(
             &snapshot,
             recorded.line_offset_s,
             &analysis,
             &transcript,
             &by,
+            piece,
         )
     });
     // A failure exactly like the take's newest check adds nothing: it is
@@ -334,6 +347,7 @@ mod tests {
             snapshot: project.snapshot("hook").unwrap(),
             dropouts: None,
             film_shift_ms: None,
+            passage: None,
         };
         let partial = begin_take(dir, "hook", &input).unwrap();
         let mut audio = noise(5.0);
@@ -751,6 +765,99 @@ mod tests {
             select_unchecked(&project, &ledger, missing, other_model),
             []
         );
+    }
+
+    /// Hears each line's text 0.1 s into its take's speech.
+    struct HearsTheLine;
+
+    impl Transcriber for HearsTheLine {
+        fn transcribe(&self, wav: &Path) -> Transcript {
+            let (text, at) = if wav.to_string_lossy().contains("/one/") {
+                ("One.", 3.1)
+            } else {
+                ("Two.", 0.1)
+            };
+            Transcript::Words(vec![word(text, at)])
+        }
+        fn model(&self) -> String {
+            "ggml-fake.bin".to_owned()
+        }
+    }
+
+    #[test]
+    fn a_piece_is_checked_with_its_passages_floor_and_edges() {
+        use crate::passage::{
+            Latency, PassageInput, PassageLine, begin_passage, publish_passage, split,
+        };
+        let (_tmp, dir) = setup();
+        let script = "[[line]]\nid = \"one\"\nstart = 10.0\nend = 13.0\ntext = \"One.\"\n\n\
+                      [[line]]\nid = \"two\"\nstart = 13.5\nend = 16.0\ntext = \"Two.\"\n";
+        fs::write(dir.join("script.toml"), script).unwrap();
+        let project = Project::open(&dir).unwrap();
+        // Read without a pause from the first line into the second, and on
+        // for 0.6 s past the second line's slot; the passage starts 3 s
+        // before the first line.
+        let mut audio = noise(10.0);
+        burst(&mut audio, 3.0, 9.6);
+        let input = PassageInput {
+            sample_rate: RATE,
+            device: "Test Mic".to_owned(),
+            channel: 1,
+            latency: Latency {
+                input_s: 0.0,
+                offset_ms: 0.0,
+            },
+            preroll_s: 3.0,
+            lines: ["one", "two"]
+                .iter()
+                .map(|id| PassageLine {
+                    id: (*id).to_owned(),
+                    snapshot: project.snapshot(id).unwrap(),
+                })
+                .collect(),
+            first_sample_film_s: Some(7.0),
+            dropouts: None,
+            film_shift_ms: None,
+        };
+        let partial = begin_passage(&dir, &input).unwrap();
+        write_take_wav(&partial.wav, &audio, RATE).unwrap();
+        let passage = publish_passage(&dir, &partial).unwrap();
+        let cuts = passage.cuts.clone().unwrap();
+        assert_eq!(cuts.len(), 1);
+        assert!(!cuts[0].pause, "no pause to cut in");
+        let takes = split(&dir, &passage.id).unwrap().takes;
+        let floor = passage.preroll_floor_dbfs.unwrap();
+
+        // The second piece is speech from its first sample on: by its own
+        // first seconds it would have no floor to find speech above.
+        let (second, _) = read_take_wav(&dir.join("takes/two/001.wav")).unwrap();
+        assert_eq!(crate::speech::analyze(&second, RATE, 3.0).speech, None);
+
+        let first = check_take(&dir, &takes[0], &HearsTheLine, "0.1.0").unwrap();
+        // It runs 0.5 s past its slot, into the next line: no overrun
+        // inside a passage, but the cut without a pause is flagged.
+        assert_eq!(first.verdict, Verdict::Listen, "{:?}", first.reasons);
+        let codes: Vec<&str> = first.reasons.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(codes, ["passage-boundary"]);
+        assert!(first.reasons[0].message.contains("the next line"));
+        assert!((first.overrun_s.unwrap() - 0.5).abs() < 0.02);
+
+        let last = check_take(&dir, &takes[1], &HearsTheLine, "0.1.0").unwrap();
+        assert!((last.noise_floor_dbfs - floor).abs() < f64::EPSILON);
+        let (start, end) = last.speech.expect("speech above the passage's floor");
+        assert!(start < 0.02 && (end - 3.1).abs() < 0.02, "{start}..{end}");
+        // The last piece is where the passage can overrun.
+        assert_eq!(last.verdict, Verdict::Retake, "{:?}", last.reasons);
+        let codes: Vec<&str> = last.reasons.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(codes, ["overrun", "passage-boundary"]);
+        assert!(last.reasons[1].message.contains("the line before"));
+
+        // A moved slot rechecks a piece without whisper, by the same rules.
+        set_line_field(&dir, "two", Field::End(Some(17.0)), None).unwrap();
+        let moved = check_take(&dir, &takes[1], &HearsTheLine, "0.1.0").unwrap();
+        let codes: Vec<&str> = moved.reasons.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(codes, ["passage-boundary"]);
+        assert_eq!(moved.verdict, Verdict::Listen);
     }
 
     #[test]

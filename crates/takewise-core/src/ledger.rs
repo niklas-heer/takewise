@@ -88,6 +88,45 @@ pub struct Recorded {
     /// 5 ms. Absent otherwise, and on takes recorded before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub film_shift_ms: Option<f64>,
+    /// The piece of a passage this take is, when it was cut from one.
+    /// Absent on takes recorded line by line; readers from before passages
+    /// ignore it and see an ordinary take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passage: Option<PassagePiece>,
+}
+
+/// Which piece of which passage a take is: several lines recorded in one
+/// go into `takes/.passages/<id>.wav` and cut into one take per line (see
+/// [`crate::passage`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PassagePiece {
+    /// The passage's id (a uuid): its files are `takes/.passages/<id>.wav`
+    /// and `<id>.json`.
+    pub id: String,
+    /// The piece's place among the passage's pieces, from 0.
+    pub index: u32,
+    /// How many pieces the passage was cut into.
+    pub count: u32,
+    /// The take's first sample in the passage file.
+    pub from_sample: u64,
+    /// One past the take's last sample in the passage file; the next
+    /// piece's `from_sample`.
+    pub to_sample: u64,
+    /// The noise floor of the passage's pre-roll in dBFS, which stands in
+    /// for the floor a piece has no pre-roll of its own to measure.
+    pub preroll_floor_dbfs: f64,
+}
+
+impl PassagePiece {
+    /// Whether this is the passage's first piece, which holds its pre-roll.
+    pub fn is_first(&self) -> bool {
+        self.index == 0
+    }
+
+    /// Whether this is the passage's last piece, which holds its tail.
+    pub fn is_last(&self) -> bool {
+        self.index + 1 >= self.count
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,6 +237,23 @@ impl Ledger {
             _ => None,
         })
     }
+
+    /// The takes cut from passage `id`, as (line, take, piece), in ledger
+    /// order: one per piece that has a `recorded` event.
+    pub fn pieces<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> impl Iterator<Item = (&'a str, u32, &'a PassagePiece)> {
+        self.events
+            .iter()
+            .filter_map(move |event| match &event.kind {
+                EventKind::Recorded(Recorded {
+                    passage: Some(piece),
+                    ..
+                }) if piece.id == id => Some((event.line.as_str(), event.take, piece)),
+                _ => None,
+            })
+    }
 }
 
 /// Appends one event under the project lock.
@@ -209,16 +265,28 @@ pub fn append(dir: &Path, event: &Event) -> Result<()> {
 /// Appends one event; the caller holds the project lock. When the file does
 /// not end in a newline (a torn line), the event still starts on its own line.
 pub(crate) fn append_locked(dir: &Path, event: &Event) -> Result<()> {
+    append_all_locked(dir, std::slice::from_ref(event))
+}
+
+/// Appends `events` in one `write`, so either all of them reach the ledger
+/// or none does; the caller holds the project lock. Each event is a line of
+/// its own, the first one also after a torn line.
+pub(crate) fn append_all_locked(dir: &Path, events: &[Event]) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
     let path = dir.join(LEDGER_FILE);
     let mut line = String::new();
     if !ends_with_newline(&path).map_err(io(&path))? {
         line.push('\n');
     }
-    line.push_str(&serde_json::to_string(event).map_err(|err| Error::Parse {
-        path: path.clone(),
-        message: err.to_string(),
-    })?);
-    line.push('\n');
+    for event in events {
+        line.push_str(&serde_json::to_string(event).map_err(|err| Error::Parse {
+            path: path.clone(),
+            message: err.to_string(),
+        })?);
+        line.push('\n');
+    }
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -304,6 +372,7 @@ mod tests {
                 recovered: false,
                 dropouts: None,
                 film_shift_ms: None,
+                passage: None,
             }),
         )
     }
@@ -467,6 +536,72 @@ mod tests {
         assert_eq!(ledger.events[1].take, 2);
         assert!(!ledger.torn_tail);
         assert_eq!(ledger.bad_lines, vec![2]);
+    }
+
+    #[test]
+    fn a_piece_of_a_passage_roundtrips_and_older_readers_ignore_it() {
+        /// The `recorded` event as Takewise 0.1 reads it.
+        #[derive(Deserialize)]
+        struct Before {
+            kind: String,
+            line: String,
+            take: u32,
+            file: String,
+            line_offset_s: f64,
+        }
+        let mut event = recorded(2);
+        let piece = PassagePiece {
+            id: "0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10".to_owned(),
+            index: 1,
+            count: 3,
+            from_sample: 297_600,
+            to_sample: 439_200,
+            preroll_floor_dbfs: -64.5,
+        };
+        if let EventKind::Recorded(rec) = &mut event.kind {
+            rec.passage = Some(piece.clone());
+        }
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""passage":{"id":"0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10","index":1,"count":3,"from_sample":297600,"to_sample":439200,"preroll_floor_dbfs":-64.5}"#),
+            "{json}"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, event);
+        assert!(!piece.is_first() && !piece.is_last());
+
+        let before: Before = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (before.kind.as_str(), before.line.as_str(), before.take),
+            ("recorded", "hook", 2)
+        );
+        assert_eq!(before.file, "takes/hook/002.wav");
+        assert!((before.line_offset_s + 2.0).abs() < f64::EPSILON);
+
+        let ledger = Ledger {
+            events: vec![recorded(1), event],
+            ..Ledger::default()
+        };
+        let pieces: Vec<_> = ledger.pieces(&piece.id).collect();
+        assert_eq!(pieces, vec![("hook", 2, &piece)]);
+        assert_eq!(ledger.pieces("another").count(), 0);
+    }
+
+    #[test]
+    fn several_events_are_appended_in_one_write() {
+        let tmp = crate::testutil::project_tempdir();
+        let path = tmp.path().join(LEDGER_FILE);
+        // After a torn line, the first event still starts on its own line.
+        fs::write(&path, "{\"v\":1,\"kind\":\"reco").unwrap();
+        let events = [recorded(1), recorded(2), recorded(3)];
+        append_all_locked(tmp.path(), &events).unwrap();
+        append_all_locked(tmp.path(), &[]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.ends_with('\n'));
+        let ledger = read(tmp.path()).unwrap();
+        assert_eq!(ledger.events, events);
+        assert_eq!(ledger.bad_lines, vec![1]);
     }
 
     #[test]

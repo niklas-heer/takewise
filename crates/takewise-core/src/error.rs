@@ -31,6 +31,17 @@ pub enum Error {
         take: u32,
         path: PathBuf,
     },
+    #[error("no passage with id {0:?}")]
+    UnknownPassage(String),
+    #[error(
+        "passage {id} has takes for {have} of its {count} pieces; run `takewise status --repair` to cut the rest"
+    )]
+    PassageNotSplit { id: String, have: u32, count: u32 },
+    #[error(
+        "{}: the passage has no film time for its first sample, so nothing says where to cut it",
+        .0.display()
+    )]
+    PassageUnplaced(PathBuf),
     #[error("no Takewise project at {} (missing project.toml)", .0.display())]
     NotAProject(PathBuf),
     #[error("{0}")]
@@ -54,6 +65,9 @@ impl Error {
             Error::UnknownLine(_) => "unknown-line",
             Error::UnknownTake { .. } => "unknown-take",
             Error::MissingFile { .. } => "missing-file",
+            Error::UnknownPassage(_) => "unknown-passage",
+            Error::PassageNotSplit { .. } => "passage-not-split",
+            Error::PassageUnplaced(_) => "passage-unplaced",
             Error::MissingFfmpeg(_) => "missing-tool",
             Error::Ffmpeg(_) => "ffmpeg-failed",
             Error::ExportSetting(_) => "bad-export-setting",
