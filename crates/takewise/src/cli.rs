@@ -552,6 +552,11 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
             .notices
             .push(Problem::new(None, "calibration-stale", stale));
     }
+    if let Some(note) = tw::remembered::latency_note(&project.config, &route) {
+        state
+            .notices
+            .push(Problem::new(None, "calibration-remembered", note));
+    }
     if let Some(warning) = tw::setup_warning(&project.config, &route) {
         let code = if project.config.setup.is_none() {
             "no-setup"
@@ -1185,6 +1190,12 @@ fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, C
             text,
             "\nWrote latency_offset_ms = {offset} and the devices it was measured on to project.toml."
         );
+        // Other projects on exactly these devices and buffer reuse it.
+        let remembered = tw::remembered::remembered_path()
+            .map(|path| tw::remembered::remember_latency(&path, offset, &info));
+        if let Some(Err(err)) = remembered {
+            let _ = write!(text, "\nCould not remember it for other projects: {err}");
+        }
     } else {
         let _ = write!(
             text,
