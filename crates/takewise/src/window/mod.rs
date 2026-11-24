@@ -140,6 +140,11 @@ const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play
 const KEY_HINTS_NO_MONITOR: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · L latency · −/+ film · K clear clip";
 /// How often the input devices are checked while idle.
 const INPUT_CHECK_S: f64 = 2.0;
+/// How often the window looks whether its frames stopped (minimized,
+/// hidden or covered: macOS then stops drawing it), and how long without
+/// a frame before it ticks from the timer instead.
+const TICK_TIMER: std::time::Duration = std::time::Duration::from_millis(50);
+const TICK_FALLBACK_S: f64 = 0.1;
 
 pub(crate) mod colors {
     pub const BACKGROUND: u32 = 0x0010_1012;
@@ -627,6 +632,8 @@ pub struct RecordingWindow {
     /// take started on, which it watches.
     output_checked_at: f64,
     take_route: Option<output::TakeRoute>,
+    /// When the window last ticked, from a frame or from its timer.
+    ticked_at: Option<f64>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -721,6 +728,7 @@ impl RecordingWindow {
             devices_seen: 0,
             devices_watched: 0,
             take_route: None,
+            ticked_at: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -736,7 +744,31 @@ impl RecordingWindow {
         view.apply_output();
         view.check_inputs();
         view.park();
+        Self::tick_without_frames(cx);
         view
+    }
+
+    /// Keeps the window's work going when it is not drawn: a take still
+    /// stops at its end, a playback ends, and device changes are acted on.
+    /// Every [`TICK_TIMER`], a window that drew no frame for
+    /// [`TICK_FALLBACK_S`] ticks from here.
+    fn tick_without_frames(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TICK_TIMER).await;
+                let ticked = this.update(cx, |view, cx| {
+                    let now = view.media.host_now_s();
+                    if view.ticked_at.is_none_or(|at| now - at >= TICK_FALLBACK_S) {
+                        view.tick();
+                        cx.notify();
+                    }
+                });
+                if ticked.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Closing the window or quitting mid-take still keeps the take; the
@@ -1259,6 +1291,7 @@ impl RecordingWindow {
     /// Once per frame: reload on outside changes, keep the device check and
     /// meter current, and advance the recorder.
     fn tick(&mut self) {
+        self.ticked_at = Some(self.media.host_now_s());
         if self.watcher.as_ref().is_some_and(Watcher::changed) {
             self.reload();
         }

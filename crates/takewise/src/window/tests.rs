@@ -1428,6 +1428,42 @@ fn an_output_that_does_not_list_its_configuration_is_still_there(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+fn a_window_that_is_not_drawn_still_ends_a_playback_and_watches_its_output(
+    cx: &mut TestAppContext,
+) {
+    // Minimized or hidden, macOS draws no frames: the timer ticks instead.
+    let f = on_test_phones(cx);
+    let no_frames = |cx: &mut TestAppContext| {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+    };
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    f.media.set_now(400.0);
+    no_frames(cx);
+    assert!(
+        !f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+        "ended without a frame"
+    );
+
+    f.media.set_now(500.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    unplug(&f, "Test Phones");
+    f.media.set_now(500.2);
+    no_frames(cx);
+    assert!(
+        !f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+        "stopped without a frame"
+    );
+    assert!(message(cx, &f.view).starts_with("The playback stopped. Test Phones is not connected"));
+}
+
+#[gpui_kit::test]
 fn a_take_watches_the_output_it_started_on(cx: &mut TestAppContext) {
     let lost = "Test Phones was disconnected during the take";
     // [output] device cleared mid-take, then the phones go: still lost.
