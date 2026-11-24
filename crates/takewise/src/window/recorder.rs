@@ -139,6 +139,9 @@ pub struct Recorder {
     /// Published passages whose takes are being cut, or wait to be cut
     /// again.
     uncut: Vec<Uncut>,
+    /// Why a playback or a take's film must not start at this tick (its
+    /// output can no longer be used), as the window says before each tick.
+    start_hold: Option<String>,
 }
 
 /// A stopped passage that is not published yet.
@@ -318,6 +321,9 @@ struct Take {
     film_ended_host_s: Option<f64>,
     /// The passage, when the take records one: several lines in one go.
     passage: Option<PassageTake>,
+    /// The output the film played through, when it went away during the
+    /// take: said with the take's result.
+    route_lost: Option<String>,
 }
 
 /// What a passage take has beyond a line take: its lines, the one being
@@ -402,6 +408,7 @@ impl Recorder {
             read_last: None,
             unsaved_passages: Vec::new(),
             uncut: Vec::new(),
+            start_hold: None,
         }
     }
 
@@ -901,6 +908,7 @@ impl Recorder {
             tail_s: rec.tail_s,
             film_ended_host_s: None,
             passage,
+            route_lost: None,
         }));
         Ok(())
     }
@@ -959,6 +967,10 @@ impl Recorder {
             };
         }
         let mut placement = place(&take, &written, estimated, unplayed_s);
+        placement.notes = join(
+            placement.notes,
+            take.route_lost.take().map(|name| lost_note(&name)),
+        );
         if let Some(passage) = take.passage.take() {
             placement.notes = join(why, placement.notes);
             return self.publish_passage(dir, passage, written, placement);
@@ -1346,6 +1358,30 @@ impl Recorder {
         }
     }
 
+    /// Before each tick: why a playback or a take's film that is about to
+    /// start must not (`None`: it may).
+    pub fn hold_start(&mut self, why: Option<String>) {
+        self.start_hold = why;
+    }
+
+    /// A playback opened and not started yet (its take may still load).
+    pub fn playback_waiting(&self) -> bool {
+        matches!(&self.phase, Phase::Playing(playback) if playback.started.is_none())
+    }
+
+    /// A take recording whose film is not scheduled yet.
+    pub fn film_waiting(&self) -> bool {
+        matches!(&self.phase, Phase::Recording(take) if !take.clock.started())
+    }
+
+    /// The output the film plays through went away during the take; the
+    /// take goes on, and its result says so.
+    pub fn note_route_lost(&mut self, output: &str) {
+        if let Phase::Recording(take) = &mut self.phase {
+            take.route_lost.get_or_insert_with(|| output.to_owned());
+        }
+    }
+
     pub fn stop_playback(&mut self, media: &mut dyn Media) {
         if matches!(self.phase, Phase::Playing(_)) {
             self.phase = Phase::Idle;
@@ -1389,11 +1425,19 @@ impl Recorder {
 
     /// The part of [`Recorder::tick`] that depends on what runs.
     fn tick_phase(&mut self, media: &mut dyn Media, dir: &Path, now: f64) -> Update {
+        let hold = self.start_hold.take();
         match &mut self.phase {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
                 let progress = take.writer.progress();
-                let failure = start_film(take, media, &progress, now);
+                // The film is scheduled once the first buffer is in; not
+                // when its output can no longer be used.
+                let failure = match hold {
+                    Some(why) if !take.clock.started() && progress.first_host_s.is_some() => {
+                        Some(why)
+                    }
+                    _ => start_film(take, media, &progress, now),
+                };
                 let mut message = begin_on_disk(take, dir, &progress);
                 if let (Some(passage), Some(film_s)) = (&mut take.passage, take.clock.film_at(now))
                 {
@@ -1424,6 +1468,13 @@ impl Recorder {
                 Some(tb) if tb.film_at(now) >= playback.stop_film_s => {
                     self.stop_playback(media);
                     Update {
+                        ..Update::default()
+                    }
+                }
+                None if hold.is_some() => {
+                    self.stop_playback(media);
+                    Update {
+                        message: hold,
                         ..Update::default()
                     }
                 }
@@ -1585,6 +1636,13 @@ fn start_both(media: &mut dyn Media, playback: &Playback, now: f64) -> Result<Ti
         media.take_play_at(begin - take_host, begin)?;
     }
     Ok(tb)
+}
+
+/// What a take whose output went away while it recorded says.
+fn lost_note(output: &str) -> String {
+    format!(
+        "{output} was disconnected during the take, so the film may have played elsewhere, out loud: listen before you choose it."
+    )
 }
 
 /// Where a stopped take lies on the film.

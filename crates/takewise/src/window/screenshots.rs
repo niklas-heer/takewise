@@ -622,6 +622,15 @@ impl Media for DemoMedia {
     fn output_connected(&self, device: &str) -> bool {
         self.outputs().iter().any(|output| output.name == device)
     }
+    fn device_generation(&self) -> u64 {
+        0
+    }
+    fn applied_output_uid(&self) -> Option<String> {
+        None
+    }
+    fn output_uid_connected(&self, _: &str) -> bool {
+        true
+    }
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
         let Some(device) = device else {
             return Ok(());

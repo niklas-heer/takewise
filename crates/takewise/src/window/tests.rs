@@ -49,8 +49,15 @@ struct Fake {
     /// Outputs that are connected but missing from `outputs()`, as a
     /// device whose configuration cannot be read just then.
     hidden_outputs: Vec<String>,
-    /// Every output set, in order (`None`: the system's default output).
+    /// Every output set, in order (`None`: the system's default output),
+    /// and how many were tried, also those that failed.
     output_sets: Vec<Option<String>>,
+    output_attempts: usize,
+    /// Why setting any output fails, when it does.
+    output_error: Option<String>,
+    /// The device generation: bumped whenever a test changes the outputs,
+    /// as CoreAudio's listener would.
+    generation: u64,
     /// Whether an opened take is still loading.
     take_loading: bool,
     /// Where the film plays (`None`: the system default).
@@ -130,6 +137,9 @@ impl FakeMedia {
             ],
             hidden_outputs: Vec::new(),
             output_sets: Vec::new(),
+            output_attempts: 0,
+            output_error: None,
+            generation: 0,
             take_loading: false,
             film_output: None,
             take: None,
@@ -313,18 +323,36 @@ impl Media for FakeMedia {
     fn default_output(&self) -> Option<String> {
         Some("MacBook Speakers".to_owned())
     }
+    fn device_generation(&self) -> u64 {
+        self.0.borrow().generation
+    }
+    fn applied_output_uid(&self) -> Option<String> {
+        self.0
+            .borrow()
+            .film_output
+            .as_ref()
+            .map(|name| format!("uid:{name}"))
+    }
+    fn output_uid_connected(&self, uid: &str) -> bool {
+        uid.strip_prefix("uid:")
+            .is_some_and(|name| self.output_connected(name))
+    }
     fn output_connected(&self, device: &str) -> bool {
         let fake = self.0.borrow();
         fake.outputs.iter().any(|output| output.name == device)
             || fake.hidden_outputs.iter().any(|name| name == device)
     }
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
+        self.0.borrow_mut().output_attempts += 1;
         if let Some(device) = device
             && !self.output_connected(device)
         {
             return Err(format!("no output device named {device:?}"));
         }
         let mut fake = self.0.borrow_mut();
+        if let Some(err) = fake.output_error.clone() {
+            return Err(err);
+        }
         if fake.take.is_some()
             && let Some(err) = fake.take_output_error.clone()
         {
@@ -1122,8 +1150,19 @@ fn on_test_phones(cx: &mut TestAppContext) -> Fixture {
     f
 }
 
+/// The output `name` goes away, and CoreAudio says the devices changed.
 fn unplug(f: &Fixture, name: &str) {
-    f.media.0.borrow_mut().outputs.retain(|o| o.name != name);
+    let mut fake = f.media.0.borrow_mut();
+    fake.outputs.retain(|o| o.name != name);
+    fake.generation += 1;
+}
+
+/// The output `name` is connected, and CoreAudio says the devices changed.
+fn plug(f: &Fixture, name: &str) {
+    let mut fake = f.media.0.borrow_mut();
+    fake.outputs
+        .push(output(name, Transport::Usb, OutputSource::Unknown));
+    fake.generation += 1;
 }
 
 /// Removes `[output] device`: the system output, by choice.
@@ -1244,21 +1283,129 @@ fn another_missing_output_set_on_disk_stops_a_playback(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
-fn every_playback_sets_its_output_again(cx: &mut TestAppContext) {
-    // A device that dropped out and came back between two checks may
-    // have left the players on the default: P sets it again.
+fn the_route_is_set_again_only_when_the_devices_changed(cx: &mut TestAppContext) {
+    // Setting it before every start could rebuild the audio path and clip
+    // the warm-up; a start only checks the device is there.
     let f = on_test_phones(cx);
     let sets = |f: &Fixture| f.media.0.borrow().output_sets.len();
     let before = sets(&f);
     f.media.set_now(200.0);
+    press(cx, f.window, &["p", "p", "p"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(sets(&f), before, "nothing changed: not set again");
+    press(cx, f.window, &["p"]);
+
+    // Another device came or went (the phones may have dropped out and
+    // come back in between): the next start sets the route again.
+    plug(&f, "Other Speakers");
     press(cx, f.window, &["p"]);
     assert_eq!(sets(&f), before + 1);
     assert_eq!(
         f.media.0.borrow().output_sets.last(),
         Some(&Some("Test Phones".to_owned()))
     );
-    press(cx, f.window, &["p", "p"]);
-    assert_eq!(sets(&f), before + 2);
+    press(cx, f.window, &["p"]);
+
+    // Gone without CoreAudio saying so: the start still finds out.
+    f.media
+        .0
+        .borrow_mut()
+        .outputs
+        .retain(|o| o.name != "Test Phones");
+    press(cx, f.window, &["p"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(message(cx, &f.view).starts_with("Test Phones is not connected"));
+}
+
+#[gpui_kit::test]
+fn a_route_that_failed_to_be_set_is_tried_again(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().output_error = Some("the device is busy".to_owned());
+    plug(&f, "Other Speakers");
+    frame(cx, f.window);
+    let attempts = f.media.0.borrow().output_attempts;
+    let note = "Test Phones could not be used: the device is busy";
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.output_note())
+            .as_deref(),
+        Some(note)
+    );
+    // The next check tries again, and keeps the error while it fails.
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    assert!(f.media.0.borrow().output_attempts > attempts, "retried");
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.output_note())
+            .as_deref(),
+        Some(note)
+    );
+    f.media.0.borrow_mut().output_error = None;
+    f.media.set_now(106.0);
+    frame(cx, f.window);
+    assert_eq!(f.view.read_with(cx, |view, _| view.output_note()), None);
+    assert_eq!(
+        f.media.0.borrow().output_sets.last(),
+        Some(&Some("Test Phones".to_owned()))
+    );
+}
+
+#[gpui_kit::test]
+fn a_device_change_stops_a_playback_at_once(cx: &mut TestAppContext) {
+    // No two-second wait: CoreAudio's change is acted on at the next tick.
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    unplug(&f, "Test Phones");
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(message(cx, &f.view).starts_with("The playback stopped. Test Phones is not connected"));
+}
+
+#[gpui_kit::test]
+fn a_playback_does_not_start_once_its_output_went(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().take_loading = true;
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    // Gone while the take loads; it has loaded by the next tick.
+    unplug(&f, "Test Phones");
+    f.media.0.borrow_mut().take_loading = false;
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().take_plays.len(), 0, "never scheduled");
+}
+
+#[gpui_kit::test]
+fn a_take_whose_output_went_before_its_film_started_stops(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let plays = f.media.0.borrow().plays.len();
+    unplug(&f, "Test Phones");
+    f.media.send(100.05, 2400);
+    settle(cx, &f);
+    f.media.set_now(100.1);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(
+        f.media.0.borrow().plays.len(),
+        plays,
+        "the film was never scheduled"
+    );
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains(
+            "Recording stopped: Test Phones is not connected, so Takewise does not record"
+        ),
+        "{said}"
+    );
 }
 
 #[gpui_kit::test]
@@ -1278,6 +1425,54 @@ fn an_output_that_does_not_list_its_configuration_is_still_there(cx: &mut TestAp
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn a_take_watches_the_output_it_started_on(cx: &mut TestAppContext) {
+    let lost = "Test Phones was disconnected during the take";
+    // [output] device cleared mid-take, then the phones go: still lost.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    clear_output_on_disk(cx, &f);
+    unplug(&f, "Test Phones");
+    frame(cx, f.window);
+    // Back before the take ends: it was lost all the same.
+    plug(&f, "Test Phones");
+    frame(cx, f.window);
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2);
+    assert!(
+        message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
+    // Said with the take, and not taken back by what follows.
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    assert!(
+        message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
+
+    // Another output, missing, chosen in the file mid-take: the take's
+    // own output is still there, so no warning.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    tw::set_route(&f.dir, None, Some("Gone Phones")).expect("output");
+    f.view.update(cx, |view, _| view.reload());
+    plug(&f, "Other Speakers");
+    f.media.set_now(102.5);
+    frame(cx, f.window);
+    f.media.set_now(102.6);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2);
+    assert!(
+        !message(cx, &f.view).contains("disconnected"),
+        "{}",
+        message(cx, &f.view)
+    );
 }
 
 #[gpui_kit::test]

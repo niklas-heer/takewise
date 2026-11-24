@@ -240,7 +240,7 @@ impl RecordingWindow {
         let Some(note) = self.change_route(None, choice) else {
             return;
         };
-        let said = match self.sync_output(false) {
+        let said = match self.sync_output(true) {
             Ok(()) => format!("The film and your takes play through {name}."),
             Err(problem) => {
                 // A playback goes on where it was only if nothing changed;

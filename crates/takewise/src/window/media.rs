@@ -68,6 +68,15 @@ pub trait Media {
     /// cannot be read now, such as Bluetooth headphones switching profile,
     /// is still there).
     fn output_connected(&self, device: &str) -> bool;
+    /// A counter that goes up whenever the system's devices change (one
+    /// comes or goes, another default output); a different reading means
+    /// something changed since the last.
+    fn device_generation(&self) -> u64;
+    /// The UID of the device the players were last set to (`None`: the
+    /// system's default output), and whether a device with a given UID is
+    /// connected: how a take watches the very output it started on.
+    fn applied_output_uid(&self) -> Option<String>;
+    fn output_uid_connected(&self, uid: &str) -> bool;
     /// The name of the system's default output device.
     fn default_output(&self) -> Option<String>;
     /// Plays the film and the takes through the output device with this
@@ -242,6 +251,18 @@ impl Media for RealMedia {
 
     fn output_connected(&self, device: &str) -> bool {
         takewise_media::output_uid(device).is_ok()
+    }
+
+    fn device_generation(&self) -> u64 {
+        takewise_media::device_generation()
+    }
+
+    fn applied_output_uid(&self) -> Option<String> {
+        self.output_uid.clone()
+    }
+
+    fn output_uid_connected(&self, uid: &str) -> bool {
+        takewise_media::output_uid_present(uid)
     }
 
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {

@@ -617,10 +617,16 @@ pub struct RecordingWindow {
     /// players could not be set to a connected one.
     output_missing: Option<String>,
     output_error: Option<String>,
-    /// When a playback or a take last checked its output, and the output
-    /// lost while the take records, to say so once it ends.
+    /// Whether the route must be set again before it is used (the devices
+    /// changed, or it was seen missing or failed since it was last set),
+    /// and the device generation as `sync_output` and the watch last saw it.
+    route_due: bool,
+    devices_seen: u64,
+    devices_watched: u64,
+    /// When a playback or a take last polled its output, and the route a
+    /// take started on, which it watches.
     output_checked_at: f64,
-    take_output_lost: Option<String>,
+    take_route: Option<output::TakeRoute>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -711,7 +717,10 @@ impl RecordingWindow {
             output_missing: None,
             output_error: None,
             output_checked_at: 0.0,
-            take_output_lost: None,
+            route_due: false,
+            devices_seen: 0,
+            devices_watched: 0,
+            take_route: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1199,7 +1208,6 @@ impl RecordingWindow {
             return;
         }
         self.message = None;
-        self.take_output_lost = None;
         self.peak_meter.clear();
         self.scroll.reset();
         self.panel.picker = None;
@@ -1213,6 +1221,7 @@ impl RecordingWindow {
         ) {
             self.message = Some(err);
         }
+        self.snapshot_take_route();
         self.reading = self.recorder.passage_reading().map(|(index, _)| index);
         self.pause_checks_while_recording();
     }
@@ -1220,7 +1229,6 @@ impl RecordingWindow {
     fn finish_take(&mut self) {
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
-        self.note_lost_output();
         self.pause_checks_while_recording();
     }
 
@@ -1279,9 +1287,9 @@ impl RecordingWindow {
                 .as_ref()
                 .map(|(device, channel)| (device.as_str(), *channel)),
         );
+        self.hold_start();
         let update = self.recorder.tick(&mut *self.media, &self.dir);
         self.show(update);
-        self.note_lost_output();
         self.follow_reading();
         self.pause_checks_while_recording();
         self.tick_setup(now);
