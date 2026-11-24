@@ -102,17 +102,7 @@ pub(crate) fn write_temp(
     path: &Path,
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<PathBuf> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temp = dir.join(format!(
-        ".{name}.{}-{}.tmp",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let temp = temp_beside(path);
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -126,6 +116,34 @@ pub(crate) fn write_temp(
         return Err(io(path)(err));
     }
     Ok(temp)
+}
+
+/// A name for a temp file next to `path` that nothing else uses:
+/// `.<name>.<pid>-<n>.tmp`.
+pub(crate) fn temp_beside(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dir.join(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Fsyncs the directory `path` is in, so a rename to `path` survives a
+/// power loss.
+pub(crate) fn sync_parent(path: &Path) -> Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io(dir))
 }
 
 /// Renames a temp file from `write_temp` over `path`, removing it on failure.

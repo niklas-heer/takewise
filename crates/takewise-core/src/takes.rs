@@ -406,19 +406,94 @@ pub(crate) fn wav_header(path: &Path) -> Result<(u32, u64)> {
 }
 
 /// Writes mono 24-bit PCM, clamping samples to 24 bits, and fsyncs it.
+/// Whatever is at `path` is replaced from its first byte: to write a take
+/// again over audio that may be all there is of it, use
+/// [`rewrite_take_wav`].
 pub fn write_take_wav(path: &Path, samples: &[i32], sample_rate: u32) -> Result<()> {
     let file = fs::File::create(path).map_err(io(path))?;
     let file = encode_wav(file, samples, sample_rate).map_err(wav_error(path))?;
     file.sync_all().map_err(io(path))
 }
 
+/// Writes a take's audio to `path` from memory without ever shortening the
+/// audio that is there: what a recording streamed to `path` before its
+/// disk failed stays whole, and adoptable by [`repair`] after a crash,
+/// until every sample has replaced it.
+///
+/// The take is written and fsynced into a new file beside `path`, which is
+/// locked before it holds anything, and then renamed over `path`. `lock` is
+/// the lock on the audio at `path`, kept from the recording; without one
+/// the audio there is locked first (`WouldBlock` when another holder has
+/// it). On success `lock` holds the new file, and still the files it
+/// replaced: a repair finds the audio at `path` locked whether it opened it
+/// before or after the rename, so it never adopts a take its recorder
+/// still owns. On failure the audio at `path` is as it was (and locked, by
+/// `lock`), and this can be called again.
+pub fn rewrite_take_wav(
+    path: &Path,
+    lock: &mut Option<WavLock>,
+    samples: &[i32],
+    sample_rate: u32,
+) -> Result<()> {
+    if lock.is_none() {
+        *lock = WavLock::acquire_existing(path)?;
+    }
+    let temp = crate::fsutil::temp_beside(path);
+    let written = (|| {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(io(&temp))?;
+        let file = LockedFile::try_lock(file).map_err(io(&temp))?;
+        encode_into(&*file, samples, sample_rate).map_err(wav_error(&temp))?;
+        file.sync_all().map_err(io(&temp))?;
+        fs::rename(&temp, path).map_err(io(path))?;
+        Ok(file)
+    })();
+    let file = match written {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = fs::remove_file(&temp);
+            return Err(err);
+        }
+    };
+    let replaced = lock.take().map(Box::new);
+    *lock = Some(WavLock { file, replaced });
+    crate::fsutil::sync_parent(path)
+}
+
 /// Encodes mono 24-bit PCM into `file` and returns it flushed.
 pub(crate) fn encode_wav(
-    mut file: fs::File,
+    file: fs::File,
     samples: &[i32],
     sample_rate: u32,
 ) -> std::result::Result<fs::File, hound::Error> {
-    use std::io::Write as _;
+    encode_into(&file, samples, sample_rate)?;
+    Ok(file)
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+thread_local! {
+    static FAIL_WAV_WRITES_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes writing a whole take's audio ([`write_take_wav`],
+/// [`rewrite_take_wav`]) on this thread fail once `bytes` of the file are
+/// written, as a failing disk can; `None` lets it succeed again. For tests.
+#[cfg(any(test, feature = "test-faults"))]
+pub fn fail_wav_writes_after(bytes: Option<usize>) {
+    FAIL_WAV_WRITES_AFTER.set(bytes);
+}
+
+/// Encodes mono 24-bit PCM into `out` and flushes it.
+fn encode_into(
+    mut out: impl std::io::Write,
+    samples: &[i32],
+    sample_rate: u32,
+) -> std::result::Result<(), hound::Error> {
     let mut wav = std::io::Cursor::new(Vec::with_capacity(64 + samples.len() * 3));
     {
         let mut writer = hound::WavWriter::new(&mut wav, take_spec(sample_rate))?;
@@ -429,9 +504,15 @@ pub(crate) fn encode_wav(
     }
     let mut wav = wav.into_inner();
     crate::wav::centre_mono(&mut wav);
-    file.write_all(&wav)?;
-    file.flush()?;
-    Ok(file)
+    #[cfg(any(test, feature = "test-faults"))]
+    if let Some(bytes) = FAIL_WAV_WRITES_AFTER.get() {
+        out.write_all(wav.get(..bytes).unwrap_or(&wav))?;
+        out.flush()?;
+        return Err(std::io::Error::other("the disk failed (test)").into());
+    }
+    out.write_all(&wav)?;
+    out.flush()?;
+    Ok(())
 }
 
 fn take_spec(sample_rate: u32) -> hound::WavSpec {
@@ -467,6 +548,12 @@ pub struct WavLock {
     /// Held for its lock alone.
     #[allow(dead_code)]
     file: LockedFile,
+    /// The lock on the file [`rewrite_take_wav`] replaced under this one
+    /// (which keeps the one before it), still held: a repair that opened
+    /// that file before it was replaced must not find it free while the
+    /// take is owned. Boxed, so the lock stays small where it is carried.
+    #[allow(dead_code)]
+    replaced: Option<Box<WavLock>>,
 }
 
 impl WavLock {
@@ -482,7 +569,25 @@ impl WavLock {
             .open(path)
             .map_err(io(path))?;
         let file = LockedFile::try_lock(file).map_err(io(path))?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            replaced: None,
+        })
+    }
+
+    /// Locks the audio at `path` when there is any; `None` when there is
+    /// no file. Fails when another holder locked it.
+    fn acquire_existing(path: &Path) -> Result<Option<Self>> {
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io(path)(err)),
+        };
+        let file = LockedFile::try_lock(file).map_err(io(path))?;
+        Ok(Some(Self {
+            file,
+            replaced: None,
+        }))
     }
 }
 
@@ -553,7 +658,10 @@ impl PartialWav {
     /// Stops writing (after a failed write) but keeps the file locked, so
     /// nothing adopts it before the take is written again from memory.
     pub fn into_lock(self) -> WavLock {
-        WavLock { file: self.file }
+        WavLock {
+            file: self.file,
+            replaced: None,
+        }
     }
 
     /// Flushes and fsyncs the file; it stays locked until the returned
@@ -1041,6 +1149,104 @@ mod tests {
         let adopted = repair(dir).unwrap().adopted;
         assert_eq!(adopted.len(), 1, "a crash leaves it adoptable");
         drop(shared_with_a_child);
+    }
+
+    /// A take of which the recording streamed the first 2 s before its
+    /// disk failed: the partial files, the lock kept from the recording,
+    /// and all 3 s as they are in memory.
+    fn half_written(dir: &Path) -> (PartialTake, Option<WavLock>, Vec<i32>) {
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        let memory: Vec<i32> = (0..144_000).collect();
+        let mut wav = PartialWav::create(&partial.wav, 48_000).unwrap();
+        wav.write(&memory[..96_000]).unwrap();
+        wav.flush().unwrap();
+        (partial, Some(wav.into_lock()), memory)
+    }
+
+    #[test]
+    fn an_interrupted_rewrite_from_memory_keeps_the_audio_on_disk() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        let (partial, mut lock, memory) = half_written(dir);
+        let before = fs::read(&partial.wav).unwrap();
+        // The disk fails again at once, inside the header, and far into
+        // the audio.
+        for bytes in [0, 20, 200_000] {
+            fail_wav_writes_after(Some(bytes));
+            let failed = rewrite_take_wav(&partial.wav, &mut lock, &memory, 48_000);
+            fail_wav_writes_after(None);
+            assert!(failed.is_err(), "{bytes}");
+            let untouched = fs::read(&partial.wav).unwrap() == before;
+            assert!(untouched, "{bytes}: the audio on disk changed");
+            assert!(WavLock::acquire(&partial.wav).is_err(), "{bytes}: held");
+            assert_eq!(repair(dir).unwrap().adopted, Vec::new(), "{bytes}");
+            let mut left = files_in(&dir.join("takes/hook"));
+            left.sort();
+            let mut partials = vec![partial.meta.clone(), partial.wav.clone()];
+            partials.sort();
+            assert_eq!(left, partials, "{bytes}: no scratch file is left");
+        }
+        // The window dies before it could save: what the recording had
+        // streamed is still there to adopt.
+        drop(lock);
+        let adopted = repair(dir).unwrap().adopted;
+        assert_eq!(adopted.len(), 1);
+        let (audio, _) = read_take_wav(&dir.join("takes/hook/001.wav")).unwrap();
+        assert!(audio == memory[..96_000], "the 2 s that were streamed");
+    }
+
+    #[test]
+    fn a_rewrite_from_memory_replaces_the_audio_under_its_lock() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        let (partial, mut lock, memory) = half_written(dir);
+        // A repair that opened the audio just before it was replaced.
+        let opened_before = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial.wav)
+            .unwrap();
+        rewrite_take_wav(&partial.wav, &mut lock, &memory, 48_000).unwrap();
+        let rewritten = read_take_wav(&partial.wav).unwrap();
+        assert!(rewritten == (memory.clone(), 48_000), "all 3 s");
+        assert!(WavLock::acquire(&partial.wav).is_err(), "the new file");
+        assert!(LockedFile::try_lock(opened_before).is_err(), "the old file");
+        assert_eq!(repair(dir).unwrap().adopted, Vec::new());
+        // Written once more (the commit failed, say): still one file, held.
+        rewrite_take_wav(&partial.wav, &mut lock, &memory, 48_000).unwrap();
+        assert!(WavLock::acquire(&partial.wav).is_err());
+        let take = commit_take(dir, partial).unwrap();
+        let events = read(dir).unwrap().events;
+        let EventKind::Recorded(rec) = &events[0].kind else {
+            panic!("{events:?}");
+        };
+        assert_eq!((take.take, rec.samples, rec.recovered), (1, 144_000, false));
+        assert_eq!(files_in(&dir.join("takes/hook")).len(), 2);
+        drop(lock);
+    }
+
+    #[test]
+    fn a_rewrite_from_memory_takes_the_lock_it_was_not_given() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        // No audio on disk yet: the take is written and held.
+        let partial = begin_take(dir, "hook", &input()).unwrap();
+        let mut lock = None;
+        rewrite_take_wav(&partial.wav, &mut lock, &[7; 480], 48_000).unwrap();
+        assert!(lock.is_some());
+        assert!(WavLock::acquire(&partial.wav).is_err(), "held");
+        assert_eq!(repair(dir).unwrap().adopted, Vec::new());
+        // Audio another holder has locked is left as it is.
+        let before = fs::read(&partial.wav).unwrap();
+        let mut none = None;
+        let busy = rewrite_take_wav(&partial.wav, &mut none, &[9; 960], 48_000);
+        assert!(
+            matches!(busy, Err(Error::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::WouldBlock),
+            "{busy:?}"
+        );
+        assert!(none.is_none());
+        assert!(fs::read(&partial.wav).unwrap() == before, "untouched");
     }
 
     #[test]

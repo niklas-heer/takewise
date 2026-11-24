@@ -38,7 +38,7 @@ use crate::speech::{analyze, analyze_with_floor, frame_len};
 use crate::takes::{
     Hold, PartialTake, PassageFailure, RecordedInput, RepairReport, TakeRef, WavLock,
     existing_piece_locked, fix_wav_lengths, hold, injected_fault, line_dir, publish_locked,
-    read_take_wav, wav_header, write_partial_meta, write_synced, write_take_wav,
+    read_take_wav, rewrite_take_wav, wav_header, write_partial_meta, write_synced, write_take_wav,
 };
 use crate::timing::Dropout;
 
@@ -367,11 +367,25 @@ pub struct UnsavedPassage {
     pub complete: bool,
 }
 
+impl UnsavedPassage {
+    /// Whether part of the passage's audio exists only in memory: the
+    /// partial audio on disk does not hold every sample (it could not be
+    /// begun, or a write failed), so quitting now would lose what a repair
+    /// cannot find there. `false` once the audio is whole on disk, also
+    /// when the passage is not published yet: a repair then finishes it.
+    pub fn audio_only_in_memory(&self) -> bool {
+        !self.complete
+    }
+}
+
 /// Writes a stopped passage's sidecar and, when its partial audio is not
 /// complete (it could not be begun or written on disk), its audio from
 /// memory, then publishes it. On failure `unsaved` keeps everything, so
-/// calling this again retries; the audio is rewritten only while its lock
-/// is held, and the lock is kept until the passage is published.
+/// calling this again retries. The audio is written from memory into a new
+/// file that replaces the partial audio only once it is whole (see
+/// [`rewrite_take_wav`]), so what the recording streamed is never
+/// shortened; it stays locked throughout, and until the passage is
+/// published.
 pub fn save_passage(dir: &Path, unsaved: &mut UnsavedPassage) -> Result<Passage> {
     let partial = if let Some(partial) = &unsaved.partial {
         partial.clone()
@@ -389,10 +403,14 @@ pub fn save_passage(dir: &Path, unsaved: &mut UnsavedPassage) -> Result<Passage>
             unsaved.complete = false;
         }
         if !unsaved.complete {
-            if unsaved.lock.is_none() {
-                unsaved.lock = Some(WavLock::acquire(&partial.wav)?);
-            }
-            write_take_wav(&partial.wav, &unsaved.samples, unsaved.input.sample_rate)?;
+            // Never over the audio that is there: a failure here leaves
+            // what the recording streamed, for a repair after a crash.
+            rewrite_take_wav(
+                &partial.wav,
+                &mut unsaved.lock,
+                &unsaved.samples,
+                unsaved.input.sample_rate,
+            )?;
             unsaved.complete = true;
         }
     }
@@ -1748,6 +1766,82 @@ text = "Later."
         let second = save_passage(&dir, &mut unsaved).unwrap();
         assert_eq!(second.samples, Some(spoken().len() as u64));
         assert_ne!(second.id, passage.id);
+    }
+
+    #[test]
+    fn an_interrupted_save_from_memory_keeps_the_audio_on_disk() {
+        let (_tmp, dir) = project();
+        let audio = spoken();
+        // The recording streamed the first 9 s, then its disk failed; the
+        // whole passage is in memory.
+        let streamed = samples(9.0);
+        let partial = begin_passage(&dir, &abc(&dir)).unwrap();
+        let mut wav = PartialWav::create(&partial.wav, RATE).unwrap();
+        wav.write(&audio[..streamed]).unwrap();
+        wav.flush().unwrap();
+        let mut unsaved = UnsavedPassage {
+            input: abc(&dir),
+            samples: audio.clone(),
+            partial: Some(partial.clone()),
+            lock: Some(wav.into_lock()),
+            complete: false,
+        };
+        assert!(unsaved.audio_only_in_memory());
+        let before = fs::read(&partial.wav).unwrap();
+        // Saving from memory fails after it began to write.
+        crate::takes::fail_wav_writes_after(Some(100_000));
+        assert!(save_passage(&dir, &mut unsaved).is_err());
+        crate::takes::fail_wav_writes_after(None);
+        assert!(unsaved.audio_only_in_memory());
+        assert!(fs::read(&partial.wav).unwrap() == before, "not shortened");
+        assert!(WavLock::acquire(&partial.wav).is_err(), "still held");
+        assert_eq!(
+            repair(&dir).unwrap().passages_published,
+            Vec::<String>::new()
+        );
+
+        // The window dies: a repair publishes what was streamed.
+        drop(unsaved);
+        let report = repair(&dir).unwrap();
+        assert_eq!(report.passages_published, vec![partial.id.clone()]);
+        let recovered = read_passage(&dir, &partial.id).unwrap();
+        assert_eq!(recovered.samples, Some(streamed as u64));
+        let (on_disk, _) = read_take_wav(&dir.join(recovered.file())).unwrap();
+        assert!(on_disk == audio[..streamed], "the 9 s that were streamed");
+    }
+
+    #[test]
+    fn a_save_from_memory_after_a_failed_one_publishes_the_whole_passage() {
+        let (_tmp, dir) = project();
+        let audio = spoken();
+        let (partial, lock) = stream(&dir, &abc(&dir), &audio[..samples(9.0)]);
+        let mut unsaved = UnsavedPassage {
+            input: abc(&dir),
+            samples: audio.clone(),
+            partial: Some(partial.clone()),
+            lock: Some(lock),
+            complete: false,
+        };
+        crate::takes::fail_wav_writes_after(Some(0));
+        assert!(save_passage(&dir, &mut unsaved).is_err());
+        crate::takes::fail_wav_writes_after(None);
+        // The disk fails once more after the audio is whole on disk:
+        // nothing is only in memory any more, and the audio is still held.
+        fail_commits_after_renames(Some(1));
+        assert!(save_passage(&dir, &mut unsaved).is_err());
+        fail_commits_after_renames(None);
+        assert!(!unsaved.audio_only_in_memory());
+        assert!(WavLock::acquire(&partial.wav).is_err(), "held");
+        assert_eq!(
+            repair(&dir).unwrap().passages_published,
+            Vec::<String>::new()
+        );
+        let passage = save_passage(&dir, &mut unsaved).unwrap();
+        assert_eq!(passage.id, partial.id);
+        assert_eq!(
+            read_take_wav(&dir.join(passage.file())).unwrap(),
+            (audio, RATE)
+        );
     }
 
     #[test]

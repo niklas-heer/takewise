@@ -69,7 +69,7 @@ pub use state::{LineState, State, TakeState, fold};
 pub use takes::{
     Judgment, PartialTake, PartialWav, PassageFailure, RecordedInput, RepairReport, TakeRef,
     WavLock, begin_take, choose_take, commit_take, finish_interrupted_commit, judge_take,
-    read_take_wav, repair, update_take_meta, write_take_wav,
+    read_take_wav, repair, rewrite_take_wav, update_take_meta, write_take_wav,
 };
 pub use timing::{
     Assembler, Dropout, GAP_TOLERANCE_S, RecordPlan, Timebase, TimebaseHistory, clamp_mark,
