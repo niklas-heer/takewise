@@ -450,8 +450,13 @@ fn within(position: i64, lo: usize, hi: usize) -> usize {
 /// For the boundary between line *k* and line *k+1*:
 ///
 /// 1. The search window runs from the midpoint of line *k*'s slot to the
-///    midpoint of line *k+1*'s, clamped to the captured range, so two
-///    boundaries never search the same audio.
+///    midpoint of line *k+1*'s, clamped to the captured range. A slot that
+///    runs past the next line's start (overlapping slots) counts only up
+///    to that start, so the windows follow each other in the lines' order,
+///    each around its own cue, and two boundaries never search the same
+///    audio. A window also begins after the cut before it; a boundary left
+///    without any audio that way (two lines starting on the same sample)
+///    ends the cutting, and the lines from there on get no piece.
 /// 2. Pauses are runs of 10 ms frames, inside the window, at or below the
 ///    energy detector's speech threshold, which comes from the noise floor
 ///    of the passage's pre-roll (its first `preroll_s` seconds).
@@ -459,8 +464,9 @@ fn within(position: i64, lo: usize, hi: usize) -> usize {
 ///    line *k*'s slot end to line *k+1*'s start), or else the cue (line
 ///    *k+1*'s start), if it lasts at least 150 ms; else the longest pause
 ///    of at least 150 ms within 1 s of the cue; else the nearest pause of
-///    at least 80 ms in the window; else the cue itself, marked
-///    `pause: false`.
+///    at least 80 ms in the window; else the cue itself (or the end of the
+///    window nearest to it), marked `pause: false`. Every cut lies in its
+///    own window, and `pause` says whether that very sample is in a pause.
 /// 4. A trailing piece without speech (the take was stopped right after a
 ///    line began) joins the piece before it, and its line gets no piece.
 pub fn cut(
@@ -483,27 +489,49 @@ pub fn cut(
     let rate = f64::from(sample_rate);
     let position = |film_s: f64| to_sample(film_s - first_sample_film_s, rate);
 
+    // The middle of line `k`'s slot, the slot ending at the next line's
+    // start at the latest.
+    let middle = |k: usize| {
+        let (line, next) = (lines.get(k)?, lines.get(k + 1));
+        let end = next.map_or(line.end, |next| line.end.min(next.start));
+        Some(position(f64::midpoint(line.start, end.max(line.start))))
+    };
     let mut cuts: Vec<Cut> = Vec::new();
     let mut previous = 0;
-    for pair in lines.windows(2) {
+    for (k, pair) in lines.windows(2).enumerate() {
         let [before, after] = pair else { break };
         let cue = position(after.start);
         if usize::try_from(cue).is_ok_and(|cue| cue >= len) {
             // The capture never reached this line.
             break;
         }
-        let lo = within(position(f64::midpoint(before.start, before.end)), 0, len);
-        let hi = within(position(f64::midpoint(after.start, after.end)), lo, len);
-        let (sample, pause) = choose_cut(&silent, frame, lo..hi, position(before.end), cue);
-        // Windows do not overlap, so this only matters for slots that do.
-        let sample = sample.max(previous + 1);
-        if sample >= len {
+        let (Some(from), Some(to)) = (middle(k), middle(k + 1)) else {
+            break;
+        };
+        // `previous < len`, so the window can begin after the cut before.
+        let lo = within(from, previous + 1, len);
+        let hi = within(to, 0, len);
+        if hi < lo {
+            // No audio is left for this boundary.
+            break;
+        }
+        let gap_from = position(before.end.min(after.start));
+        let (sample, pause) = choose_cut(&silent, frame, lo..hi, gap_from, cue);
+        let in_window = (lo..=hi).contains(&sample);
+        let in_pause = pause
+            .as_ref()
+            .is_none_or(|pause| lo <= pause.start && pause.end <= hi && pause.contains(&sample));
+        debug_assert!(
+            in_window && in_pause,
+            "cut {sample} of {lo}..{hi}, {pause:?}"
+        );
+        if !(in_window && in_pause) || sample >= len {
             break;
         }
         cuts.push(Cut {
             sample: sample as u64,
             cue_film_s: after.start,
-            pause,
+            pause: pause.is_some(),
         });
         previous = sample;
     }
@@ -548,16 +576,17 @@ fn pauses_in(silent: &[bool], frame: usize, window: &Range<usize>) -> Vec<Range<
     pauses
 }
 
-/// Where to cut inside `window`, and whether that is in a pause; `gap_from`
-/// and `cue` are the positions of the cue gap's start (the slot end of the
-/// line before) and of the cue (the start of the line after).
+/// Where to cut inside `window`, and the pause that sample is the middle
+/// of, when it is in one; `gap_from` and `cue` are the positions of the cue
+/// gap's start (the slot end of the line before) and of the cue (the start
+/// of the line after).
 fn choose_cut(
     silent: &[bool],
     frame: usize,
     window: Range<usize>,
     gap_from: i64,
     cue: i64,
-) -> (usize, bool) {
+) -> (usize, Option<Range<usize>>) {
     let pauses = pauses_in(silent, frame, &window);
     let signed = |sample: usize| i64::try_from(sample).unwrap_or(i64::MAX);
     let contains =
@@ -567,7 +596,8 @@ fn choose_cut(
             .max(cue - signed(pause.end))
             .max(0)
     };
-    let middle = |pause: &Range<usize>| (usize::midpoint(pause.start, pause.end), true);
+    let middle =
+        |pause: &Range<usize>| (usize::midpoint(pause.start, pause.end), Some(pause.clone()));
     let long = |pause: &&Range<usize>| pause.len() >= PAUSE_FRAMES * frame;
 
     let at_cue = pauses
@@ -593,7 +623,7 @@ fn choose_cut(
     if let Some(pause) = nearest {
         return middle(pause);
     }
-    (within(cue, window.start, window.end), false)
+    (within(cue, window.start, window.end), None)
 }
 
 /// What [`split`] did.
@@ -1360,6 +1390,145 @@ text = "Later."
                     passage.lines_without_piece().len(),
                     lines.len() - pieces.len()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_slots_are_cut_at_their_own_cues() {
+        // The first line's slot runs over the two after it.
+        let lines = vec![snap(10.0, 19.0), snap(12.0, 13.0), snap(13.2, 15.0)];
+        let audio = audio(9.0, &[(10.0, 11.8), (12.1, 12.9), (13.3, 14.9)]);
+        let cuts = cut_at_film(&audio, &lines);
+        assert_eq!(
+            cuts,
+            vec![
+                Cut {
+                    sample: at(11.95),
+                    cue_film_s: 12.0,
+                    pause: true
+                },
+                Cut {
+                    sample: at(13.1),
+                    cue_film_s: 13.2,
+                    pause: true
+                }
+            ]
+        );
+        // Read without a pause: each cut is its own cue, and says so.
+        let through = self::audio(9.0, &[(10.0, 14.9)]);
+        let cuts: Vec<_> = cut_at_film(&through, &lines)
+            .into_iter()
+            .map(|cut| (cut.sample, cut.pause))
+            .collect();
+        assert_eq!(cuts, vec![(at(12.0), false), (at(13.2), false)]);
+    }
+
+    /// A deterministic stream of numbers.
+    struct Random(u64);
+
+    impl Random {
+        /// The next number below `n`.
+        fn below(&mut self, n: u32) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            u32::try_from((self.0 >> 33) % u64::from(n)).unwrap()
+        }
+
+        fn between(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + f64::from(self.below(1 << 24)) / f64::from(1 << 24) * (hi - lo)
+        }
+    }
+
+    /// The search window of the cut before line `k + 1`, as the rule says:
+    /// from the middle of line `k`'s slot to the middle of line `k + 1`'s,
+    /// a slot counting up to the next line's start at the latest, within
+    /// the `len` captured samples.
+    fn window_of(lines: &[Snapshot], k: usize, len: usize) -> (usize, usize) {
+        let middle = |k: usize| {
+            let end = lines
+                .get(k + 1)
+                .map_or(lines[k].end, |next| lines[k].end.min(next.start));
+            let film_s = f64::midpoint(lines[k].start, end.max(lines[k].start));
+            samples((film_s - FIRST).max(0.0)).min(len)
+        };
+        (middle(k), middle(k + 1))
+    }
+
+    #[test]
+    fn every_cut_lies_in_its_own_window_whatever_the_slots() {
+        let frame = frame_len(RATE);
+        for seed in 0..200 {
+            let mut random = Random(seed);
+            // Two to six lines, each starting after the one before, some
+            // on the same instant; slots that end before the next line,
+            // run far over the following ones, or are empty.
+            let count = 2 + random.below(5);
+            let mut lines = Vec::new();
+            let mut start = FIRST + 3.0;
+            for _ in 0..count {
+                let end = match random.below(4) {
+                    0 => start + random.between(0.0, 0.3),
+                    1 => start + random.between(3.0, 12.0),
+                    2 => start - random.between(0.0, 1.0),
+                    _ => start + random.between(0.3, 3.0),
+                };
+                lines.push(snap(start, end));
+                start += match random.below(6) {
+                    0 => 0.0,
+                    1 => random.between(0.0, 0.000_05),
+                    _ => random.between(0.05, 3.0),
+                };
+            }
+            // Speech in bursts with pauses of every length between them.
+            let seconds = random.between(0.5, start - FIRST + 3.0);
+            let mut speech = Vec::new();
+            let mut from = FIRST + random.between(2.5, 3.5);
+            while from < FIRST + seconds {
+                let to = from + random.between(0.05, 2.5);
+                speech.push((from, to));
+                from = to + random.between(0.02, 0.6);
+            }
+            let audio = audio(seconds, &speech);
+            let cuts = cut(&audio, RATE, FIRST, &lines, 3.0).cuts;
+
+            let analysis = analyze(&audio, RATE, 3.0);
+            let silent = |index: usize| {
+                analysis
+                    .frames
+                    .levels_dbfs
+                    .get(index)
+                    .is_some_and(|&level| level <= analysis.frames.threshold_dbfs)
+            };
+            let context = format!("seed {seed}: {lines:?}, {seconds} s, {cuts:?}");
+            assert!(cuts.len() < lines.len(), "{context}");
+            let mut previous = 0;
+            for (k, cut) in cuts.iter().enumerate() {
+                let sample = usize::try_from(cut.sample).unwrap();
+                assert!(previous < sample && sample < audio.len(), "{context}");
+                assert!((cut.cue_film_s - lines[k + 1].start).abs() < 1e-12);
+                let (lo, hi) = window_of(&lines, k, audio.len());
+                assert!(lo <= sample && sample <= hi, "cut {k}, {context}");
+                // The silent frames around the cut, inside its window.
+                let lo = lo.max(previous + 1);
+                let mut pause = sample / frame..sample / frame;
+                while pause.start > 0 && (pause.start - 1) * frame >= lo && silent(pause.start - 1)
+                {
+                    pause.start -= 1;
+                }
+                while (pause.end + 1) * frame <= hi && silent(pause.end) {
+                    pause.end += 1;
+                }
+                if cut.pause {
+                    assert!(pause.len() >= SHORT_PAUSE_FRAMES, "cut {k}, {context}");
+                } else {
+                    let cue = samples((lines[k + 1].start - FIRST).max(0.0));
+                    let nearest = cue.clamp(lo, hi);
+                    assert_eq!(sample, nearest, "cut {k}, {context}");
+                }
+                previous = sample;
             }
         }
     }
