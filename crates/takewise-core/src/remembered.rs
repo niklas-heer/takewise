@@ -205,7 +205,11 @@ pub enum LatencySync {
 ///    exactly `route` is remembered, that one is copied into
 ///    `[input] latency_offset_ms` and `[calibration]` with
 ///    `from = "remembered"`. A project's own fitting measurement always
-///    wins, and an incomplete route matches nothing.
+///    wins, and an incomplete route matches nothing;
+/// 3. a calibration that was itself copied does not fit once a newer
+///    measurement is remembered for the route (a later day, or another
+///    offset from the same day): the newer one is copied in its place, so
+///    measuring again in one project reaches the others.
 pub fn sync_latency(
     path: &Path,
     dir: &Path,
@@ -229,12 +233,29 @@ pub fn sync_latency(
         Ok(remembered.latency.iter().find(|k| k.fits(route)).cloned())
     })?;
     match found {
-        Some(remembered) if !fits => {
+        Some(remembered) if !fits || superseded(config, &remembered) => {
             set_calibration(dir, remembered.latency_offset_ms, &remembered.calibration())?;
             Ok(LatencySync::Applied(remembered))
         }
         _ => Ok(LatencySync::Unchanged),
     }
+}
+
+/// Whether the project's calibration is a copy that `remembered`, the
+/// measurement now remembered for its route, replaces: one from a later
+/// day, or from the same day with another offset. A measurement made in
+/// the project itself is never superseded.
+fn superseded(config: &ProjectConfig, remembered: &RememberedLatency) -> bool {
+    let Some(cal) = config
+        .calibration
+        .as_ref()
+        .filter(|cal| cal.is_remembered())
+    else {
+        return false;
+    };
+    let copy = (cal.date.as_str(), config.input.latency_offset_ms);
+    let now = (remembered.date.as_str(), remembered.latency_offset_ms);
+    remembered.date.as_str() >= cal.date.as_str() && copy != now
 }
 
 /// What the window and `status` say about a latency offset copied from an
@@ -513,6 +534,49 @@ mod tests {
         // Known again: in use again.
         assert_eq!(offset(&route(512)), (-29, false));
         assert!(latency_note(&config, &route(512)).is_some());
+    }
+
+    #[test]
+    fn a_copied_offset_follows_a_newer_measurement() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        remember_latency(&home.remembered, -29, &measured("2026-11-23")).unwrap();
+        let dir = project(&tmp, "new.takewise");
+        let sync = |dir: &Path| {
+            let config = read_config(dir).unwrap();
+            sync_latency(&home.remembered, dir, &config, &route(512)).unwrap()
+        };
+        assert!(matches!(sync(&dir), LatencySync::Applied(_)));
+        assert_eq!(sync(&dir), LatencySync::Unchanged);
+
+        // Measured again in another project the next day: the copy follows.
+        remember_latency(&home.remembered, -31, &measured("2026-11-24")).unwrap();
+        let synced = sync(&dir);
+        assert!(matches!(synced, LatencySync::Applied(ref l) if l.latency_offset_ms == -31));
+        let config = read_config(&dir).unwrap();
+        assert_eq!(config.input.latency_offset_ms, -31);
+        let cal = config.calibration.unwrap();
+        assert!(cal.is_remembered());
+        assert_eq!(cal.date, "2026-11-24");
+        assert_eq!(sync(&dir), LatencySync::Unchanged);
+
+        // And again the same day (Bluetooth headphones reconnected).
+        remember_latency(&home.remembered, -34, &measured("2026-11-24")).unwrap();
+        assert!(matches!(sync(&dir), LatencySync::Applied(_)));
+        assert_eq!(read_config(&dir).unwrap().input.latency_offset_ms, -34);
+
+        // An older measurement (the store was rebuilt from an old project)
+        // does not replace the newer copy.
+        std::fs::remove_file(&home.remembered).unwrap();
+        remember_latency(&home.remembered, -20, &measured("2026-11-20")).unwrap();
+        assert_eq!(sync(&dir), LatencySync::Unchanged);
+        assert_eq!(read_config(&dir).unwrap().input.latency_offset_ms, -34);
+
+        // A project's own measurement is never replaced by a newer one.
+        let own = project(&tmp, "own.takewise");
+        set_calibration(&own, -12, &measured("2026-11-19")).unwrap();
+        assert_eq!(sync(&own), LatencySync::Unchanged);
+        assert_eq!(read_config(&own).unwrap().input.latency_offset_ms, -12);
     }
 
     #[test]
