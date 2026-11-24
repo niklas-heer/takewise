@@ -53,6 +53,10 @@ const END_TOLERANCE_S: f64 = 0.25;
 const FILM_START_TIMEOUT_S: f64 = 1.0;
 /// A film shift larger than this after the take started is recorded.
 const FILM_SHIFT_TOLERANCE_MS: f64 = 5.0;
+/// How long, in film time, the prompter keeps the line just read in view
+/// after a passage take moved on to the next line, so a reader running a
+/// little late can finish it.
+pub const PASSED_S: f64 = 1.5;
 /// A passage's sidecar is rewritten when its first sample's film time moved
 /// by more than this (the film started late, so the take follows it).
 const SIDECAR_TOLERANCE_S: f64 = 0.0005;
@@ -398,6 +402,19 @@ impl Recorder {
     /// Whether a passage take is being recorded.
     pub fn is_recording_passage(&self) -> bool {
         matches!(&self.phase, Phase::Recording(take) if take.passage.is_some())
+    }
+
+    /// During a passage take, the text of the line read before the one
+    /// being read, for [`PASSED_S`] of film after the film reached the
+    /// line being read.
+    pub fn passed_line(&self, media: &dyn Media) -> Option<&str> {
+        let Phase::Recording(take) = &self.phase else {
+            return None;
+        };
+        let passage = take.passage.as_ref()?;
+        let before = passage.input.lines.get(passage.reading.checked_sub(1)?)?;
+        let since = take.clock.film_at(media.host_now_s())? - passage.line()?.snapshot.start;
+        (since < PASSED_S).then_some(before.snapshot.text.as_str())
     }
 
     /// Which line of a passage take is being read (from 0), and that

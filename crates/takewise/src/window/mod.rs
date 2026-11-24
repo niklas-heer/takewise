@@ -690,6 +690,18 @@ impl RecordingWindow {
         )
     }
 
+    /// The row above the prompter's current line for the line just read:
+    /// kept during a passage take, holding that line for a moment after
+    /// the switch.
+    fn prompter_passed(&self) -> prompter::Passed<'_> {
+        if !self.recorder.is_recording_passage() {
+            return prompter::Passed::Off;
+        }
+        self.recorder
+            .passed_line(&*self.media)
+            .map_or(prompter::Passed::Empty, prompter::Passed::Line)
+    }
+
     #[cfg(test)]
     fn prompter_text(&self) -> Option<&str> {
         self.prompter_line().map(|reading| reading.text)
@@ -1470,6 +1482,7 @@ impl Render for RecordingWindow {
             reading: self.prompter_line(),
             note,
             next,
+            passed: self.prompter_passed(),
             level_dbfs: level,
             hold_dbfs: hold,
             near_clip: self.peak_meter.near_clip(),

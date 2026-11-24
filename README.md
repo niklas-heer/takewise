@@ -127,7 +127,7 @@ The window shows the film, the line to read, its note for the narrator and the n
 
 Read one line at a time, each sentence gets its own count-in and loses the intonation that joins it to the next. So lines that follow each other closely form a *passage*, and you can read a passage in one go.
 
-- **Shift+Space** records from the current line through the end of its passage: one take, one count-in. The prompter moves to each line when the film reaches its start, and the take stops by itself 1.5 s after the last line's slot, or when you press Space.
+- **Shift+Space** records from the current line through the end of its passage: one take, one count-in. The prompter moves to each line when the film reaches its start, keeping the line you just read dimmed above it for a moment in case you run late, and the take stops by itself 1.5 s after the last line's slot, or when you press Space.
 - The recording is kept whole and cut, in the pauses between the sentences, into one take per line. Each of those is checked, chosen and replaced like any other take, so you can still pick up a single line with Space.
 - **Shift+P** plays the passage against the film from the selected take's line to the passage's end (from its first line, the whole passage), so you hear the flow. **Shift+Enter** chooses the passage for every line it has a take of.
 - The export keeps chosen takes of one passage together, as you read them: the breaths and pauses between the sentences stay, and only the passage's outer edges are trimmed. A line you picked up on its own is spliced in as any take is.

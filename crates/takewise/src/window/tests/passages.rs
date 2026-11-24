@@ -4,6 +4,7 @@
 //! host 100.4, so its first sample (host 100.0) lies at film 0.6.
 
 use super::*;
+use crate::window::prompter::Passed;
 
 /// Three sentences close together (one passage), a pause for the picture,
 /// then two more.
@@ -334,6 +335,69 @@ fn the_prompter_follows_the_passage_and_starts_each_line_at_the_top(cx: &mut Tes
     press(cx, f.window, &["space"]);
     assert!(!recording(cx, &f));
     cut(cx, &f);
+}
+
+#[gpui_kit::test]
+fn the_prompter_keeps_the_line_just_read_in_view_for_a_moment(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    read_from_a(cx, &f, "shift-space", 0.7);
+    // The prompter's text, the line kept above it, and how far the pace
+    // guide filled the text.
+    let shown = |cx: &mut TestAppContext, film_s: f64| {
+        at_film(cx, &f, film_s);
+        f.view.read_with(cx, |view, _| {
+            let reading = view.prompter_line().expect("a line");
+            (
+                reading.text.to_owned(),
+                match view.prompter_passed() {
+                    Passed::Off => None,
+                    Passed::Empty => Some(String::new()),
+                    Passed::Line(text) => Some(text.to_owned()),
+                },
+                super::super::prompter::filled_bytes(reading, film_s),
+            )
+        })
+    };
+    let first = Some("First sentence.".to_owned());
+    let empty = Some(String::new());
+    // While a is read, its row above is kept, empty.
+    let (text, passed, _) = shown(cx, 4.0);
+    assert_eq!((text.as_str(), passed), ("First sentence.", empty.clone()));
+    // At b's cue b is current, its pace guide filling from the cue, and a
+    // stays above it, for 1.5 s of film.
+    let (text, passed, filled) = shown(cx, 5.41);
+    assert_eq!(
+        (text.as_str(), passed.clone(), filled),
+        ("Second sentence.", first.clone(), 0)
+    );
+    let (text, passed, filled) = shown(cx, 6.85);
+    assert_eq!((text.as_str(), passed), ("Second sentence.", first));
+    assert!(filled > 0, "{filled}");
+    let (_, passed, _) = shown(cx, 6.95);
+    assert_eq!(passed, empty, "the row stays, empty");
+    // c follows b the same way.
+    let (text, passed, _) = shown(cx, 7.85);
+    assert_eq!(
+        (text.as_str(), passed),
+        ("Third sentence.", Some("Second sentence.".to_owned()))
+    );
+    press(cx, f.window, &["space"]);
+    cut(cx, &f);
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.prompter_passed() == Passed::Off)
+    );
+
+    // A take of one line has no such row.
+    press(cx, f.window, &["down"]); // d
+    begin(cx, &f, 300.0);
+    assert!(recording(cx, &f));
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.prompter_passed() == Passed::Off)
+    );
+    f.media.set_now(300.5);
+    press(cx, f.window, &["space"]);
 }
 
 #[gpui_kit::test]
