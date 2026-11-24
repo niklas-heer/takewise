@@ -1037,10 +1037,14 @@ impl Recorder {
         Ok(())
     }
 
-    /// Plays the passage a take was cut from, whole and in context: the
-    /// passage file locked to the film from its own first sample (holding
-    /// the film's first frame when that lies before the film), to the
-    /// passage's end. Starts once the file has loaded.
+    /// Plays the passage a take was cut from in context, from that take's
+    /// line to the passage's end: the passage file locked to the film. From
+    /// the passage's first piece, the film starts at the passage's first
+    /// sample (holding the film's first frame when that lies before the
+    /// film); from a later piece, it starts one pre-roll before that
+    /// piece's line as recorded (or before the piece, when it begins
+    /// earlier), and the passage plays from the sample the film starts at.
+    /// Starts once the file has loaded.
     pub fn start_passage_playback(
         &mut self,
         media: &mut dyn Media,
@@ -1062,12 +1066,27 @@ impl Recorder {
         if !path.is_file() {
             return Err(format!("The passage's file {file} is missing."));
         }
+        let rate = f64::from(passage.input.sample_rate.max(1));
+        let line = passage
+            .input
+            .lines
+            .get(piece.index as usize)
+            .filter(|_| !piece.is_first());
+        let (film_from_s, hold_s) = match line {
+            None => (first_film_s.max(0.0), (-first_film_s).max(0.0)),
+            Some(line) => {
+                let piece_film_s = first_film_s + piece.from_sample as f64 / rate;
+                let from = line.snapshot.start.min(piece_film_s);
+                let plan = plan_take(from, from, project.config.record.preroll_s, 0.0);
+                (plan.film_from_s, plan.hold_first_frame_s)
+            }
+        };
         self.end_warmup(media);
         media.open_take(&path)?;
-        let length_s = samples as f64 / f64::from(passage.input.sample_rate.max(1));
+        let length_s = samples as f64 / rate;
         self.phase = Phase::Playing(Playback {
-            film_from_s: first_film_s.max(0.0),
-            hold_s: (-first_film_s).max(0.0),
+            film_from_s,
+            hold_s,
             stop_film_s: first_film_s + length_s,
             take_first_film_s: first_film_s,
             film_gain_db: project.config.record.film_gain_db,

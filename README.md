@@ -129,7 +129,7 @@ Read one line at a time, each sentence gets its own count-in and loses the inton
 
 - **Shift+Space** records from the current line through the end of its passage: one take, one count-in. The prompter moves to each line when the film reaches its start, and the take stops by itself 1.5 s after the last line's slot, or when you press Space.
 - The recording is kept whole and cut, in the pauses between the sentences, into one take per line. Each of those is checked, chosen and replaced like any other take, so you can still pick up a single line with Space.
-- **Shift+P** plays the whole passage against the film, so you hear the flow. **Shift+Enter** chooses the passage for every line it has a take of.
+- **Shift+P** plays the passage against the film from the selected take's line to the passage's end (from its first line, the whole passage), so you hear the flow. **Shift+Enter** chooses the passage for every line it has a take of.
 - The export keeps chosen takes of one passage together, as you read them: the breaths and pauses between the sentences stay, and only the passage's outer edges are trimmed. A line you picked up on its own is spliced in as any take is.
 
 Which lines belong together is a rule, not a setting per line: a line joins the one before it when it starts less than `[record] passage_gap_s` (1.0 s) after that line's slot ends. Sentences a few tenths of a second apart are grouped, and a deliberate pause for the picture or the music ends the passage. The line list shows each passage with a thin bar beside its lines.
@@ -219,7 +219,7 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 | Shift+Enter | Choose the selected take's passage for every line it has a take of |
 | R | Record another take of the current line |
 | P | Play the line in context, the selected take locked to the film (needs a take) |
-| Shift+P | Play the selected take's whole passage, locked to the film |
+| Shift+P | Play the selected take's passage locked to the film, from that take's line to the passage's end |
 | M | Set the line's start to the playhead while the film plays (during a take of one line, or P) |
 | E | Edit the line's text (Enter saves, Esc cancels) |
 | ↑ / ↓ | Previous or next line |

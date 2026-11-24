@@ -470,6 +470,39 @@ fn shift_p_plays_the_whole_passage_locked_to_the_film(cx: &mut TestAppContext) {
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
     press(cx, f.window, &["shift-p"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+
+    // From b's take, the film starts one pre-roll before b's piece, which
+    // begins in the pause before b's start, and the passage file plays
+    // from the sample the film starts at; both at host 300.3, to the
+    // passage's end (film 11.3).
+    let b_first = 5.4 + recorded(&f.dir)[1].2.line_offset_s;
+    assert!(b_first < 5.4, "{b_first}");
+    let from = b_first - 2.0;
+    press(cx, f.window, &["down"]);
+    f.media.set_now(300.0);
+    press(cx, f.window, &["shift-p"]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().opened_takes.last(), Some(&wav));
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, from) && close(host_s, 300.3),
+        "{film_s} {host_s}"
+    );
+    let (from_s, at_host_s) = *f.media.0.borrow().take_plays.last().expect("a play");
+    assert!(
+        close(from_s, from - FIRST_FILM_S) && close(at_host_s, 300.3),
+        "{from_s} {at_host_s}"
+    );
+    let end_host = 300.3 + 11.3 - from;
+    for (now, playing) in [(end_host - 0.1, true), (end_host + 0.1, false)] {
+        f.media.set_now(now);
+        frame(cx, f.window);
+        assert_eq!(
+            f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+            playing,
+            "at host {now}"
+        );
+    }
 }
 
 #[gpui_kit::test]
