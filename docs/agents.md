@@ -69,7 +69,7 @@ Each line's `passage` names the passage it belongs to, by the id of the passage'
 }
 ```
 
-`problems` block an export; `notices` inform. One notice to act on with the narrator is `rescued-audio`: the window could not save a take or passage into the project (its disk was full or gone) and kept the audio in the folder the message names, with the steps to bring it back ([reference](reference.md#rescued-audio)).
+`problems` block an export; `notices` inform. One notice to act on with the narrator is `rescued-audio`: the window could not save a take or passage into the project (its disk was full or gone) and kept the audio in the folder the message names, with the steps to bring it back ([reference](reference.md#rescued-audio)). One folder can hold several recordings: restore all of them before the folder is deleted, and never delete a WAV the message lists as having no JSON file without the narrator.
 
 ## 3. The narrator records
 

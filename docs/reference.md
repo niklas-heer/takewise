@@ -75,27 +75,43 @@ A take or passage that cannot be saved into its project stays in memory while th
   002-passage.json
 ```
 
+`<line>` is the line's id; an id longer than 80 bytes is cut to its beginning and eight hex digits of a hash, and the JSON file's `lines` has it whole (a project folder name longer than 200 bytes is cut the same way, and `project` has the whole path). A name is used once: a copy never replaces a file that is in the folder, and a folder holds everything one window could not save, which can be several takes and passages.
+
 (`rescue/` lies beside the settings file, so beside the file `TAKEWISE_SETTINGS` names when that is set.)
 
 This happens in two cases, and only for audio that is not whole on the project's disk either:
 
 - You close the window, or quit with ⌘Q, a second time while saving still fails. The first time the window refuses and names the folder; the second time it writes the copy, syncs it and closes. If the copy cannot be written either, the window stays open and keeps the audio.
-- The app is quit from outside (the Dock's Quit, a logout, a shutdown). macOS tells the app only once that is underway, so the window cannot refuse: it tries once more to save, then writes the copy.
+- The app is quit from outside (the Dock's Quit, a logout, a shutdown). macOS tells the app only once that is underway, so the window cannot refuse: it tries once more to save, then writes the copy. If the copy cannot be written either, because the project's disk and the disk of the rescue folder are both full or gone, the audio that was only in memory is lost: nothing can hold a quit from outside. Closing the window or ⌘Q refuses instead and keeps the audio. So when the window says a take is only in memory, free disk space first, and do not quit from the Dock, log out or shut down until it is saved.
 
 The window prints where the copy is, the next window opened on the project says so, and `takewise status` lists it as a `rescued-audio` notice until the folder is removed. Nothing removes a rescue copy or brings it back on its own. A rescue copy is the whole recording; if the project also adopts a shorter take of the same reading after a crash (marked `recovered`, from what had reached its disk), the rescue copy is the complete one.
 
-To bring a copy back once the project can be written again, put its two files where a take that a crash interrupted would lie, and let a repair adopt them. Each JSON file names both places in `restore`, relative to the project folder, and carries the file to write as `sidecar`:
+To bring the audio back once the project can be written again, put each copy's two files where a take that a crash interrupted would lie, and let a repair adopt them. One folder can hold several recordings, so go through all of it. First see what it holds:
+
+```sh
+rescue="$HOME/Library/Application Support/Takewise/rescue/<folder>"
+ls "$rescue"
+jq -r '"\(.audio): \(.kind) of \(.lines | join(", ")), for \(.project)"' "$rescue"/*.json
+```
+
+Each JSON file names both places in `restore`, relative to the project folder, and carries the file to write as `sidecar`. Restore every recording in the folder, then run one repair:
 
 ```sh
 cd "<project>.takewise"
-rescue="$HOME/Library/Application Support/Takewise/rescue/<folder>"
-mkdir -p "$(dirname "$(jq -r .restore.audio "$rescue/001-take-hook.json")")"
-cp "$rescue/001-take-hook.wav" "$(jq -r .restore.audio "$rescue/001-take-hook.json")"
-jq .sidecar "$rescue/001-take-hook.json" > "$(jq -r .restore.sidecar "$rescue/001-take-hook.json")"
+for json in "$rescue"/*.json; do
+  audio="$(jq -r .restore.audio "$json")"
+  mkdir -p "$(dirname "$audio")"
+  cp "$rescue/$(jq -r .audio "$json")" "$audio"
+  jq .sidecar "$json" > "$(jq -r .restore.sidecar "$json")"
+done
 takewise status --repair .
 ```
 
-The repair numbers a take as the line's next one, or publishes a passage and cuts it into its takes, marked `recovered`. Do this with the window closed, or let the window do the repair when it opens. Then check the take is there (`takewise status`) and delete the rescue folder. The JSON file's other fields say what the copy is: `kind` (`take` or `passage`), `project` (the folder it was recorded for), `rescued_at`, `audio`, `sample_rate`, `samples` and `lines`; inside `sidecar` are the line's `snapshot` (the text read and its slot) and the take's `line_offset_s`, or for a passage its `lines` with their snapshots and `first_sample_film_s`, which place the audio in the film.
+The repair numbers each take as its line's next one, and publishes each passage and cuts it into its takes, all marked `recovered`. Do this with the window closed, or let the window do the repair when it opens. Then check that every recording is back: `takewise status` shows a new take on the line of each rescued take, and on every line a rescued passage reached. Only then delete the rescue folder, which removes all its recordings at once; until it is gone, `status` keeps listing it.
+
+A WAV in the folder with no JSON file of the same name is audio whose JSON file could not be written (the disk failed between the two). The window says so as it goes, and `status` names such files in the folder's notice. Nothing says where that audio belongs in the project, so a repair cannot adopt it: listen to it, and keep it somewhere else if you need it, before you delete the folder.
+
+The JSON file's other fields say what the copy is: `kind` (`take` or `passage`), `project` (the folder it was recorded for), `rescued_at`, `audio`, `sample_rate`, `samples` and `lines`; inside `sidecar` are the line's `snapshot` (the text read and its slot) and the take's `line_offset_s`, or for a passage its `lines` with their snapshots and `first_sample_film_s`, which place the audio in the film.
 
 ## Sound: the audio panel and meters
 
