@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::edit::{set_calibration_when, set_setup};
 use crate::error::{Error, Result, io};
-use crate::fsutil::write_atomic;
+use crate::fsutil::{sync_dir, sync_parent, write_atomic};
 use crate::project::{CalibrationInfo, ProjectConfig, REMEMBERED, SetupInfo};
 use crate::room::{RoomTone, copy_room_tone, import_room_tone};
 use crate::route::{Route, calibration_stale, settings_path};
@@ -150,8 +150,8 @@ thread_local! {
 /// [`update`], then `then` with what is now on disk and its folder, still
 /// under the lock: for what may only happen once the file is committed,
 /// such as removing the files it no longer refers to. When the file cannot
-/// be written, `then` does not run, and everything the file on disk refers
-/// to is still there.
+/// be written, or its folder not synced after it, `then` does not run, and
+/// everything the file on disk refers to is still there.
 fn update_then<T>(
     path: &Path,
     change: impl FnOnce(&mut Remembered, &Path) -> Result<T>,
@@ -189,6 +189,10 @@ fn update_then<T>(
             return Err(io(path)(failed));
         }
         write_atomic(path, &text)?;
+        // The rename is durable before anything it replaced is removed: a
+        // power loss could otherwise bring back the old file, naming
+        // files `then` had already deleted.
+        sync_parent(path)?;
     }
     then(&remembered, dir);
     Ok(out)
@@ -314,7 +318,10 @@ pub fn latency_note(config: &ProjectConfig, route: &Route) -> Option<String> {
 /// of the room tone in `rooms/`. Results and room tones from days before
 /// `today` (the local day) are pruned: the room tones only after
 /// `remembered.json` is committed without them, so a failed write leaves
-/// every room tone the file on disk still names.
+/// every room tone the file on disk still names. Committed means durable:
+/// the new room tone and its folder are synced before the file names it,
+/// and the file's folder is synced before an older room tone is removed,
+/// so no power loss leaves a `remembered.json` whose room tone is gone.
 pub fn remember_setup(
     path: &Path,
     dir: &Path,
@@ -327,7 +334,15 @@ pub fn remember_setup(
         path,
         |remembered, home| {
             let rooms = home.join(ROOMS_DIR);
+            let new_folder = !rooms.is_dir();
             let copy = copy_room_tone(&dir.join(&tone.file), tone, &rooms, ROOMS_DIR)?;
+            // The copy is on disk under its names before the store names
+            // it: its files are synced as they are written, their folder
+            // here (and a folder made just now, in its own).
+            sync_dir(&rooms)?;
+            if new_folder {
+                sync_dir(home)?;
+            }
             remembered.setup.retain(|known| {
                 known.setup.date == today && !known.on(&info.input, info.channel, &info.output)
             });
@@ -957,6 +972,61 @@ mod tests {
         remember_setup(&home.remembered, &dir, &info, &tone, today).unwrap();
         assert!(!old.exists());
         assert_eq!(fs::read_dir(&rooms).unwrap().count(), 2, "WAV and sidecar");
+    }
+
+    #[test]
+    fn room_tones_are_pruned_only_once_the_new_state_is_durable() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = project(&tmp, "p.takewise");
+        let rooms = home.remembered.with_file_name(ROOMS_DIR);
+        let store_dir = home.remembered.parent().unwrap().to_path_buf();
+        // The first check makes the folder of the room tones, which is
+        // synced into its own folder too.
+        crate::fsutil::dir_syncs::start();
+        setup_check(&home, &dir, "2026-11-23T09:00:00Z", -60.0);
+        let synced = crate::fsutil::dir_syncs::take();
+        assert_eq!(
+            synced,
+            [rooms.clone(), store_dir.clone(), store_dir.clone()]
+        );
+        let old = rooms.join("20261123T090000Z.wav");
+
+        // The next day's check: the new room tone and its folder are
+        // synced before the store names it, and the store's folder before
+        // the room tone it named until then is removed.
+        crate::fsutil::dir_syncs::start();
+        setup_check(&home, &dir, "2026-11-24T09:00:00Z", -61.0);
+        let synced = crate::fsutil::dir_syncs::take();
+        assert_eq!(synced, [rooms.clone(), store_dir.clone()]);
+        assert!(!old.exists(), "pruned");
+
+        // A store folder that cannot be synced: the store's rename may
+        // not survive a power loss, so nothing is pruned.
+        let kept = rooms.join("20261124T090000Z.wav");
+        let at: jiff::Timestamp = "2026-11-24T10:00:00Z".parse().unwrap();
+        let input = RoomInput {
+            input: DUO,
+            channel: 1,
+            output: XM5,
+            floor_dbfs: -62.0,
+            gated: false,
+        };
+        let tone = save_room_tone(&dir, &[5, -5, 4], 48_000, at, &input).unwrap();
+        let info = read_config(&dir).unwrap().setup.unwrap();
+        crate::fsutil::dir_syncs::fail(Some(store_dir));
+        let failed = remember_setup(&home.remembered, &dir, &info, &tone, day("2026-11-24"));
+        crate::fsutil::dir_syncs::fail(None);
+        assert!(failed.is_err());
+        assert!(kept.is_file(), "the room tone the old store names");
+        assert!(rooms.join("20261124T100000Z.wav").is_file(), "the new one");
+        // A room tone whose folder cannot be synced is not published.
+        let before = fs::read(&home.remembered).unwrap();
+        crate::fsutil::dir_syncs::fail(Some(rooms.clone()));
+        let failed = remember_setup(&home.remembered, &dir, &info, &tone, day("2026-11-24"));
+        crate::fsutil::dir_syncs::fail(None);
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&home.remembered).unwrap(), before);
     }
 
     #[test]

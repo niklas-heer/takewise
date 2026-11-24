@@ -141,9 +141,59 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
+    sync_dir(dir)
+}
+
+/// Fsyncs the directory `dir`, so the files created in it and renamed
+/// into it survive a power loss under their names.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    dir_syncs::note(dir).map_err(io(dir))?;
     File::open(dir)
         .and_then(|dir| dir.sync_all())
         .map_err(io(dir))
+}
+
+/// What a test sees of [`sync_dir`], and makes of it: which directories
+/// were synced, in order, and one that cannot be.
+#[cfg(test)]
+pub(crate) mod dir_syncs {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SYNCED: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+        static FAILS: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording the directories this thread syncs.
+    pub(crate) fn start() {
+        SYNCED.set(Some(Vec::new()));
+    }
+
+    /// The directories synced since [`start`]; stops recording.
+    pub(crate) fn take() -> Vec<PathBuf> {
+        SYNCED.take().unwrap_or_default()
+    }
+
+    /// Makes syncing `dir` fail on this thread until `None` is given.
+    pub(crate) fn fail(dir: Option<PathBuf>) {
+        FAILS.set(dir);
+    }
+
+    pub(super) fn note(dir: &Path) -> std::io::Result<()> {
+        if FAILS.with_borrow(|fails| fails.as_deref() == Some(dir)) {
+            return Err(std::io::Error::other(
+                "the folder could not be synced (test)",
+            ));
+        }
+        SYNCED.with_borrow_mut(|synced| {
+            if let Some(synced) = synced {
+                synced.push(dir.to_path_buf());
+            }
+        });
+        Ok(())
+    }
 }
 
 /// Renames a temp file from `write_temp` over `path`, removing it on failure.
