@@ -625,6 +625,10 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
         };
         state.notices.push(Problem::new(None, code, warning));
     }
+    // Audio a window could not save into this project, kept elsewhere.
+    if let Some(root) = tw::rescue::rescue_root() {
+        state.notices.extend(tw::rescue::notices(&root, dir));
+    }
 
     let data = StatusData {
         script_version: script_version.to_string(),

@@ -262,6 +262,25 @@ fn sidecar(partial: &PartialPassage, input: &PassageInput) -> Passage {
     }
 }
 
+/// What [`begin_passage`] writes beside the partial audio of the passage
+/// `id`, as JSON, for a copy of the passage kept elsewhere (see
+/// [`crate::rescue`]); `path` is the file an error names.
+pub(crate) fn partial_sidecar_json(
+    path: &Path,
+    id: &str,
+    input: &PassageInput,
+) -> Result<serde_json::Value> {
+    let partial = PartialPassage {
+        id: id.to_owned(),
+        meta: PathBuf::from(format!(".{id}.json.partial")),
+        wav: PathBuf::from(format!(".{id}.wav.partial")),
+    };
+    serde_json::to_value(sidecar(&partial, input)).map_err(|err| Error::Parse {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })
+}
+
 fn to_json(path: &Path, passage: &Passage) -> Result<Vec<u8>> {
     serde_json::to_vec_pretty(passage).map_err(|err| Error::Parse {
         path: path.to_path_buf(),

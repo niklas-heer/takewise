@@ -488,6 +488,78 @@ fn status_warns_about_stale_calibration_and_missing_setup() {
 }
 
 #[test]
+fn status_says_when_the_project_has_rescued_audio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    // The rescue folder lies beside the settings file.
+    let settings = tmp.path().join("Takewise/settings.toml");
+    let root = takewise_core::rescue::beside(&settings);
+    let (_, before) = json(
+        takewise()
+            .env("TAKEWISE_SETTINGS", &settings)
+            .arg("status")
+            .arg(&dir),
+    );
+    assert!(!before.to_string().contains("rescued-audio"), "{before}");
+
+    let at = "2026-11-24T10:15:30Z".parse().unwrap();
+    let mut rescue = takewise_core::rescue::Rescue::create(&root, &dir, at).unwrap();
+    let input = RecordedInput {
+        sample_rate: RATE,
+        device: "Test Mic".to_owned(),
+        channel: 1,
+        line_offset_s: -2.0,
+        snapshot: Project::open(&dir).unwrap().snapshot("hook").unwrap(),
+        dropouts: None,
+        film_shift_ms: None,
+        passage: None,
+    };
+    let wav = rescue.add_take("hook", &input, &vec![0; 4800]).unwrap();
+    let folder = rescue.finish().unwrap();
+    let (code, status) = json(
+        takewise()
+            .env("TAKEWISE_SETTINGS", &settings)
+            .arg("status")
+            .arg(&dir),
+    );
+    assert_eq!(code, 0, "{status}");
+    let notices = status["data"]["notices"].as_array().unwrap();
+    let rescued: Vec<&Value> = notices
+        .iter()
+        .filter(|notice| notice["code"] == "rescued-audio")
+        .collect();
+    assert_eq!(rescued.len(), 1, "{status}");
+    let message = rescued[0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "1 take (hook) could not be saved into this project on 2026-11-24 and is kept in "
+        ),
+        "{message}"
+    );
+    assert!(message.contains(&folder.display().to_string()), "{message}");
+    assert!(wav.is_file());
+    // A notice, not a problem: `--strict` does not count it, and other
+    // projects do not see it.
+    takewise()
+        .env("TAKEWISE_SETTINGS", &settings)
+        .arg("status")
+        .arg(&dir)
+        .assert()
+        .stdout(predicate::str::contains("rescued-audio"));
+    let other = tmp.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    let other = init(&other);
+    let (_, status) = json(
+        takewise()
+            .env("TAKEWISE_SETTINGS", &settings)
+            .arg("status")
+            .arg(&other),
+    );
+    assert!(!status.to_string().contains("rescued-audio"), "{status}");
+}
+
+#[test]
 fn init_starts_with_the_saved_devices() {
     let tmp = tempfile::tempdir().unwrap();
     let settings = tmp.path().join("settings.toml");

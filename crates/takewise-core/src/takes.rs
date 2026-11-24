@@ -138,6 +138,24 @@ pub(crate) fn write_partial_meta(partial: &PartialTake, input: &RecordedInput) -
     write_synced(&partial.meta, &json)
 }
 
+/// What [`begin_take`] writes beside the partial audio named `wav_name`,
+/// as JSON, for a copy of the take kept elsewhere (see [`crate::rescue`]);
+/// `path` is the file an error names.
+pub(crate) fn partial_meta_json(
+    path: &Path,
+    input: &RecordedInput,
+    wav_name: &str,
+) -> Result<serde_json::Value> {
+    let take_meta = TakeMeta {
+        input: input.clone(),
+        partial_wav: Some(wav_name.to_owned()),
+    };
+    serde_json::to_value(&take_meta).map_err(|err| Error::Parse {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })
+}
+
 pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let mut file = fs::File::create(path).map_err(io(path))?;
