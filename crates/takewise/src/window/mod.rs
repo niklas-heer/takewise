@@ -83,6 +83,7 @@ gpui_kit::actions!(
         MonitorQuieter,
         MonitorLouder,
         ToggleSetup,
+        MeasureLatency,
         SetupListen,
         SetupNext,
         CloseSetup,
@@ -100,10 +101,10 @@ const EDITING: &str = "RecorderEditing";
 /// The key context while the setup check is open: Space and Enter drive it.
 const SETUP: &str = "RecorderSetup";
 /// The keys, along the window's bottom edge.
-const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · ,/. monitor · K clear clip";
+const KEY_HINTS: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · L latency · −/+ film · ,/. monitor · K clear clip";
 /// The keys while monitoring is unavailable: the monitor volume keys are
 /// not advertised.
-const KEY_HINTS_NO_MONITOR: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · −/+ film · K clear clip";
+const KEY_HINTS_NO_MONITOR: &str = "Space record/stop · Enter choose · R retake · P play in context · ⇧ + Space/Enter/P: the whole passage · M mark start · E edit · ↑/↓ lines · ←/→ takes · A audio · C setup check · L latency · −/+ film · K clear clip";
 /// How often the input devices are checked while idle.
 const INPUT_CHECK_S: f64 = 2.0;
 
@@ -145,6 +146,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(",", MonitorQuieter, Some(CONTEXT)),
         KeyBinding::new(".", MonitorLouder, Some(CONTEXT)),
         KeyBinding::new("c", ToggleSetup, Some(CONTEXT)),
+        KeyBinding::new("l", MeasureLatency, Some(CONTEXT)),
         KeyBinding::new("i", InstallModel, Some(CONTEXT)),
         KeyBinding::new("space", SetupListen, Some(SETUP)),
         KeyBinding::new("enter", SetupNext, Some(SETUP)),
@@ -1390,8 +1392,9 @@ impl RecordingWindow {
     }
 }
 
-/// The audio keys: the panel (A), monitoring (H), the clipping light (K)
-/// and the film and monitor volume.
+/// The audio keys: the panel (A), monitoring (H), the clipping light (K),
+/// the setup check (C) and its latency step alone (L), and the film and
+/// monitor volume.
 fn audio_actions(
     root: gpui_kit::Stateful<gpui_kit::Div>,
     cx: &mut Context<RecordingWindow>,
@@ -1407,6 +1410,10 @@ fn audio_actions(
     }))
     .on_action(cx.listener(|view, _: &ToggleSetup, _, cx| {
         view.toggle_setup();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &MeasureLatency, _, cx| {
+        view.measure_latency();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &SetupListen, _, cx| {

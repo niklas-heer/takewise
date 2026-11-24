@@ -41,7 +41,7 @@ takewise models install
 takewise doctor
 ```
 
-The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones delay the film's sound and aren't supported for recording. The Mac's built-in microphone and its headphone jack are enough for a first try. The app is signed and notarized.
+The cask installs `Takewise.app`, the `takewise` command, whisper-cpp and ffmpeg. Takewise needs an Apple Silicon Mac with macOS 14 or later, an audio input that runs at 48 kHz, and wired headphones: film sound from speakers leaks into your takes, and Bluetooth headphones add a delay that can change after reconnecting, which the latency measurement corrects but wired headphones avoid. The Mac's built-in microphone and its headphone jack are enough for a first try. The app is signed and notarized.
 
 The speech model (`ggml-large-v3-turbo.bin`, 1.5 GB) is downloaded once, from whisper.cpp's repository on Hugging Face and is installed only when its SHA-256 matches the one pinned in Takewise. The recording window offers the same download with a button. After that, nothing needs the network.
 
@@ -160,7 +160,7 @@ Takewise records at 48 kHz from an input running at that rate. For an input set 
 
 Press C, and Takewise walks you through your devices, flagging speakers and Bluetooth headphones. Then it listens while you read a sentence and tells you how far to turn the gain on your interface. Next it records five seconds of silence and rates how far your voice stands above the room's noise; that recording is kept as room tone for the export's noise reduction. When the latency hasn't been measured for these devices, a last step does it: hold your headphones against the microphone and press Space, and beeps play for about 15 seconds while Takewise measures where they land (`takewise calibrate --write` does the same from the command line).
 
-Takewise remembers both for your next project. A latency measured on exactly the same input, output and buffer size is reused, and the panel says it came from an earlier measurement. A setup check from today on the same devices is adopted with its room tone. On Bluetooth headphones, whose delay can change after reconnecting, press C to measure again if takes sound late.
+Takewise remembers both for your next project. A latency measured on exactly the same input, output and buffer size is reused, and the panel says it came from an earlier measurement. A setup check from today on the same devices is adopted with its room tone. On Bluetooth headphones, whose delay can change after reconnecting, press L to measure the latency again (15 s) if takes sound late; L runs only the latency step, whenever you like.
 
 ### Export for your editor
 
@@ -226,6 +226,7 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 | ← / → | Previous or next take |
 | A | The audio panel: input, channel, output, volume, meters |
 | C | The setup check |
+| L | Measure the latency again: the setup check's latency step alone (15 s) |
 | − / + | Film quieter or louder |
 | K | Clear the clipping light |
 | I | Install the speech model, while it is missing |

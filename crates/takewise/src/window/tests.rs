@@ -3822,6 +3822,80 @@ fn a_bluetooth_output_offers_to_measure_again(cx: &mut TestAppContext) {
     to_latency_step(cx, &f);
 }
 
+#[gpui_kit::test]
+fn l_measures_the_latency_again_on_the_same_route(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.view.update(cx, |view, _| view.beep_film = fake_beep_film);
+    f.media.0.borrow_mut().outputs.push(output(
+        "WH-1000XM5",
+        Transport::Bluetooth,
+        OutputSource::Unknown,
+    ));
+    remember_measurement("WH-1000XM5", 512, -29, "2026-11-23");
+    use_settings(cx, &f);
+    f.view
+        .update(cx, |view, _| view.choose_output("WH-1000XM5"));
+    frame(cx, f.window);
+    // The Bluetooth output is flagged in plain words, and L is named.
+    let warning = f
+        .view
+        .read_with(cx, |view, _| view.output_warning())
+        .expect("a warning");
+    assert!(warning.contains("latency measurement (L)"), "{warning}");
+    assert!(!warning.contains("not supported"), "{warning}");
+    let note = f
+        .view
+        .read_with(cx, |view, _| view.panel.remembered.clone())
+        .expect("a note");
+    assert!(note.contains("press L to measure it again"), "{note}");
+
+    // L opens the latency step alone; once it stored a measurement, it
+    // closes and says what it stored.
+    for round in 0..2 {
+        press(cx, f.window, &["l"]);
+        assert_eq!(
+            setup_step(cx, &f),
+            Some(super::setup::Step::Latency),
+            "round {round}"
+        );
+        press(cx, f.window, &["space"]);
+        assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+        run_calibration(cx, &f, true);
+        assert_eq!(setup_step(cx, &f), None, "round {round}");
+        let shown = message(cx, &f.view);
+        assert!(
+            shown.starts_with("Latency measured:")
+                && shown.contains("Stored latency_offset_ms = -30 for Test Mic and WH-1000XM5."),
+            "{shown}"
+        );
+        // The fresh measurement is the project's own, so C's full check no
+        // longer offers the latency step; L still measures on this route.
+        let cal = Project::open(&f.dir)
+            .expect("project")
+            .config
+            .calibration
+            .expect("[calibration]");
+        assert!(!cal.is_remembered(), "{cal:?}");
+        assert_eq!(cal.output, "WH-1000XM5");
+    }
+    assert_eq!(recorded(&f.dir), [], "no take was recorded");
+}
+
+#[gpui_kit::test]
+fn l_waits_for_the_take_and_esc_closes_it(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    press(cx, f.window, &["l"]);
+    assert_eq!(setup_step(cx, &f), None);
+    assert!(message(cx, &f.view).contains("Finish the take first, then press L."));
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    press(cx, f.window, &["l"]);
+    assert_eq!(setup_step(cx, &f), Some(super::setup::Step::Latency));
+    press(cx, f.window, &["escape"]);
+    assert_eq!(setup_step(cx, &f), None);
+}
+
 /// Saves a setup check's result in another project with the test mic and
 /// `output` today, and remembers it.
 fn remember_todays_setup(output: &str) {
