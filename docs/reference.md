@@ -97,19 +97,22 @@ jq -r '"\(.audio): \(.kind) of \(.lines | join(", ")), for \(.project)"' "$rescu
 Each JSON file names both places in `restore`, relative to the project folder, and carries the file to write as `sidecar`. Restore every recording in the folder, then run one repair. The steps stop at the first one that fails, so nothing is left half restored without you seeing it:
 
 ```sh
-cd "<project>.takewise"
-set -e
-for json in "$rescue"/*.json; do
-  audio="$(jq -r .restore.audio "$json")"
-  mkdir -p "$(dirname "$audio")"
-  cp "$rescue/$(jq -r .audio "$json")" "$audio"
-  jq .sidecar "$json" > "$(jq -r .restore.sidecar "$json")"
-  echo "staged $(jq -r .audio "$json")"
-done
-takewise status --repair --json . | jq .data.repair
+(
+  set -e
+  cd "<project>.takewise"
+  for json in "$rescue"/*.json; do
+    audio="$(jq -r .restore.audio "$json")"
+    mkdir -p "$(dirname "$audio")"
+    cp "$rescue/$(jq -r .audio "$json")" "$audio"
+    jq .sidecar "$json" > "$(jq -r .restore.sidecar "$json")"
+    echo "staged $(jq -r .audio "$json")"
+  done
+  report="$(takewise status --repair --json .)"
+  printf '%s\n' "$report" | jq -e .data.repair
+)
 ```
 
-Run this once per folder: running it again stages every recording a second time, and the repair adopts each again as another take. If a step failed, fix the cause, remove what that run staged for the recording it stopped at, and stage the remaining recordings only.
+The parentheses keep `set -e` to these steps, so a failure stops them without closing your terminal. Run them once per folder: running them again stages every recording a second time; the repair adopts each take again as another take, and a passage that is already published is reported again with no new takes and leaves its staged audio behind as a stray partial file under `takes/.passages/`. If a step failed, fix the cause, remove what that run staged for the recording it stopped at, and stage the remaining recordings only.
 
 The repair numbers each take as its line's next one, and publishes each passage and cuts it into its takes, all marked `recovered`. Do this with the window closed, or let the window do the repair when it opens. Then check every recording against the repair's report: each staged take is in `adopted` (its line and new number), and each staged passage in `passages_published`, with its takes in `pieces`. A recording missing there is not back yet; its files are still in the rescue folder. Only when every recording is accounted for, delete the rescue folder, which removes all its recordings at once; until it is gone, `status` keeps listing it.
 

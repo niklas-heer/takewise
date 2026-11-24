@@ -1,6 +1,6 @@
 # Milestone 6: passages and a remembered setup
 
-Status: revised after council round 1 (Claude Fable 5.2: 6.5/10, GPT Sol 6.2: 6/10), 2026-11-24.
+Status: implemented for 0.2.0, 2026-11-24. Design revised after council round 1 (Claude Fable 5.2: 6.5/10, GPT Sol 6.2: 6/10); code reviewed in rounds 2 to 6 (Fable 8.5, 9.4, 9.5, 9.5, 9.5; Sol 6.5, 7.5, 8.4, 9.0, 9.5), with each round's findings fixed.
 
 ## Why
 
