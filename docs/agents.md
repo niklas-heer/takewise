@@ -75,7 +75,7 @@ Each line's `passage` names the passage it belongs to, by the id of the passage'
 takewise record promo.takewise
 ```
 
-This opens the recording window in `Takewise.app`; the narrator records one or more takes per line and may choose some. A passage can be read in one go: it is kept whole in `takes/.passages/<id>.wav` and cut, in the pauses between the lines, into one take per line, so everything below works on its takes as on any other. Wait for them. The window checks each take as it is recorded; you can follow along with `status`, which reloads from the files every time.
+This opens the recording window in `Takewise.app`; the narrator records one or more takes per line and may choose some. A passage can be read in one go (Shift+Space in the window): it is kept whole in `takes/.passages/<id>.wav` and cut, in the pauses between the lines, into one take per line, so everything below works on its takes as on any other. Wait for them. The window checks each take as it is recorded; you can follow along with `status`, which reloads from the files every time.
 
 ## 4. Read the checks
 

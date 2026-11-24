@@ -157,8 +157,10 @@ const LOOP_TAKES: [usize; 2] = [4, 5];
 /// The loop's width in pixels.
 const LOOP_WIDTH: u32 = 1000;
 /// The loop's close-up of the takes and their verdicts, in logical pixels
-/// of a [`HERO`] window: the side column's list of takes.
-const CLOSE_UP: (f32, f32, f32, f32) = (700.0, 304.0, 300.0, 128.0);
+/// of a [`HERO`] window: the side column's list of takes, which begins
+/// halfway down the column above the key hints (two rows of them at this
+/// width).
+const CLOSE_UP: (f32, f32, f32, f32) = (700.0, 293.5, 300.0, 128.0);
 
 /// Runs `takewise screenshots <work> <out>`.
 pub fn main(args: &[OsString]) -> ExitCode {

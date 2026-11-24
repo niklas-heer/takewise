@@ -22,6 +22,8 @@ use super::checks::{Checker, Checks, SharedTranscriber, worker_tag};
 use super::clock::FilmClock;
 use super::{Media, RecordingWindow, bind_keys, load};
 
+mod passages;
+
 const DEVICE: &str = "Test Mic";
 const LATENCY_S: f64 = 0.05;
 
@@ -61,6 +63,10 @@ struct Fake {
     audible: Vec<(f64, f64)>,
     /// Host times of every pause.
     pauses: Vec<f64>,
+    /// Every file opened for playback, in order.
+    opened_takes: Vec<PathBuf>,
+    /// Every `take_play_at` call: (`take_s`, `host_s`).
+    take_plays: Vec<(f64, f64)>,
 }
 
 #[derive(Clone)]
@@ -111,6 +117,8 @@ impl FakeMedia {
             muted: false,
             audible: Vec::new(),
             pauses: Vec::new(),
+            opened_takes: Vec::new(),
+            take_plays: Vec::new(),
         })))
     }
 
@@ -244,13 +252,15 @@ impl Media for FakeMedia {
     fn capture_error(&self) -> Option<String> {
         self.0.borrow().capture_error.clone()
     }
-    fn open_take(&mut self, _: &Path) -> Result<(), String> {
+    fn open_take(&mut self, path: &Path) -> Result<(), String> {
+        self.0.borrow_mut().opened_takes.push(path.to_owned());
         Ok(())
     }
     fn take_ready(&self) -> bool {
         true
     }
-    fn take_play_at(&mut self, _: f64, _: f64) -> Result<(), String> {
+    fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {
+        self.0.borrow_mut().take_plays.push((take_s, host_s));
         Ok(())
     }
     fn stop_take(&mut self) {}
@@ -3941,4 +3951,52 @@ fn the_setup_check_and_its_calibration_are_remembered(cx: &mut TestAppContext) {
         fs::read_to_string(&settings).expect("settings"),
         "# untouched\n"
     );
+}
+
+#[gpui_kit::test]
+fn the_line_list_scrolls_to_keep_the_current_line_in_view(cx: &mut TestAppContext) {
+    let script = (0..60).fold(String::new(), |script, i| {
+        let start = f64::from(i) * 0.3;
+        format!(
+            "{script}[[line]]\nid = \"l{i:02}\"\nstart = {start:.1}\nend = {:.1}\ntext = \"Line {i}.\"\n\n",
+            start + 0.2
+        )
+    });
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        fs::write(dir.join("script.toml"), &script).expect("script");
+    });
+    let in_view = |cx: &mut TestAppContext, idx: usize| {
+        frame(cx, f.window);
+        f.view.read_with(cx, |view, _| {
+            let list = view.lines_scroll.bounds();
+            let row = view.lines_scroll.bounds_for_item(idx).expect("the row");
+            let offset = view.lines_scroll.offset().y;
+            row.top() + offset >= list.top() && row.bottom() + offset <= list.bottom()
+        })
+    };
+    assert!(in_view(cx, 0));
+    assert!(!in_view(cx, 45), "the list is longer than its space");
+
+    press(cx, f.window, &["down"; 45]);
+    assert_eq!(f.view.read_with(cx, |view, _| view.line), 45);
+    assert!(in_view(cx, 45), "scrolled down to the current line");
+    assert!(!in_view(cx, 0));
+    // Just enough: the line became the last one in view.
+    assert!(!in_view(cx, 46));
+
+    press(cx, f.window, &["up"; 45]);
+    assert!(in_view(cx, 0), "and back up");
+
+    // A reload that moves the current line (an agent removed lines above
+    // it) follows it too.
+    press(cx, f.window, &["down"; 59]);
+    assert!(in_view(cx, 59));
+    let kept: String = script
+        .split("[[line]]")
+        .skip(51)
+        .fold(String::new(), |all, line| all + "[[line]]" + line);
+    fs::write(f.dir.join("script.toml"), kept).expect("script");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(f.view.read_with(cx, |view, _| view.line), 9);
+    assert!(in_view(cx, 9));
 }

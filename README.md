@@ -123,6 +123,16 @@ Opened from the Dock or Finder, `Takewise.app` shows a start window instead: **O
 
 The window shows the film, the line to read, its note for the narrator and the next line. A bar shows the slot running out. A line longer than three rows scrolls with the pace guide. E fixes a line's wording in place.
 
+### Passages: sentences that run on
+
+Read one line at a time, each sentence gets its own count-in and loses the intonation that joins it to the next. So lines that follow each other closely form a *passage*, and you can read a passage in one go.
+
+- **Shift+Space** records from the current line through the end of its passage: one take, one count-in. The prompter moves to each line when the film reaches its start, and the take stops by itself 1.5 s after the last line's slot, or when you press Space.
+- The recording is kept whole and cut, in the pauses between the sentences, into one take per line. Each of those is checked, chosen and replaced like any other take, so you can still pick up a single line with Space.
+- **Shift+P** plays the whole passage against the film, so you hear the flow. **Shift+Enter** chooses the passage for every line it has a take of.
+
+Which lines belong together is a rule, not a setting per line: a line joins the one before it when it starts less than `[record] passage_gap_s` (1.0 s) after that line's slot ends. Sentences a few tenths of a second apart are grouped, and a deliberate pause for the picture or the music ends the passage. The line list shows each passage with a thin bar beside its lines.
+
 ### Every take checked
 
 <p align="center"><img src="docs/images/takes.png" alt="The takes of the capsule line: 1 listen, heard &quot;dock&quot; for &quot;port&quot;; 2 retake, speech ends 0.31 s after the slot; 3 retake, missing &quot;home&quot;; 4 keep, chosen (filled star)." width="300"><br><sub>The capsule line's takes, take 4 chosen.</sub></p>
@@ -202,11 +212,14 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 
 | Key | Does |
 | --- | --- |
-| Space | Record a take of the current line, or stop it (it also stops by itself 1.5 s after the slot) |
+| Space | Record a take of the current line, or stop a take (it also stops by itself 1.5 s after the slot) |
+| Shift+Space | Record from the current line through the end of its passage as one take, or stop a take |
 | Enter | Choose the selected take |
-| R | Record another take |
+| Shift+Enter | Choose the selected take's passage for every line it has a take of |
+| R | Record another take of the current line |
 | P | Play the line in context, the selected take locked to the film (needs a take) |
-| M | Set the line's start to the playhead while the film plays (during a take or P) |
+| Shift+P | Play the selected take's whole passage, locked to the film |
+| M | Set the line's start to the playhead while the film plays (during a take of one line, or P) |
 | E | Edit the line's text (Enter saves, Esc cancels) |
 | ↑ / ↓ | Previous or next line |
 | ← / → | Previous or next take |
@@ -230,7 +243,7 @@ If something doesn't work with your setup, please [open an issue](https://github
 
 ## Reference
 
-- [docs/reference.md](docs/reference.md): every command and its options, exit codes and refusals, the export formats and processing, the audio panel, the setup check step by step, building from source, and how the screenshots are made.
+- [docs/reference.md](docs/reference.md): every command and its options, exit codes and refusals, the export formats and processing, recording passages, the audio panel, the setup check step by step, building from source, and how the screenshots are made.
 - [docs/agents.md](docs/agents.md): an agent's full loop with the exact commands and JSON.
 - [docs/design.md](docs/design.md): the design, the folder format and the reasons behind them.
 
