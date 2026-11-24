@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use sha2::{Digest as _, Sha256};
-use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
+use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
@@ -149,7 +149,7 @@ pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
     let table = doc
         .entry("film_info")
         .or_insert_with(toml_edit::table)
-        .as_table_mut()
+        .as_table_like_mut()
         .ok_or_else(|| parse_error("film_info is not a table".to_owned()))?;
     set_value(table, "duration_s", Some(Value::from(info.duration_s)));
     set_value(table, "size", Some(Value::from(size)));
@@ -161,7 +161,7 @@ pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
 /// keeping the rest of the file, its comments and layout as they are.
 pub fn set_latency_offset(dir: &Path, offset_ms: i32) -> Result<()> {
     edit_project(dir, |doc| {
-        let input = table(doc, "input")?;
+        let input = table_like(doc, "input")?;
         set_value(
             input,
             "latency_offset_ms",
@@ -200,13 +200,13 @@ fn write_calibration(
     offset_ms: i32,
     info: &CalibrationInfo,
 ) -> Result<(), String> {
-    let input = table(doc, "input")?;
+    let input = table_like(doc, "input")?;
     set_value(
         input,
         "latency_offset_ms",
         Some(Value::from(i64::from(offset_ms))),
     );
-    let cal = table(doc, "calibration")?;
+    let cal = table_like(doc, "calibration")?;
     set_value(cal, "input", Some(Value::from(info.input.as_str())));
     set_value(cal, "output", Some(Value::from(info.output.as_str())));
     set_value(
@@ -254,7 +254,7 @@ pub fn set_setup_when(
 }
 
 fn write_setup(doc: &mut DocumentMut, info: &SetupInfo) -> Result<(), String> {
-    let setup = table(doc, "setup")?;
+    let setup = table_like(doc, "setup")?;
     set_value(setup, "date", Some(Value::from(info.date.as_str())));
     set_value(setup, "input", Some(Value::from(info.input.as_str())));
     set_value(setup, "channel", Some(Value::from(i64::from(info.channel))));
@@ -277,7 +277,7 @@ fn write_setup(doc: &mut DocumentMut, info: &SetupInfo) -> Result<(), String> {
 /// layout.
 pub fn set_export(dir: &Path, config: &ExportConfig) -> Result<()> {
     edit_project(dir, |doc| {
-        let export = table(doc, "export")?;
+        let export = table_like(doc, "export")?;
         set_value(
             export,
             "format",
@@ -313,12 +313,12 @@ fn round_db(db: f64) -> f64 {
 pub fn set_route(dir: &Path, input: Option<(&str, u16)>, output: Option<&str>) -> Result<()> {
     edit_project(dir, |doc| {
         if let Some((device, channel)) = input {
-            let table = table(doc, "input")?;
+            let table = table_like(doc, "input")?;
             set_value(table, "device", Some(Value::from(device)));
             set_value(table, "channel", Some(Value::from(i64::from(channel))));
         }
         if let Some(device) = output {
-            let table = table(doc, "output")?;
+            let table = table_like(doc, "output")?;
             set_value(table, "device", Some(Value::from(device)));
         }
         Ok(())
@@ -415,14 +415,6 @@ fn edit_project_when(
     toml::from_str::<crate::ProjectConfig>(&text).map_err(|err| parse_error(err.to_string()))?;
     write_atomic(&path, text.as_bytes())?;
     Ok(true)
-}
-
-/// The table `name`, created when missing.
-fn table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, String> {
-    doc.entry(name)
-        .or_insert_with(toml_edit::table)
-        .as_table_mut()
-        .ok_or_else(|| format!("{name} is not a table"))
 }
 
 /// The table `name` as a table or an inline table (`record = { … }`),
@@ -799,6 +791,40 @@ text = "Third."
         assert!((config.record.voice_gain_db + 4.0).abs() < f64::EPSILON);
         assert!((config.monitor.volume_db - 3.0).abs() < f64::EPSILON);
         assert!(!config.monitor.enabled, "enabled keeps its default");
+    }
+
+    #[test]
+    fn route_calibration_and_setup_write_into_inline_tables() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        // [input] as an inline table at the top, and an inline [output].
+        let start = text.find("[input]").unwrap();
+        let end = text[start..].find("\n\n").map_or(text.len(), |n| start + n);
+        let inline = "input = { device = \"Mic\", channel = 1, latency_offset_ms = 0 }\n\
+                      output = { device = \"Phones\" }\n";
+        let text = format!("{inline}{}{}", &text[..start], &text[end..]);
+        fs::write(&path, &text).unwrap();
+
+        set_route(&dir, Some(("Duo", 2)), Some("Studio Phones")).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.input.device.as_deref(), Some("Duo"));
+        assert_eq!(config.input.channel, 2);
+        assert_eq!(config.output.device.as_deref(), Some("Studio Phones"));
+        set_latency_offset(&dir, -12).unwrap();
+        assert_eq!(
+            crate::project::read_config(&dir)
+                .unwrap()
+                .input
+                .latency_offset_ms,
+            -12
+        );
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("input = {"), "{written}");
+        assert!(
+            !written.contains("[input]") && !written.contains("[output]"),
+            "{written}"
+        );
     }
 
     #[test]
