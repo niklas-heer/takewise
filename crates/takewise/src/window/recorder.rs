@@ -22,7 +22,7 @@ use takewise_core::{
     ProjectConfig, RECORD_RATE, RecordPlan, RecordedInput, Route, Snapshot, TakeRef, TakeState,
     Timebase, UnsavedPassage, WavLock, begin_passage, begin_take, commit_take,
     finish_interrupted_commit, line_offset_s, passage_file, plan_take, read_passage,
-    sample_film_time, save_passage, update_passage_meta, update_take_meta, write_take_wav,
+    rewrite_take_wav, sample_film_time, save_passage, update_passage_meta, update_take_meta,
 };
 use takewise_media::CaptureBuffer;
 
@@ -1682,13 +1682,16 @@ fn save(dir: &Path, unsaved: &mut Unsaved) -> Result<Saved, String> {
         unsaved.complete = false;
     }
     if !unsaved.complete {
-        // Rewritten only while holding the file's lock (kept from the
-        // recording, else taken now), so a repair never adopts it meanwhile.
-        if unsaved.lock.is_none() {
-            unsaved.lock = Some(WavLock::acquire(&partial.wav).map_err(|err| err.to_string())?);
-        }
-        write_take_wav(&partial.wav, &unsaved.samples, RECORD_RATE)
-            .map_err(|err| err.to_string())?;
+        // Written into a locked file beside the partial and renamed over it
+        // only when whole, so a failure never shortens the audio already on
+        // disk, and a repair never adopts it meanwhile.
+        rewrite_take_wav(
+            &partial.wav,
+            &mut unsaved.lock,
+            &unsaved.samples,
+            RECORD_RATE,
+        )
+        .map_err(|err| err.to_string())?;
         unsaved.complete = true;
     }
     update_take_meta(&partial, &unsaved.input).map_err(|err| err.to_string())?;
