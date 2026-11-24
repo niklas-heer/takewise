@@ -432,6 +432,9 @@ struct DemoState {
     room: Room,
     channel_meter: bool,
     levels: Vec<f32>,
+    /// The output last set (`None`: the system output), with a synthetic
+    /// UID and object, so the window finds the route it set in place.
+    output: Option<String>,
 }
 
 #[derive(Clone)]
@@ -453,6 +456,7 @@ impl DemoMedia {
             position: 0,
             room: Room::new(7),
             channel_meter: false,
+            output: None,
             levels: vec![-15.0, f32::NEG_INFINITY],
         }))))
     }
@@ -626,23 +630,27 @@ impl Media for DemoMedia {
         0
     }
     fn applied_output_uid(&self) -> Option<String> {
-        None
+        self.0
+            .borrow()
+            .output
+            .as_ref()
+            .map(|name| format!("demo:{name}"))
     }
-    fn output_object(&self, _: &str) -> Option<u32> {
-        Some(1)
+    fn output_object(&self, uid: &str) -> Option<u32> {
+        let name = uid.strip_prefix("demo:")?;
+        self.output_connected(name).then_some(1)
     }
     fn default_output_uid(&self) -> Option<(String, String)> {
-        Some((SPEAKERS.to_owned(), SPEAKERS.to_owned()))
+        Some((SPEAKERS.to_owned(), format!("demo:{SPEAKERS}")))
     }
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
-        let Some(device) = device else {
-            return Ok(());
-        };
-        if self.outputs().iter().any(|output| output.name == device) {
-            Ok(())
-        } else {
-            Err(format!("no output device named {device:?}"))
+        if let Some(device) = device
+            && !self.outputs().iter().any(|output| output.name == device)
+        {
+            return Err(format!("no output device named {device:?}"));
         }
+        self.0.borrow_mut().output = device.map(str::to_owned);
+        Ok(())
     }
     fn start_channel_meter(&mut self, _: &str) -> Result<(), String> {
         self.0.borrow_mut().channel_meter = true;
