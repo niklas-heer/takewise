@@ -178,6 +178,7 @@ impl RecordingWindow {
             output: measurement.output.clone(),
             buffer_frames: measurement.buffer_frames,
             date: crate::calibrate::today(),
+            from: None,
         };
         tw::set_calibration(&self.dir, offset, &info)
             .map_err(|err| format!("{placed}, but it could not be saved: {err}"))?;

@@ -56,14 +56,7 @@ pub fn save_room_tone(
 ) -> Result<RoomTone> {
     let room = dir.join(TAKES_DIR).join(ROOM_DIR);
     fs::create_dir_all(&room).map_err(io(&room))?;
-    let stamp = at.strftime("%Y%m%dT%H%M%SZ").to_string();
-    let name = (0..1000)
-        .map(|n| match n {
-            0 => stamp.clone(),
-            n => format!("{stamp}-{n}"),
-        })
-        .find(|name| !room.join(format!("{name}.json")).exists())
-        .unwrap_or(stamp);
+    let name = free_name(&room, at);
     let wav = room.join(format!("{name}.wav"));
     let temp = write_temp(&wav, |file| {
         let copy = file.try_clone()?;
@@ -90,6 +83,64 @@ pub fn save_room_tone(
     })?;
     write_atomic(&json, &text)?;
     Ok(tone)
+}
+
+/// A name for a room tone recorded at `at` that `room` does not hold yet:
+/// its UTC timestamp, with a counter when that is taken.
+fn free_name(room: &Path, at: jiff::Timestamp) -> String {
+    let stamp = at.strftime("%Y%m%dT%H%M%SZ").to_string();
+    (0..1000)
+        .map(|n| match n {
+            0 => stamp.clone(),
+            n => format!("{stamp}-{n}"),
+        })
+        .find(|name| {
+            !room.join(format!("{name}.json")).exists()
+                && !room.join(format!("{name}.wav")).exists()
+        })
+        .unwrap_or(stamp)
+}
+
+/// Copies the room tone `tone`, whose WAV is `wav`, into the folder
+/// `into`: the WAV first, then its sidecar, whose `file` becomes
+/// `<prefix>/<name>.wav`. Returns the copy's sidecar.
+pub fn copy_room_tone(wav: &Path, tone: &RoomTone, into: &Path, prefix: &str) -> Result<RoomTone> {
+    fs::create_dir_all(into).map_err(io(into))?;
+    let name = free_name(into, tone.recorded_at);
+    let target = into.join(format!("{name}.wav"));
+    let temp = write_temp(&target, |file| {
+        let mut source = fs::File::open(wav)?;
+        std::io::copy(&mut source, file).map(drop)
+    })?;
+    rename_temp(&temp, &target)?;
+    let copy = RoomTone {
+        file: format!("{prefix}/{name}.wav"),
+        ..tone.clone()
+    };
+    let json = into.join(format!("{name}.json"));
+    let text = serde_json::to_vec_pretty(&copy).map_err(|err| Error::Parse {
+        path: json.clone(),
+        message: err.to_string(),
+    })?;
+    write_atomic(&json, &text)?;
+    Ok(copy)
+}
+
+/// Copies a room tone recorded elsewhere (its WAV is `wav`) into the
+/// project's `takes/.room/`, unless the project already holds it (the same
+/// recording time and devices). Returns the project's sidecar of it.
+pub fn import_room_tone(dir: &Path, wav: &Path, tone: &RoomTone) -> Result<RoomTone> {
+    let same = |held: &RoomTone| {
+        held.recorded_at == tone.recorded_at
+            && held.input == tone.input
+            && held.channel == tone.channel
+            && held.output == tone.output
+    };
+    if let Some(held) = room_tones(dir)?.into_iter().find(same) {
+        return Ok(held);
+    }
+    let room = dir.join(TAKES_DIR).join(ROOM_DIR);
+    copy_room_tone(wav, tone, &room, &format!("{TAKES_DIR}/{ROOM_DIR}"))
 }
 
 /// Every room tone whose sidecar parses and whose WAV exists, oldest first.

@@ -259,6 +259,7 @@ fn prepare(work: &Path) -> Result<Demo, String> {
             output: INPUT.to_owned(),
             buffer_frames: Some(256),
             date: jiff::ZonedDateTime::now().date().to_string(),
+            from: None,
         },
     )
     .map_err(fail)?;

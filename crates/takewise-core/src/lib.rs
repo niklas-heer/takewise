@@ -13,6 +13,7 @@ pub mod ledger;
 pub mod models;
 pub mod permission;
 pub mod project;
+pub mod remembered;
 pub mod render;
 pub mod room;
 pub mod route;

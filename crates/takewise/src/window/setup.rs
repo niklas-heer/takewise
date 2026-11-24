@@ -258,6 +258,7 @@ impl RecordingWindow {
             output,
             room_floor_dbfs: (!room.gated).then_some(room.floor_dbfs),
             speech_to_noise_db: room.snr_db,
+            from: None,
         };
         let written = tw::set_setup(&self.dir, &info)
             .map_err(|err| format!("Could not save the setup check: {err}"));

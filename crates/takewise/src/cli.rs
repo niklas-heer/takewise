@@ -1178,6 +1178,7 @@ fn calibrate(dir: &Path, write: bool, output: Option<&str>) -> Result<Outcome, C
             output: measurement.output.clone(),
             buffer_frames: measurement.buffer_frames,
             date: calibrate::today(),
+            from: None,
         };
         tw::set_calibration(&dir, offset, &info)?;
         let _ = write!(

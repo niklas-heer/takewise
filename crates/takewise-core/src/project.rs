@@ -169,8 +169,23 @@ pub struct CalibrationInfo {
     /// record it, which count as stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_frames: Option<u32>,
-    /// `YYYY-MM-DD`.
+    /// `YYYY-MM-DD`: the day of the measurement, also when copied.
     pub date: String,
+    /// [`REMEMBERED`] when the offset was copied from an earlier
+    /// measurement on these devices instead of measured for this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+/// The `from` of a `[calibration]` or `[setup]` copied from the app's
+/// remembered setup (see [`crate::remembered`]).
+pub const REMEMBERED: &str = "remembered";
+
+impl CalibrationInfo {
+    /// Whether the offset came from an earlier measurement on these devices.
+    pub fn is_remembered(&self) -> bool {
+        self.from.as_deref() == Some(REMEMBERED)
+    }
 }
 
 /// `[setup]`: the result of the setup check.
@@ -184,6 +199,17 @@ pub struct SetupInfo {
     pub room_floor_dbfs: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech_to_noise_db: Option<f64>,
+    /// [`REMEMBERED`] when the result and its room tone were copied from
+    /// a setup check of another project on the same day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl SetupInfo {
+    /// Whether the result was copied from another project's setup check.
+    pub fn is_remembered(&self) -> bool {
+        self.from.as_deref() == Some(REMEMBERED)
+    }
 }
 
 /// What the film looked like when the project last measured it.

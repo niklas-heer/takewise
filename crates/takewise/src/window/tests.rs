@@ -2742,6 +2742,7 @@ fn stale_calibration_shows_in_the_panel(cx: &mut TestAppContext) {
             output: "MacBook Speakers".to_owned(),
             buffer_frames: Some(512),
             date: "2026-11-23".to_owned(),
+            from: None,
         };
         tw::set_calibration(dir, 25, &info).expect("calibration");
     });
@@ -2760,6 +2761,7 @@ fn calibrate_on(dir: &Path, output: &str) {
         output: output.to_owned(),
         buffer_frames: Some(512),
         date: "2026-11-23".to_owned(),
+        from: None,
     };
     tw::set_calibration(dir, 25, &info).expect("calibration");
 }
@@ -2983,6 +2985,7 @@ fn setup_not_offered_when_current(cx: &mut TestAppContext) {
             output: "MacBook Speakers".to_owned(),
             room_floor_dbfs: Some(-70.0),
             speech_to_noise_db: Some(48.0),
+            from: None,
         };
         tw::set_setup(dir, &info).expect("setup");
         save_room_tone_at(dir, jiff::Timestamp::now());
@@ -3017,6 +3020,7 @@ fn room_step_offered_without_todays_room_tone(cx: &mut TestAppContext) {
             output: "MacBook Speakers".to_owned(),
             room_floor_dbfs: Some(-70.0),
             speech_to_noise_db: Some(48.0),
+            from: None,
         };
         tw::set_setup(dir, &info).expect("setup");
         let days_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(72);
