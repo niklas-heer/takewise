@@ -223,25 +223,54 @@ fn write_calibration(
 /// the file's comments and layout; values the check did not measure are
 /// removed.
 pub fn set_setup(dir: &Path, info: &SetupInfo) -> Result<()> {
-    edit_project(dir, |doc| {
-        let setup = table(doc, "setup")?;
-        set_value(setup, "date", Some(Value::from(info.date.as_str())));
-        set_value(setup, "input", Some(Value::from(info.input.as_str())));
-        set_value(setup, "channel", Some(Value::from(i64::from(info.channel))));
-        set_value(setup, "output", Some(Value::from(info.output.as_str())));
-        set_value(
-            setup,
-            "room_floor_dbfs",
-            info.room_floor_dbfs.map(|db| Value::from(round_db(db))),
-        );
-        set_value(
-            setup,
-            "speech_to_noise_db",
-            info.speech_to_noise_db.map(|db| Value::from(round_db(db))),
-        );
-        set_value(setup, "from", info.from.as_deref().map(Value::from));
-        Ok(())
-    })
+    edit_project(dir, |doc| write_setup(doc, info))
+}
+
+/// [`set_setup`], decided under the lock: `decide` gets the project as it
+/// is on disk then, not as a caller read it some time ago, and returns the
+/// result to write, or `None` to leave the file as it is. It runs under
+/// the project lock, so what it does first (copying a room tone in) and
+/// the `[setup]` that names it belong to one decision; when it fails,
+/// nothing is written. Returns whether `[setup]` was written.
+pub fn set_setup_when(
+    dir: &Path,
+    decide: impl FnOnce(&crate::ProjectConfig) -> Result<Option<SetupInfo>>,
+) -> Result<bool> {
+    // `decide` fails with an error of its own, not with a parse error of
+    // `project.toml`.
+    let mut failed = None;
+    let written = edit_project_when(dir, |text, doc| {
+        let config: crate::ProjectConfig = toml::from_str(text).map_err(|err| err.to_string())?;
+        match decide(&config) {
+            Ok(Some(info)) => write_setup(doc, &info).map(|()| true),
+            Ok(None) => Ok(false),
+            Err(err) => {
+                failed = Some(err);
+                Ok(false)
+            }
+        }
+    })?;
+    failed.map_or(Ok(written), Err)
+}
+
+fn write_setup(doc: &mut DocumentMut, info: &SetupInfo) -> Result<(), String> {
+    let setup = table(doc, "setup")?;
+    set_value(setup, "date", Some(Value::from(info.date.as_str())));
+    set_value(setup, "input", Some(Value::from(info.input.as_str())));
+    set_value(setup, "channel", Some(Value::from(i64::from(info.channel))));
+    set_value(setup, "output", Some(Value::from(info.output.as_str())));
+    set_value(
+        setup,
+        "room_floor_dbfs",
+        info.room_floor_dbfs.map(|db| Value::from(round_db(db))),
+    );
+    set_value(
+        setup,
+        "speech_to_noise_db",
+        info.speech_to_noise_db.map(|db| Value::from(round_db(db))),
+    );
+    set_value(setup, "from", info.from.as_deref().map(Value::from));
+    Ok(())
 }
 
 /// Writes `[export]` under the lock, keeping the file's comments and

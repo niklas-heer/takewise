@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::edit::{set_calibration_when, set_setup};
+use crate::edit::{set_calibration_when, set_setup_when};
 use crate::error::{Error, Result, io};
 use crate::fsutil::{sync_dir, sync_parent, write_atomic};
 use crate::project::{CalibrationInfo, ProjectConfig, REMEMBERED, SetupInfo};
@@ -385,6 +385,13 @@ fn prune_rooms(rooms: &Path, kept: &[RememberedSetup]) {
 /// exactly this input, channel and output from today, if any. Its room
 /// tone is copied into the project's `takes/.room/` first, then `[setup]`
 /// is written with `from = "remembered"`; returns what was written.
+///
+/// `config` is the project as the caller read it, which may be a while
+/// ago (the window's copy): it only spares the look when it already has
+/// today's check. Whether the project still lacks one is decided again
+/// from the file, under the project lock that writes `[setup]`, before
+/// the room tone is copied in: a check that ran in the project since is
+/// never replaced.
 pub fn adopt_setup(
     path: &Path,
     dir: &Path,
@@ -396,16 +403,20 @@ pub fn adopt_setup(
     let (Some(input), Some(output)) = (route.input.as_deref(), route.output.as_deref()) else {
         return Ok(None);
     };
-    let has_own = config.setup.as_ref().is_some_and(|setup| {
-        setup.date == today
-            && setup.input == input
-            && setup.channel == route.channel
-            && setup.output == output
-    });
-    if has_own || !path.is_file() {
+    let has_own = |config: &ProjectConfig| {
+        config.setup.as_ref().is_some_and(|setup| {
+            setup.date == today
+                && setup.input == input
+                && setup.channel == route.channel
+                && setup.output == output
+        })
+    };
+    if has_own(config) || !path.is_file() {
         return Ok(None);
     }
-    let adopted = update(path, |remembered, home| {
+    // The project lock is taken inside the store's: nothing takes them
+    // the other way round.
+    update(path, |remembered, home| {
         let Some(known) = remembered
             .setup
             .iter()
@@ -413,17 +424,20 @@ pub fn adopt_setup(
         else {
             return Ok(None);
         };
-        let wav = home.join(&known.room_tone.file);
-        import_room_tone(dir, &wav, &known.room_tone)?;
-        Ok(Some(SetupInfo {
+        let info = SetupInfo {
             from: Some(REMEMBERED.to_owned()),
             ..known.setup.clone()
-        }))
-    })?;
-    if let Some(info) = &adopted {
-        set_setup(dir, info)?;
-    }
-    Ok(adopted)
+        };
+        let wav = home.join(&known.room_tone.file);
+        let written = set_setup_when(dir, |on_disk| {
+            if has_own(on_disk) {
+                return Ok(None);
+            }
+            import_room_tone(dir, &wav, &known.room_tone)?;
+            Ok(Some(info.clone()))
+        })?;
+        Ok(written.then_some(info))
+    })
 }
 
 #[cfg(test)]
@@ -431,7 +445,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::edit::set_calibration;
+    use crate::edit::{set_calibration, set_setup};
     use crate::project::{FilmInfo, Project, read_config};
     use crate::room::{RoomInput, room_tones, save_room_tone};
     use crate::takes::read_take_wav;
@@ -868,6 +882,51 @@ mod tests {
             None
         );
         assert_eq!(room_tones(&own).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stale_view_of_the_project_does_not_replace_a_setup_check_made_since() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        let checked = project(&tmp, "checked.takewise");
+        setup_check(&home, &checked, "2026-11-24T09:00:00Z", -70.0);
+        let dir = project(&tmp, "open.takewise");
+        // The window read the project before it had a setup check.
+        let stale = read_config(&dir).unwrap();
+        assert_eq!(stale.setup, None);
+        // Then the check ran in the project itself (remembering it did
+        // not work, so the other project's is still the one remembered).
+        let at: jiff::Timestamp = "2026-11-24T10:00:00Z".parse().unwrap();
+        let input = RoomInput {
+            input: DUO,
+            channel: 1,
+            output: XM5,
+            floor_dbfs: -60.0,
+            gated: false,
+        };
+        save_room_tone(&dir, &[5, -5, 4], 48_000, at, &input).unwrap();
+        let own = SetupInfo {
+            date: "2026-11-24".to_owned(),
+            input: DUO.to_owned(),
+            channel: 1,
+            output: XM5.to_owned(),
+            room_floor_dbfs: Some(-60.0),
+            speech_to_noise_db: Some(40.0),
+            from: None,
+        };
+        set_setup(&dir, &own).unwrap();
+
+        // The window adopts with what it read: the project's own check,
+        // which is on disk by now, stays, and no room tone is copied in.
+        let today = day("2026-11-24");
+        assert_eq!(
+            adopt_setup(&home.remembered, &dir, &stale, &route(512), today).unwrap(),
+            None
+        );
+        assert_eq!(read_config(&dir).unwrap().setup, Some(own));
+        let tones = room_tones(&dir).unwrap();
+        assert_eq!(tones.len(), 1, "{tones:?}");
+        assert!((tones[0].floor_dbfs - -60.0).abs() < f64::EPSILON);
     }
 
     #[test]
