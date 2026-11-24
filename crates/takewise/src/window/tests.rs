@@ -3064,6 +3064,8 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
     use super::{OpenHelp, OpenKeys, OpenReleaseNotes, ReportIssue};
     let f = open(cx, &[(DEVICE, 48_000)]);
     cx.update(super::menu_actions);
+    let names: Vec<_> = super::menus().into_iter().map(|menu| menu.name).collect();
+    assert_eq!(names, ["Takewise", "File", "Window", "Help"]);
     cx.update(|cx| {
         for menu in super::menus() {
             for item in menu.items {
@@ -3096,6 +3098,10 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
         cx.opened_url().as_deref(),
         Some("https://github.com/niklas-heer/takewise/issues/new")
     );
+    // Window › Minimize and Zoom act on the window in front.
+    cx.dispatch_action(f.window, super::Minimize);
+    cx.dispatch_action(f.window, super::Zoom);
+    assert_eq!(cx.windows().len(), 1);
 }
 
 #[gpui_kit::test]

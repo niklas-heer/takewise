@@ -233,7 +233,7 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 
 H and the monitor volume keys (`,` and `.`) belong to monitoring, which isn't available yet.
 
-The menu bar has **About Takewise**, **Open Project…** (⌘O), **Install Command Line Tool…** and **Quit** (⌘Q), and a **Help** menu that opens this README, these keys, the release notes of your version and a new issue.
+The menu bar has **About Takewise**, **Open Project…** (⌘O), **Install Command Line Tool…**, **Quit** (⌘Q), **Minimize** (⌘M) and **Zoom**, and a **Help** menu that opens this README, these keys, the release notes of your version and a new issue.
 
 ## Status
 

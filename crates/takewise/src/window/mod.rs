@@ -103,6 +103,8 @@ gpui_kit::actions!(
         Hide,
         HideOthers,
         ShowAll,
+        Minimize,
+        Zoom,
         OpenHelp,
         OpenKeys,
         OpenReleaseNotes,
@@ -188,6 +190,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-w", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
     ]);
 }
 
@@ -346,7 +349,7 @@ fn set_up_app(cx: &mut App) {
     .detach();
 }
 
-/// The menu bar: Takewise, File and Help. Its actions are the app's, so
+/// The menu bar: Takewise, File, Window and Help. Its actions are the app's, so
 /// they work from the start window and every recording window alike.
 fn menus() -> Vec<Menu> {
     vec![
@@ -364,6 +367,10 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Quit Takewise", Quit),
         ]),
         Menu::new("File").items([MenuItem::action("Open Project…", start::OpenProject)]),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", Minimize),
+            MenuItem::action("Zoom", Zoom),
+        ]),
         Menu::new("Help").items([
             MenuItem::action("Takewise Help", OpenHelp),
             MenuItem::action("Keyboard Shortcuts", OpenKeys),
@@ -407,6 +414,16 @@ fn menu_actions(cx: &mut App) {
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
+    cx.on_action(|_: &Minimize, cx: &mut App| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.minimize_window());
+        }
+    });
+    cx.on_action(|_: &Zoom, cx: &mut App| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.zoom_window());
+        }
+    });
     cx.on_action(|_: &OpenHelp, cx: &mut App| cx.open_url(HELP_URL));
     cx.on_action(|_: &OpenKeys, cx: &mut App| cx.open_url(KEYS_URL));
     cx.on_action(|_: &OpenReleaseNotes, cx: &mut App| cx.open_url(RELEASE_NOTES_URL));
