@@ -136,9 +136,7 @@ impl OutputProblem {
                 format!("{name} is not connected: connect it or pick another output (A).")
             }
             Self::Failed { name, error } => format!("Cannot play through {name}: {error}."),
-            Self::Unconfirmed(name) => {
-                format!("{name} could not be checked, so nothing played; try again.")
-            }
+            Self::Unconfirmed(name) => format!("{name} could not be checked; try again."),
         }
     }
 
@@ -294,8 +292,11 @@ impl RecordingWindow {
             self.route_due = true;
             return Err(OutputProblem::Missing(name));
         }
+        // Missing until the device it came back as is confirmed.
         let ready = self.set_route(&name)?;
-        self.output_missing = None;
+        if ready == Ready::Yes {
+            self.output_missing = None;
+        }
         self.output_error = None;
         Ok(ready)
     }
@@ -343,15 +344,13 @@ impl RecordingWindow {
         match self.sync_output() {
             Ok(Ready::Yes) => {
                 let back = was_missing.filter(|name| self.film_output.as_ref() == Some(name));
-                if let Some(name) = back {
-                    // Only in place of nothing, or of an earlier route
-                    // status: never over a take's result or warning.
-                    let quiet = self.message.is_none() || self.message == self.route_status;
-                    if quiet {
-                        self.say_route(format!(
-                            "{name} is connected: the film and your takes play there."
-                        ));
-                    }
+                // Never over a take's result or warning.
+                if let Some(name) = back
+                    && (self.message.is_none() || self.message != self.take_result)
+                {
+                    self.say_route(format!(
+                        "{name} is connected: the film and your takes play there."
+                    ));
                 }
             }
             Ok(Ready::Pending) => {}
@@ -370,7 +369,6 @@ impl RecordingWindow {
     /// A playback follows the configured route; a take checks the route it
     /// started on every tick, whatever `[output] device` says meanwhile.
     pub(super) fn watch_output(&mut self, now: f64) {
-        self.recorder.track_film(&*self.media);
         self.cancel_calibration_if_output_dropped();
         let recording = self.recorder.is_recording();
         if !recording {
@@ -388,9 +386,18 @@ impl RecordingWindow {
         }
         if recording {
             self.check_take_route(changed || due);
-        } else if changed || due {
+        } else if changed || due || self.route_pending() {
             self.follow_output();
         }
+    }
+
+    /// Whether the route waits on its device's object (reads failing
+    /// within the grace, or not read yet since it was set): read again
+    /// every tick, one property read, until it resolves, as before a start.
+    fn route_pending(&self) -> bool {
+        !self.route_due
+            && (self.failing.applied.since.is_some()
+                || matches!(self.applied_device, Some((_, None))))
     }
 
     /// When a take starts: the route it plays the film through, to watch.
@@ -491,15 +498,23 @@ impl RecordingWindow {
             self.confirm_take_device();
             return;
         };
-        let back = match self.see(&uid, object, Lookup::Take) {
+        let seen = self.see(&uid, object, Lookup::Take);
+        let back = match seen {
             Seen::Same | Seen::Unsure => return,
             Seen::Unreadable => None,
             Seen::Dropped(back) => back,
         };
-        let note = format!(
-            "{} was disconnected during the take, so the film may have played elsewhere, out loud: listen before you choose it.",
-            route.name
-        );
+        let note = if seen == Seen::Unreadable {
+            format!(
+                "{} could not be checked during the take: the film may have played elsewhere; listen before you choose it.",
+                route.name
+            )
+        } else {
+            format!(
+                "{} was disconnected during the take, so the film may have played elsewhere, out loud: listen before you choose it.",
+                route.name
+            )
+        };
         if !self.recorder.note_route(note) {
             // Its film has not been seen running: the start is held instead.
             return;
@@ -564,30 +579,28 @@ impl RecordingWindow {
                 named
             }
         };
-        let other = pending
-            .clone()
-            .filter(|(_, uid)| route.uid.as_ref() != Some(uid));
-        let known = route.uid.is_some();
-        let note = match (&other, now) {
-            (Some((name, _)), _) if known => format!(
-                "The system output changed from {} to {name} during the take: listen before you choose it.",
-                route.name
-            ),
-            (Some((name, _)), _) => format!(
-                "The system output changed to {name} during the take: listen before you choose it."
-            ),
-            // Another device whose name could not be read, or the same one
-            // back as a new object.
-            (None, Some(_)) if pending.is_none() || !known => {
-                "The system output changed during the take: listen before you choose it.".to_owned()
-            }
-            _ if known => format!(
-                "The system output ({}) dropped out during the take: listen before you choose it.",
-                route.name
-            ),
-            _ => "The system output dropped out during the take: listen before you choose it."
-                .to_owned(),
+        // The same device back as a new object, or none: it dropped out.
+        let back = pending
+            .as_ref()
+            .is_some_and(|(_, uid)| route.uid.as_ref() == Some(uid));
+        let other = pending.filter(|_| !back);
+        let from = route.uid.as_ref().map(|_| route.name.as_str());
+        let what = if now.is_none() || back {
+            format!(
+                "dropped out{}",
+                from.map(|n| format!(" ({n})")).unwrap_or_default()
+            )
+        } else {
+            let to = other.as_ref().map(|(name, _)| format!(" to {name}"));
+            let from = from.map(|n| format!(" from {n}"));
+            format!(
+                "changed{}{}",
+                from.unwrap_or_default(),
+                to.unwrap_or_default()
+            )
         };
+        let note =
+            format!("The system output {what} during the take: listen before you choose it.");
         if self.recorder.note_route(note)
             && let Some(route) = &mut self.take_route
         {
@@ -639,6 +652,14 @@ impl RecordingWindow {
             (Some(uid), Some(object)) => self.see(uid, object, Lookup::Take),
             _ => self.confirm_take_device(),
         };
+        if !matches!(seen, Seen::Same | Seen::Unsure) {
+            // Before stopping it: a film that moved already played, and its
+            // loss is noted instead.
+            self.recorder.probe_film(&*self.media);
+            if !self.recorder.film_waiting() {
+                return StartHold::Go;
+            }
+        }
         match seen {
             Seen::Same => StartHold::Go,
             Seen::Unsure => StartHold::Wait,
@@ -667,9 +688,8 @@ impl RecordingWindow {
     }
 
     /// Says something about the route (a refusal, a stop, its output being
-    /// back): a later route status may replace it, but never a take's result.
+    /// back).
     pub(super) fn say_route(&mut self, text: String) {
-        self.route_status = Some(text.clone());
         self.message = Some(text);
     }
 

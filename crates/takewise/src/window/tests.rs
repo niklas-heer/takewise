@@ -1155,8 +1155,8 @@ fn a_missing_output_refuses_playback_until_it_is_connected(cx: &mut TestAppConte
         format!("{PHONES} is connected: the film and your takes play there.")
     );
     assert_eq!(f.view.read_with(cx, |view, _| view.output_note()), None);
-    // Back again after another drop: said only in place of nothing, or of
-    // what was said about it, never over something else.
+    // Back again after another drop: said over a passing status, but
+    // never over a take's result (see `a_reconnect_does_not_hide_a_take_warning`).
     unplug(&f, PHONES);
     f.media.set_now(106.0);
     frame(cx, f.window);
@@ -1174,7 +1174,10 @@ fn a_missing_output_refuses_playback_until_it_is_connected(cx: &mut TestAppConte
         f.media.0.borrow().output_sets.last(),
         Some(&Some(PHONES.to_owned()))
     );
-    assert_eq!(message(cx, &f.view), "Chose d take 1.");
+    assert_eq!(
+        message(cx, &f.view),
+        format!("{PHONES} is connected: the film and your takes play there.")
+    );
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     frame(cx, f.window);
@@ -1608,10 +1611,15 @@ fn a_take_stopped_before_its_film_started_has_no_output_note(cx: &mut TestAppCon
 #[gpui_kit::test]
 fn a_route_loss_calls_off_a_start_whose_time_already_came(cx: &mut TestAppContext) {
     // `begin` schedules d's film for 100.4. At 100.42 the start time has
-    // come, but the player was not read back running yet: the window's
-    // stop still holds, and the film is paused at once.
+    // come, but the player has not moved: the window's stop still holds,
+    // and the film is paused at once.
     let f = on_test_phones(cx);
     begin(cx, &f, 100.0);
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.4,
+    });
     f.media.set_now(100.42);
     let pauses = f.media.0.borrow().pauses.len();
     f.view.update(cx, |view, _| {
@@ -1718,7 +1726,10 @@ fn a_failed_lookup_is_not_a_drop(cx: &mut TestAppContext) {
     }
     f.media.set_now(301.5);
     press(cx, f.window, &["space"]);
-    assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+    // Reads that failed are not a disconnect: said as such.
+    assert!(message(cx, &f.view).contains(
+        "Test Phones could not be checked during the take: the film may have played elsewhere"
+    ));
 }
 
 #[gpui_kit::test]
@@ -1858,6 +1869,115 @@ fn partial_meta(dir: &Path, line: &str) -> Option<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| path.to_string_lossy().ends_with(".json.partial"))
+}
+
+#[gpui_kit::test]
+fn a_playing_route_that_cannot_be_read_is_retried_each_tick(cx: &mut TestAppContext) {
+    // One device change, then reads that fail: retried every tick (not
+    // left to the two-second poll), and stopped once the grace is over.
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.0.borrow_mut().generation += 1;
+    let mut lookups = f.media.0.borrow().lookups;
+    for n in 1..=4 {
+        f.media.set_now(200.0 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+        assert!(
+            f.media.0.borrow().lookups > lookups,
+            "read again at tick {n}"
+        );
+        lookups = f.media.0.borrow().lookups;
+        assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    }
+    for n in 5..=7 {
+        f.media.set_now(200.0 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        message(cx, &f.view),
+        "The playback stopped. Test Phones could not be checked; try again."
+    );
+
+    // A read that succeeds in time: it plays on.
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(300.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.0.borrow_mut().generation += 1;
+    f.media.set_now(300.1);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().lookups_fail = false;
+    for n in 2..=8 {
+        f.media.set_now(300.0 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn a_refusal_gives_way_to_the_connected_notice_once_confirmed(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some(PHONES)).expect("output");
+        commit_outside(dir, "d");
+    });
+    press(cx, f.window, &["down", "down", "down"]); // d
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    let refusal = format!("{PHONES} is not connected: connect it or pick another output (A).");
+    assert_eq!(message(cx, &f.view), refusal);
+    // Back, but not confirmed yet: still the refusal.
+    f.media.0.borrow_mut().lookups_fail = true;
+    plug(&f, PHONES);
+    f.media.set_now(200.1);
+    frame(cx, f.window);
+    assert_eq!(message(cx, &f.view), refusal, "not confirmed yet");
+    // Confirmed on a later tick, without another device change.
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(200.2);
+    frame(cx, f.window);
+    assert_eq!(
+        message(cx, &f.view),
+        format!("{PHONES} is connected: the film and your takes play there.")
+    );
+}
+
+#[gpui_kit::test]
+fn a_probe_decides_but_places_nothing(cx: &mut TestAppContext) {
+    // The film's player first reports it started at 100.41 (a glimpse at
+    // 100.42, when the phones are gone), then at 100.43 once settled. The
+    // decision at 100.42 sees it moving, so the take goes on and warns;
+    // the take is placed by the settled read (from 100.45 on), not the
+    // glimpse: its first sample (host 100.0) at film 6.0 - 0.43 = 5.57.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.41,
+    });
+    unplug_quietly(&f, "Test Phones");
+    f.media.set_now(100.42);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 1.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.43,
+    });
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    f.media.set_now(100.6);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+    let takes = recorded(&f.dir);
+    let offset = takes.last().expect("the take").2.line_offset_s;
+    assert!(close(offset, 5.57 - 8.0), "placed at {offset}");
 }
 
 #[gpui_kit::test]

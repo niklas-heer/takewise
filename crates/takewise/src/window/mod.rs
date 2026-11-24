@@ -641,9 +641,9 @@ pub struct RecordingWindow {
     take_warning: Option<String>,
     /// The failing streaks of device lookups, by kind.
     failing: output::Failures,
-    /// The last thing said about the route (a refusal, a stop, "is
-    /// connected"), which a later route status may replace.
-    route_status: Option<String>,
+    /// The last take result shown, which no notice about the output may
+    /// replace.
+    take_result: Option<String>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -741,7 +741,7 @@ impl RecordingWindow {
             ticked_at: None,
             take_warning: None,
             failing: output::Failures::default(),
-            route_status: None,
+            take_result: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1274,7 +1274,7 @@ impl RecordingWindow {
     fn finish_take(&mut self) {
         // Whatever stops it (Space, R, closing), its route is checked
         // before its result is made: first whether its film moved at all.
-        self.recorder.track_film(&*self.media);
+        self.recorder.probe_film(&*self.media);
         self.check_take_route(true);
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
@@ -1440,7 +1440,11 @@ impl RecordingWindow {
         let success = self.took(update.committed);
         let passage = update.passage.map(|passage| self.took_passage(&passage));
         let success = recorder::join(success, passage);
+        let result = update.route_note.is_some() || success.is_some();
         if let Some(message) = recorder::join(success, update.message) {
+            if result {
+                self.take_result = Some(message.clone());
+            }
             self.message = Some(message);
         }
     }
@@ -1468,6 +1472,7 @@ impl RecordingWindow {
         self.start_take();
         if warning.is_some() {
             self.message = recorder::join(warning, self.message.take());
+            self.take_result.clone_from(&self.message);
         }
         cx.notify();
     }

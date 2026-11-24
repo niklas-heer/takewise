@@ -35,8 +35,10 @@ pub struct FilmClock {
     start_host_s: Option<f64>,
     /// Host time from which the current start's scheduled mapping holds.
     scheduled_from_s: f64,
-    /// Whether the player was read playing since the current start.
+    /// Whether the player was read playing since the current start, and
+    /// whether a probe saw it moving (which places nothing).
     read_back: bool,
+    moved: bool,
     /// The mapping a start would have scheduled, when the player refused to
     /// play: it places the take, though the film never follows it.
     assumed: Option<Timebase>,
@@ -56,7 +58,7 @@ impl FilmClock {
     /// the film really ran, not only was scheduled. A start still to come,
     /// or a player that stalled, has not.
     pub fn ran(&self) -> bool {
-        self.start_host_s.is_some() && self.read_back
+        self.start_host_s.is_some() && (self.read_back || self.moved)
     }
 
     /// Whether samples can be placed: the film was scheduled, or a refused
@@ -103,6 +105,7 @@ impl FilmClock {
         self.scheduled_from_s = from;
         self.start_host_s = Some(tb.host_anchor_s);
         self.read_back = false;
+        self.moved = false;
         Ok(tb)
     }
 
@@ -117,27 +120,10 @@ impl FilmClock {
         let Some(start) = self.start_host_s else {
             return;
         };
-        if media.host_now_s() < start + READ_BACK_AFTER_S {
+        let now = media.host_now_s();
+        if now < start + READ_BACK_AFTER_S {
             return;
         }
-        self.read(media);
-    }
-
-    /// Asks the player whether the film moves, from its start on and
-    /// without waiting [`READ_BACK_AFTER_S`]: before a start is called off
-    /// or a take stopped, a film that already moved counts as played. A
-    /// player that does not move yet changes nothing.
-    pub fn probe(&mut self, media: &dyn Media) {
-        if self
-            .start_host_s
-            .is_some_and(|start| media.host_now_s() >= start)
-        {
-            self.read(media);
-        }
-    }
-
-    fn read(&mut self, media: &dyn Media) {
-        let now = media.host_now_s();
         let actual = media.film_timebase();
         if !self.read_back && actual.rate <= 0.0 {
             return;
@@ -155,6 +141,20 @@ impl FilmClock {
             self.history.record(from, actual);
         }
         self.read_back = true;
+    }
+
+    /// Asks the player, at a decision (calling a start off, stopping a
+    /// take), whether the film moves, from its start on and without
+    /// waiting [`READ_BACK_AFTER_S`]: one that moved counts as played. It
+    /// places nothing: the mapping is read by [`FilmClock::track`] only.
+    pub fn probe(&mut self, media: &dyn Media) {
+        if self
+            .start_host_s
+            .is_some_and(|start| media.host_now_s() >= start)
+            && media.film_timebase().rate > 0.0
+        {
+            self.moved = true;
+        }
     }
 
     /// How far the film is behind its schedule at `host_s` when the player

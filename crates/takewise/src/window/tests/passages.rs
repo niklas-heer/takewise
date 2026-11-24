@@ -514,6 +514,19 @@ fn shift_p_waits_for_a_missing_output(cx: &mut TestAppContext) {
         "Gone Phones is not connected: connect it or pick another output (A)."
     );
     assert_eq!(f.media.0.borrow().opened_takes.len(), 0, "no take opened");
+    // Connected: the refusal gives way to the notice, as for P.
+    f.media.0.borrow_mut().outputs.push(super::output(
+        "Gone Phones",
+        takewise_media::Transport::Usb,
+        takewise_media::OutputSource::Unknown,
+    ));
+    f.media.0.borrow_mut().generation += 1;
+    f.media.set_now(201.0);
+    frame(cx, f.window);
+    assert_eq!(
+        message(cx, &f.view),
+        "Gone Phones is connected: the film and your takes play there."
+    );
 }
 
 #[gpui_kit::test]

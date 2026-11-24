@@ -79,6 +79,12 @@ pub fn calibration_matches(config: &ProjectConfig, route: &Route) -> bool {
     config.calibration.is_some() && !takewise_core::effective_latency_offset(config, route).1
 }
 
+/// Whether a take's film ran, the player asked at once.
+fn probed(take: &mut Take, media: &dyn Media) -> bool {
+    take.clock.probe(media);
+    take.clock.ran()
+}
+
 /// How long a start may wait for its output to be confirmed before it gives
 /// up (the window usually gives up first, after its lookup grace).
 const WAIT_LIMIT_S: f64 = 1.0;
@@ -1414,9 +1420,9 @@ impl Recorder {
             if playback.started.is_none() || now < playback.starts_host_s)
     }
 
-    /// Asks the player whether a take's film has started moving (at once,
-    /// not after a delay), so that what follows in this tick knows it.
-    pub fn track_film(&mut self, media: &dyn Media) {
+    /// At a decision: asks the player whether a take's film has started
+    /// moving (at once, not after a delay). Places nothing.
+    pub fn probe_film(&mut self, media: &dyn Media) {
         if let Phase::Recording(take) = &mut self.phase {
             take.clock.probe(media);
         }
@@ -1519,11 +1525,13 @@ impl Recorder {
                 // film paused at once. One not confirmed waits.
                 let failure = match hold {
                     // Also before any input buffer came: what came is kept.
-                    StartHold::Stop(why) if !take.clock.ran() => {
+                    // A film that moved is not stopped or called off: it
+                    // played, and the window notes it.
+                    StartHold::Stop(why) if !probed(take, media) => {
                         media.film_pause();
                         Some(why)
                     }
-                    StartHold::Wait if !take.clock.ran() => {
+                    StartHold::Wait if !probed(take, media) => {
                         // Not confirmed: a start already scheduled is
                         // called off, to be scheduled afresh (its count-in
                         // with it) once the output is confirmed.
@@ -1851,18 +1859,17 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
         film_shift_ms: None,
         passage: None,
     };
+    // Recorded as tried before writing, as for a passage: a failing disk
+    // is not tried every frame, and the take is written again on commit.
+    take.sidecar_first_film_s = Some(first);
     if let Some(partial) = &take.partial {
-        // Left as it was when this fails: written once more on commit.
-        if update_take_meta(partial, &input).is_ok() {
-            take.sidecar_first_film_s = Some(first);
-        }
+        let _ = update_take_meta(partial, &input);
         return None;
     }
     match begin_take(dir, &take.line, &input) {
         Ok(partial) => {
             take.writer.open(partial.wav.clone());
             take.partial = Some(partial);
-            take.sidecar_first_film_s = Some(first);
             None
         }
         Err(err) => {

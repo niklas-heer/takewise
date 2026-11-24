@@ -111,13 +111,21 @@ impl RecordingWindow {
             self.recorder.stop_playback(&mut *self.media);
             return;
         }
-        let started = self.selected_piece().and_then(|piece| {
-            self.route_for_start()
-                .map_err(|problem| problem.for_playback())?;
-            self.recorder
-                .start_passage_playback(&mut *self.media, &self.project, &piece)
-        });
-        self.message = started.err();
+        let piece = match self.selected_piece() {
+            Ok(piece) => piece,
+            Err(why) => {
+                self.message = Some(why);
+                return;
+            }
+        };
+        if let Err(problem) = self.route_for_start() {
+            self.say_route(problem.for_playback());
+            return;
+        }
+        self.message = self
+            .recorder
+            .start_passage_playback(&mut *self.media, &self.project, &piece)
+            .err();
     }
 
     /// Shift+Enter: chooses the selected take's passage for every line it
