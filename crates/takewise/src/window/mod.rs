@@ -1928,6 +1928,7 @@ fn take_actions(
 impl Render for RecordingWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tick();
+        self.sync_sliders(window, cx);
         window.request_animation_frame();
 
         let media = &*self.media;

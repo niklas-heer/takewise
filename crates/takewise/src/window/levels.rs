@@ -156,6 +156,9 @@ pub struct Levels {
     film: Entity<SliderState>,
     voice: Entity<SliderState>,
     monitor: Entity<SliderState>,
+    /// Whether a level changed without its slider (a reload): the sliders
+    /// are moved to the levels at the next frame, which has the window.
+    stale: bool,
 }
 
 impl Levels {
@@ -181,6 +184,7 @@ impl Levels {
             film: slider(Level::Film, cx),
             voice: slider(Level::Voice, cx),
             monitor: slider(Level::Monitor, cx),
+            stale: false,
         };
         let subscriptions = [Level::Film, Level::Voice, Level::Monitor]
             .into_iter()
@@ -346,6 +350,9 @@ impl RecordingWindow {
             }
         }
         self.volumes.write_into(&mut self.project.config);
+        if self.volumes != before {
+            self.levels.stale = true;
+        }
         if (self.volumes.film - before.film).abs() > f64::EPSILON {
             self.apply_film_level();
         }
@@ -354,6 +361,21 @@ impl RecordingWindow {
         }
         self.recorder
             .set_playback_levels(self.volumes.film, self.volumes.voice);
+    }
+
+    /// Once per frame: moves the sliders to levels that changed without
+    /// them, so dragging or a key goes on from the level heard.
+    pub(super) fn sync_sliders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.levels.stale) {
+            return;
+        }
+        for level in Level::ALL {
+            #[allow(clippy::cast_possible_truncation)]
+            let db = self.volumes.get(level) as f32;
+            self.levels
+                .slider(level)
+                .update(cx, |s, cx| s.set_value(db, window, cx));
+        }
     }
 
     /// The levels block under the takes.

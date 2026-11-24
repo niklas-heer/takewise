@@ -3257,6 +3257,25 @@ fn keys_move_the_level_sliders(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_reloaded_level_moves_its_slider(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let edit = tw::Volumes {
+        film_gain_db: Some(-20.0),
+        ..tw::Volumes::default()
+    };
+    tw::set_volumes(&f.dir, edit).expect("agent edit");
+    f.view.update(cx, |view, _| view.reload());
+    frame(cx, f.window);
+    assert_eq!(slider_db(cx, &f, Level::Film), -20.0);
+    press(cx, f.window, &["+"]);
+    assert_eq!(slider_db(cx, &f, Level::Film), -19.0);
+    press(cx, f.window, &["-", "-"]);
+    assert_eq!(slider_db(cx, &f, Level::Film), -21.0);
+    f.view
+        .read_with(cx, |view, _| assert_eq!(view.volumes.film, -21.0));
+}
+
+#[gpui_kit::test]
 fn the_monitor_level_shows_only_while_monitoring_can_run(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     let shown = |cx: &mut TestAppContext| f.view.read_with(cx, |view, _| view.shown_levels());
