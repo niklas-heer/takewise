@@ -236,6 +236,41 @@ pub struct Rescued {
     pub passages: usize,
 }
 
+/// Why [`Recorder::rescue`] did not give everything a rescue copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RescueFailed {
+    /// What failed first.
+    pub error: String,
+    /// The copies that were written all the same.
+    pub rescued: Option<Rescued>,
+    /// The audio that was written without its JSON file.
+    pub audio_only: Option<AudioOnly>,
+}
+
+/// Audio that [`Recorder::rescue`] wrote without its JSON file: the WAVs
+/// are in the folder, but nothing with them says where they belong, so it
+/// still counts as having no rescue copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioOnly {
+    /// The folder the WAVs are in.
+    pub folder: PathBuf,
+    pub takes: usize,
+    pub passages: usize,
+    /// Why the first of the JSON files could not be written.
+    pub error: String,
+}
+
+impl RescueFailed {
+    /// Nothing was written, because of `error`.
+    pub fn new(error: &impl ToString) -> Self {
+        Self {
+            error: error.to_string(),
+            rescued: None,
+            audio_only: None,
+        }
+    }
+}
+
 enum Warmup {
     Pending,
     Running { until_host_s: f64 },
@@ -400,17 +435,24 @@ impl Recorder {
         (takes, passages.filter(|s| s.only_in_memory()).count())
     }
 
-    /// Whether audio exists only in memory and has no rescue copy either:
-    /// closing now would lose it for good.
-    pub fn needs_rescue(&self) -> bool {
+    /// How many takes and passages exist only in memory and have no
+    /// rescue copy either: closing now would lose them for good.
+    pub fn without_rescue_copy(&self) -> (usize, usize) {
         let takes = self.unsaved.iter();
         let passages = self.unsaved_passages.iter();
-        takes
-            .filter(|u| u.only_in_memory())
-            .any(|u| u.rescued.is_none())
-            || passages
-                .filter(|s| s.only_in_memory())
-                .any(|s| s.rescued.is_none())
+        (
+            takes
+                .filter(|u| u.only_in_memory() && u.rescued.is_none())
+                .count(),
+            passages
+                .filter(|s| s.only_in_memory() && s.rescued.is_none())
+                .count(),
+        )
+    }
+
+    /// Whether audio exists only in memory and has no rescue copy either.
+    pub fn needs_rescue(&self) -> bool {
+        self.without_rescue_copy() != (0, 0)
     }
 
     /// Writes a rescue copy of every stopped take and passage whose audio
@@ -420,20 +462,25 @@ impl Recorder {
     /// and saving it into the project is still retried.
     ///
     /// `Ok(None)` when nothing needed one. On an error some copies may
-    /// have been written; what has none yet still needs one, and this can
-    /// be called again.
+    /// have been written, and some audio without its JSON file, which the
+    /// error says; what has no whole copy yet still needs one, and this
+    /// can be called again.
     pub fn rescue(
         &mut self,
         root: &Path,
         dir: &Path,
         at: jiff::Timestamp,
-    ) -> Result<Option<Rescued>, String> {
+    ) -> Result<Option<Rescued>, Box<RescueFailed>> {
         if !self.needs_rescue() {
             return Ok(None);
         }
-        let mut rescue = Rescue::create(root, dir, at).map_err(|err| err.to_string())?;
+        let mut rescue =
+            Rescue::create(root, dir, at).map_err(|err| Box::new(RescueFailed::new(&err)))?;
         // What was copied, to be marked once the folder is durable.
         let (mut takes, mut passages) = (Vec::new(), Vec::new());
+        // The audio that got its WAV and no JSON file: takes, passages,
+        // and why the first JSON file could not be written.
+        let mut audio_only = (0, 0, None);
         let mut failed = None;
         for (index, unsaved) in self.unsaved.iter().enumerate() {
             if !unsaved.only_in_memory() || unsaved.rescued.is_some() {
@@ -441,7 +488,13 @@ impl Recorder {
             }
             match rescue.add_take(&unsaved.line, &unsaved.input, &unsaved.samples) {
                 Ok(wav) => takes.push((index, wav)),
-                Err(err) => failed = failed.or(Some(err.to_string())),
+                Err(err) => {
+                    if let takewise_core::Error::RescueJson { source, .. } = &err {
+                        audio_only.0 += 1;
+                        audio_only.2 = audio_only.2.or(Some(source.to_string()));
+                    }
+                    failed = failed.or(Some(err.to_string()));
+                }
             }
         }
         for (index, stopped) in self.unsaved_passages.iter().enumerate() {
@@ -450,20 +503,31 @@ impl Recorder {
             }
             match rescue.add_passage(&stopped.unsaved.input, &stopped.unsaved.samples) {
                 Ok(wav) => passages.push((index, wav)),
-                Err(err) => failed = failed.or(Some(err.to_string())),
+                Err(err) => {
+                    if let takewise_core::Error::RescueJson { source, .. } = &err {
+                        audio_only.1 += 1;
+                        audio_only.2 = audio_only.2.or(Some(source.to_string()));
+                    }
+                    failed = failed.or(Some(err.to_string()));
+                }
             }
         }
-        if takes.is_empty() && passages.is_empty() {
-            // Nothing could be copied: no empty folder is left behind.
+        if takes.is_empty() && passages.is_empty() && audio_only.2.is_none() {
+            // Nothing could be written: no empty folder is left behind.
             let _ = std::fs::remove_dir(rescue.folder());
-            return Err(failed.unwrap_or_else(|| "nothing was copied".to_owned()));
+            let failed = failed.unwrap_or_else(|| "nothing was copied".to_owned());
+            return Err(Box::new(RescueFailed::new(&failed)));
         }
-        let folder = rescue.finish().map_err(|err| err.to_string())?;
-        let rescued = Rescued {
-            folder,
+        // A WAV without its JSON file is made durable like a whole copy:
+        // it is all there is of that audio outside this process.
+        let folder = rescue
+            .finish()
+            .map_err(|err| Box::new(RescueFailed::new(&err)))?;
+        let rescued = (!takes.is_empty() || !passages.is_empty()).then(|| Rescued {
+            folder: folder.clone(),
             takes: takes.len(),
             passages: passages.len(),
-        };
+        });
         for (index, wav) in takes {
             if let Some(unsaved) = self.unsaved.get_mut(index) {
                 unsaved.rescued = Some(wav);
@@ -475,8 +539,17 @@ impl Recorder {
             }
         }
         match failed {
-            Some(err) => Err(err),
-            None => Ok(Some(rescued)),
+            Some(error) => Err(Box::new(RescueFailed {
+                error,
+                rescued,
+                audio_only: audio_only.2.map(|error| AudioOnly {
+                    folder,
+                    takes: audio_only.0,
+                    passages: audio_only.1,
+                    error,
+                }),
+            })),
+            None => Ok(rescued),
         }
     }
 

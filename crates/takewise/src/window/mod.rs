@@ -710,7 +710,7 @@ impl RecordingWindow {
                     self.close_refused = None;
                     return false;
                 }
-                Err(err) => Some(err),
+                Err(failed) => Some(failed.error),
             }
         } else {
             None
@@ -731,39 +731,45 @@ impl RecordingWindow {
     }
 
     /// Writes a rescue copy of the audio that is only in memory and has
-    /// none yet, and says where it is.
-    fn rescue_unsaved(&mut self) -> Result<(), String> {
-        let root = self
-            .rescue_root
-            .clone()
-            .ok_or("there is no folder for rescue copies")?;
+    /// none yet, and says where it is: also of the copies that were
+    /// written when another could not be.
+    fn rescue_unsaved(&mut self) -> Result<(), Box<recorder::RescueFailed>> {
+        let root = self.rescue_root.clone().ok_or_else(|| {
+            Box::new(recorder::RescueFailed::new(
+                &"there is no folder for rescue copies",
+            ))
+        })?;
         #[cfg(test)]
         start::isolated::assert_temporary(&root);
         let at = jiff::Timestamp::now();
-        if let Some(rescued) = self.recorder.rescue(&root, &self.dir, at)? {
-            let note = rescued_note(&rescued);
+        let outcome = self.recorder.rescue(&root, &self.dir, at);
+        let rescued = match &outcome {
+            Ok(rescued) => rescued.as_ref(),
+            Err(failed) => failed.rescued.as_ref(),
+        };
+        if let Some(rescued) = rescued {
+            let note = rescued_note(rescued);
             // The window may be gone before anyone reads its message.
             eprintln!("takewise: {note}");
             self.message = Some(note);
         }
-        Ok(())
+        outcome.map(drop)
     }
 
     /// When the window or the app is going for good: audio that is still
     /// only in memory gets its rescue copy, whether or not closing was
-    /// asked about before (a quit from the Dock or a logout is not).
+    /// asked about before (a quit from the Dock or a logout is not). What
+    /// did not get one is said, and where its audio is when only the JSON
+    /// file beside it could not be written.
     fn rescue_at_exit(&mut self) {
         if !self.recorder.needs_rescue() {
             return;
         }
-        if let Err(err) = self.rescue_unsaved() {
-            let (takes, passages) = self.recorder.in_memory_only();
-            let note = format!(
-                "{} could be neither saved nor rescued and is lost: {err}",
-                counted(takes, passages)
-            );
+        if let Err(failed) = self.rescue_unsaved() {
+            let note = not_rescued_note(self.recorder.without_rescue_copy(), &failed);
             eprintln!("takewise: {note}");
-            self.message = Some(note);
+            // After what was said of the copies that were written.
+            self.message = recorder::join(failed.rescued.and(self.message.take()), Some(note));
         }
     }
 
@@ -1622,6 +1628,43 @@ fn rescued_note(rescued: &recorder::Rescued) -> String {
         "{what} could not be saved into the project and {was} only in memory: {copy} in {}. `takewise status` says how to bring the audio back.",
         rescued.folder.display()
     )
+}
+
+/// What the window says as it goes about the audio that got no rescue
+/// copy: `without` takes and passages, of which `failed.audio_only` are in
+/// the rescue folder as WAVs without their JSON file, and the rest are
+/// nowhere but in the memory that is about to go.
+fn not_rescued_note(without: (usize, usize), failed: &recorder::RescueFailed) -> String {
+    let (kept_takes, kept_passages) = failed
+        .audio_only
+        .as_ref()
+        .map_or((0, 0), |kept| (kept.takes, kept.passages));
+    let kept = failed.audio_only.as_ref().map(|kept| {
+        let (copy, files, keep) = if kept_takes + kept_passages == 1 {
+            ("its rescue copy is", "a WAV file", "that file")
+        } else {
+            ("their rescue copies are", "WAV files", "those files")
+        };
+        format!(
+            "{} could not be saved into the project, and {copy} incomplete: the audio is in {} as {files}, but the JSON that says where it belongs could not be written ({}). Keep {keep}.",
+            counted(kept_takes, kept_passages),
+            kept.folder.display(),
+            kept.error
+        )
+    });
+    let (takes, passages) = (
+        without.0.saturating_sub(kept_takes),
+        without.1.saturating_sub(kept_passages),
+    );
+    let lost = (takes + passages > 0).then(|| {
+        format!(
+            "{} could be neither saved nor rescued and {} lost: {}",
+            counted(takes, passages),
+            if takes + passages == 1 { "is" } else { "are" },
+            failed.error
+        )
+    });
+    recorder::join(kept, lost).unwrap_or_else(|| failed.error.clone())
 }
 
 /// The audio keys: the panel (A), monitoring (H), the clipping light (K),

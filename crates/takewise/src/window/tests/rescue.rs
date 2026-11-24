@@ -288,3 +288,66 @@ fn a_window_says_when_its_project_has_rescued_audio(cx: &mut TestAppContext) {
         "{shown}"
     );
 }
+
+#[gpui_kit::test]
+fn a_quit_says_where_the_audio_is_when_its_json_could_not_be_written(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    use_settings(cx, &f);
+    block_takes_of_a(&f.dir);
+    record_take(cx, &f);
+    // The rescue folder's disk takes the audio and then fails.
+    tw::rescue::fail_json_writes(true);
+    cx.quit();
+    tw::rescue::fail_json_writes(false);
+
+    // The audio is not lost: it is in the folder, which `status` lists.
+    let found = tw::rescue::rescued_for(&rescue_root(), &f.dir);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].audio, []);
+    assert_eq!(found[0].without_json, ["001-take-a.wav"]);
+    let folder = &found[0].folder;
+    let (samples, rate) = tw::read_take_wav(&folder.join("001-take-a.wav")).expect("the audio");
+    assert_eq!((samples.len(), rate), (2400, 48_000));
+    // And the window says so, not that it is lost.
+    let shown = message(cx, &f.view);
+    let said = format!(
+        "1 take could not be saved into the project, and its rescue copy is incomplete: the audio is in {} as a WAV file, but the JSON that says where it belongs could not be written (",
+        folder.display()
+    );
+    assert!(shown.starts_with(&said), "{shown}");
+    assert!(shown.ends_with("). Keep that file."), "{shown}");
+    assert!(!shown.contains("lost"), "{shown}");
+}
+
+#[gpui_kit::test]
+fn the_window_stays_open_while_a_rescue_copy_has_no_json(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    use_settings(cx, &f);
+    let blocker = block_takes_of_a(&f.dir);
+    record_take(cx, &f);
+    assert!(!VisualTestContext::from_window(f.window, cx).simulate_close());
+    // Asked again, the audio is written and its JSON file is not: that is
+    // no copy to close on, and the window says where the audio is.
+    tw::rescue::fail_json_writes(true);
+    assert!(!VisualTestContext::from_window(f.window, cx).simulate_close());
+    tw::rescue::fail_json_writes(false);
+    let found = tw::rescue::rescued_for(&rescue_root(), &f.dir);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let wav = found[0].folder.join("001-take-a.wav");
+    assert!(wav.is_file());
+    let shown = message(cx, &f.view);
+    let said = format!(
+        "and the rescue copy could not be written either (the audio is in {}, but the JSON file that says where it belongs could not be written: ",
+        wav.display()
+    );
+    assert!(
+        shown.starts_with("Not closing: 1 take is only in memory") && shown.contains(&said),
+        "{shown}"
+    );
+    assert!(f.view.read_with(cx, |view, _| view.recorder.needs_rescue()));
+
+    // The project works again: the take is saved, and the window closes.
+    fs::remove_file(blocker).expect("unblock");
+    assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
+    assert_eq!(recorded(&f.dir).len(), 1);
+}
