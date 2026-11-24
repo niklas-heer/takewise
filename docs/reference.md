@@ -94,20 +94,24 @@ ls "$rescue"
 jq -r '"\(.audio): \(.kind) of \(.lines | join(", ")), for \(.project)"' "$rescue"/*.json
 ```
 
-Each JSON file names both places in `restore`, relative to the project folder, and carries the file to write as `sidecar`. Restore every recording in the folder, then run one repair:
+Each JSON file names both places in `restore`, relative to the project folder, and carries the file to write as `sidecar`. Restore every recording in the folder, then run one repair. The steps stop at the first one that fails, so nothing is left half restored without you seeing it:
 
 ```sh
 cd "<project>.takewise"
+set -e
 for json in "$rescue"/*.json; do
   audio="$(jq -r .restore.audio "$json")"
   mkdir -p "$(dirname "$audio")"
   cp "$rescue/$(jq -r .audio "$json")" "$audio"
   jq .sidecar "$json" > "$(jq -r .restore.sidecar "$json")"
+  echo "staged $(jq -r .audio "$json")"
 done
-takewise status --repair .
+takewise status --repair --json . | jq .data.repair
 ```
 
-The repair numbers each take as its line's next one, and publishes each passage and cuts it into its takes, all marked `recovered`. Do this with the window closed, or let the window do the repair when it opens. Then check that every recording is back: `takewise status` shows a new take on the line of each rescued take, and on every line a rescued passage reached. Only then delete the rescue folder, which removes all its recordings at once; until it is gone, `status` keeps listing it.
+Run this once per folder: running it again stages every recording a second time, and the repair adopts each again as another take. If a step failed, fix the cause, remove what that run staged for the recording it stopped at, and stage the remaining recordings only.
+
+The repair numbers each take as its line's next one, and publishes each passage and cuts it into its takes, all marked `recovered`. Do this with the window closed, or let the window do the repair when it opens. Then check every recording against the repair's report: each staged take is in `adopted` (its line and new number), and each staged passage in `passages_published`, with its takes in `pieces`. A recording missing there is not back yet; its files are still in the rescue folder. Only when every recording is accounted for, delete the rescue folder, which removes all its recordings at once; until it is gone, `status` keeps listing it.
 
 A WAV in the folder with no JSON file of the same name is audio whose JSON file could not be written (the disk failed between the two). The window says so as it goes, and `status` names such files in the folder's notice. Nothing says where that audio belongs in the project, so a repair cannot adopt it: listen to it, and keep it somewhere else if you need it, before you delete the folder.
 
