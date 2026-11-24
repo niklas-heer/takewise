@@ -30,7 +30,18 @@ pub struct Calibrating {
     /// The route it measures: as configured, and as in use, when it began.
     configured: Route,
     route: Route,
+    /// The very output device it began on (see [`OutputIdentity`]).
+    output: OutputIdentity,
 }
+
+/// Which output device plays: its UID and CoreAudio object (`None` when
+/// it could not be read). A device that went away and came back keeps its
+/// UID but has another object.
+type OutputIdentity = Option<(String, Option<u32>)>;
+
+/// Why a calibration ended when its output dropped out or changed.
+pub const OUTPUT_CHANGED: &str =
+    "the output dropped out or changed while measuring; press Space to measure again";
 
 impl RecordingWindow {
     /// Space in the latency step: makes the beep film, puts it in place of
@@ -78,6 +89,7 @@ impl RecordingWindow {
                     _work: work,
                     configured: Route::of(&self.project.config),
                     route,
+                    output: self.output_identity(),
                 });
                 Ok(())
             }
@@ -133,6 +145,39 @@ impl RecordingWindow {
         if self.calibrating.is_some() {
             self.end_calibration();
         }
+    }
+
+    /// The output device the film plays through now: the one the players
+    /// are set to, or the system's default output.
+    fn output_identity(&self) -> OutputIdentity {
+        let uid = match &self.applied_device {
+            Some((uid, _)) => uid.clone(),
+            None => self.media.default_output_uid()?.1,
+        };
+        let object = self.media.output_object(&uid);
+        Some((uid, object))
+    }
+
+    /// Before anything sets the output again: cancels a calibration whose
+    /// output device dropped out or changed since it began (a reconnect
+    /// gives it another object), whose beeps may have played elsewhere.
+    pub(super) fn cancel_calibration_if_output_dropped(&mut self) {
+        let Some(calibrating) = &self.calibrating else {
+            return;
+        };
+        let began = calibrating.output.clone();
+        // Not known when it began: nothing to compare.
+        if began.as_ref().is_none_or(|(_, object)| object.is_none()) {
+            return;
+        }
+        if self.output_identity() == began {
+            return;
+        }
+        self.end_calibration();
+        if let Some(setup) = &mut self.setup {
+            setup.latency = Some(Err(OUTPUT_CHANGED.to_owned()));
+        }
+        self.message = Some(format!("Latency calibration cancelled: {OUTPUT_CHANGED}."));
     }
 
     /// Cancels a calibration whose route changed since it began (in the

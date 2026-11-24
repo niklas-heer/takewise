@@ -52,6 +52,12 @@ impl FilmClock {
         self.start_host_s.is_some()
     }
 
+    /// Whether the film plays at host time `now`: it was scheduled and its
+    /// start came. Between the two it is scheduled, but nothing is heard.
+    pub fn playing(&self, now: f64) -> bool {
+        self.start_host_s.is_some_and(|start| now >= start)
+    }
+
     /// Whether samples can be placed: the film was scheduled, or a refused
     /// start's mapping is assumed.
     pub fn placed(&self) -> bool {

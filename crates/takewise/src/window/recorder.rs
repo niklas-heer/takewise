@@ -89,6 +89,11 @@ pub struct Update {
     pub peak_dbfs: Option<f64>,
     /// The takes a passage was cut into, once they are all there.
     pub passage: Option<PassageTakes>,
+    /// What a take that just stopped says of its output (it went away, or
+    /// the system output changed, while its film played), also in
+    /// `message`: the window keeps it in sight until the next take's
+    /// result.
+    pub route_note: Option<String>,
 }
 
 /// The takes of a passage recorded in one go.
@@ -388,8 +393,10 @@ struct Playback {
     /// The level the take plays at (`[record] voice_gain_db`).
     voice_gain_db: f64,
     opened_host_s: f64,
-    /// The film's scheduled timebase once both players started.
+    /// The film's scheduled timebase once both players were scheduled,
+    /// and the host time the first of them starts at.
     started: Option<Timebase>,
+    starts_host_s: f64,
 }
 
 impl Recorder {
@@ -972,14 +979,18 @@ impl Recorder {
         }
         let mut placement = place(&take, &written, estimated, unplayed_s);
         // Only a film that played can have played elsewhere.
-        let lost = take.route_lost.take().filter(|_| take.clock.started());
-        placement.notes = join(placement.notes, lost);
+        let now = media.host_now_s();
+        let lost = take.route_lost.take().filter(|_| take.clock.playing(now));
+        placement.notes = join(placement.notes, lost.clone());
         if let Some(passage) = take.passage.take() {
             placement.notes = join(why, placement.notes);
-            return self.publish_passage(dir, passage, written, placement);
+            let mut update = self.publish_passage(dir, passage, written, placement);
+            update.route_note = lost;
+            return update;
         }
         let mut update = self.commit_line(dir, take, written, placement);
         update.message = join(why, update.message);
+        update.route_note = lost;
         update
     }
 
@@ -1293,6 +1304,7 @@ impl Recorder {
             voice_gain_db: rec.voice_gain_db,
             opened_host_s: media.host_now_s(),
             started: None,
+            starts_host_s: f64::INFINITY,
         });
         Ok(())
     }
@@ -1353,6 +1365,7 @@ impl Recorder {
             voice_gain_db: project.config.record.voice_gain_db,
             opened_host_s: media.host_now_s(),
             started: None,
+            starts_host_s: f64::INFINITY,
         });
         Ok(())
     }
@@ -1372,23 +1385,26 @@ impl Recorder {
         self.start_hold = why;
     }
 
-    /// A playback opened and not started yet (its take may still load).
-    pub fn playback_waiting(&self) -> bool {
-        matches!(&self.phase, Phase::Playing(playback) if playback.started.is_none())
+    /// A playback opened and not playing yet at host time `now`: its take
+    /// may still load, or both are scheduled and their start is to come.
+    pub fn playback_waiting(&self, now: f64) -> bool {
+        matches!(&self.phase, Phase::Playing(playback)
+            if playback.started.is_none() || now < playback.starts_host_s)
     }
 
-    /// A take recording whose film is not scheduled yet.
-    pub fn film_waiting(&self) -> bool {
-        matches!(&self.phase, Phase::Recording(take) if !take.clock.started())
+    /// A take recording whose film does not play yet at host time `now`:
+    /// not scheduled, or scheduled and its start is to come.
+    pub fn film_waiting(&self, now: f64) -> bool {
+        matches!(&self.phase, Phase::Recording(take) if !take.clock.playing(now))
     }
 
     /// The output the film plays through went away or changed during the
     /// take: the take goes on, and its result says `note`. Only once its
-    /// film started, since before that nothing played; returns whether the
-    /// note was taken.
-    pub fn note_route(&mut self, note: String) -> bool {
+    /// film plays (`now`), since before that nothing was heard; returns
+    /// whether the note was taken.
+    pub fn note_route(&mut self, note: String, now: f64) -> bool {
         match &mut self.phase {
-            Phase::Recording(take) if take.clock.started() => {
+            Phase::Recording(take) if take.clock.playing(now) => {
                 take.route_lost.get_or_insert(note);
                 true
             }
@@ -1434,6 +1450,7 @@ impl Recorder {
             peak_dbfs: update.peak_dbfs,
             passage: cut.passage,
             message: join(update.message, cut.message),
+            route_note: update.route_note,
         }
     }
 
@@ -1445,9 +1462,10 @@ impl Recorder {
             Phase::Recording(take) => {
                 let progress = take.writer.progress();
                 // The film is scheduled once the first buffer is in; not
-                // when its output can no longer be used.
+                // when its output can no longer be used, and a start still
+                // to come is called off then.
                 let failure = match hold {
-                    Some(why) if !take.clock.started() && progress.first_host_s.is_some() => {
+                    Some(why) if !take.clock.playing(now) && progress.first_host_s.is_some() => {
                         Some(why)
                     }
                     _ => start_film(take, media, &progress, now),
@@ -1485,7 +1503,7 @@ impl Recorder {
                         ..Update::default()
                     }
                 }
-                None if hold.is_some() => {
+                _ if hold.is_some() => {
                     self.stop_playback(media);
                     Update {
                         message: hold,
@@ -1496,6 +1514,7 @@ impl Recorder {
                     match start_both(media, playback, now) {
                         Ok(tb) => {
                             playback.started = Some(tb);
+                            playback.starts_host_s = now + START_LEAD_S;
                             Update::default()
                         }
                         Err(err) => {

@@ -635,6 +635,9 @@ pub struct RecordingWindow {
     take_route: Option<output::TakeRoute>,
     /// When the window last ticked, from a frame or from its timer.
     ticked_at: Option<f64>,
+    /// The last take's warning about its output, kept in sight until the
+    /// next take's result.
+    take_warning: Option<String>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -730,6 +733,7 @@ impl RecordingWindow {
             applied_device: None,
             take_route: None,
             ticked_at: None,
+            take_warning: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1240,7 +1244,7 @@ impl RecordingWindow {
             self.message = Some(problem.for_recording());
             return;
         }
-        self.message = None;
+        self.message.clone_from(&self.take_warning);
         self.peak_meter.clear();
         self.scroll.reset();
         self.panel.picker = None;
@@ -1262,7 +1266,7 @@ impl RecordingWindow {
     fn finish_take(&mut self) {
         // Whatever stops it (Space, R, closing), its route is checked
         // before its result is made.
-        self.check_take_route(true);
+        self.check_take_route();
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
         self.pause_checks_while_recording();
@@ -1416,6 +1420,13 @@ impl RecordingWindow {
     fn show(&mut self, update: recorder::Update) {
         if let (Some(take), Some(peak)) = (&update.committed, update.peak_dbfs) {
             self.take_peaks.insert((take.line.clone(), take.take), peak);
+        }
+        // A take's warning about its output stays in sight until the next
+        // take's result, through a retake (R) that starts at once.
+        if update.route_note.is_some() {
+            self.take_warning.clone_from(&update.route_note);
+        } else if update.committed.is_some() {
+            self.take_warning = None;
         }
         let success = self.took(update.committed);
         let passage = update.passage.map(|passage| self.took_passage(&passage));

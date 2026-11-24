@@ -63,6 +63,9 @@ struct Fake {
     objects: std::collections::HashMap<String, u32>,
     /// The system's default output.
     default_output: String,
+    /// Whether no device's CoreAudio object can be read (gone again just
+    /// after it was found, or CoreAudio refusing).
+    objects_unreadable: bool,
     /// Whether an opened take is still loading.
     take_loading: bool,
     /// Where the film plays (`None`: the system default).
@@ -147,6 +150,7 @@ impl FakeMedia {
             generation: 0,
             objects: std::collections::HashMap::new(),
             default_output: "MacBook Speakers".to_owned(),
+            objects_unreadable: false,
             take_loading: false,
             film_output: None,
             take: None,
@@ -343,6 +347,9 @@ impl Media for FakeMedia {
     fn output_object(&self, uid: &str) -> Option<u32> {
         let name = uid.strip_prefix("uid:")?;
         let fake = self.0.borrow();
+        if fake.objects_unreadable {
+            return None;
+        }
         let connected = fake.outputs.iter().any(|output| output.name == name)
             || fake.hidden_outputs.iter().any(|hidden| hidden == name);
         connected.then(|| fake.objects.get(name).copied().unwrap_or(1))
@@ -1474,6 +1481,87 @@ fn a_start_looks_up_the_device_even_without_a_change(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_route_whose_device_cannot_be_confirmed_stays_due(cx: &mut TestAppContext) {
+    // Set, but gone again before its CoreAudio object could be read: not
+    // known to be there, so nothing is scheduled on it.
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().objects_unreadable = true;
+    unplug(&f, "Test Phones");
+    plug(&f, "Test Phones");
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(message(cx, &f.view).starts_with("Test Phones is not connected"));
+    assert_eq!(f.media.0.borrow().take_plays.len(), 0);
+    assert!(f.view.read_with(cx, |view, _| view.route_due));
+    // Confirmed on the next try: it plays.
+    f.media.0.borrow_mut().objects_unreadable = false;
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(!f.view.read_with(cx, |view, _| view.route_due));
+}
+
+#[gpui_kit::test]
+fn a_route_lost_before_the_scheduled_start_calls_the_start_off(cx: &mut TestAppContext) {
+    // `begin` schedules d's film at 100.1 to start at 100.4.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.2);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains(
+            "Recording stopped: Test Phones is not connected, so Takewise does not record"
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("may have played"), "nothing played: {said}");
+    assert_eq!(recorded(&f.dir).len(), 2, "the audio is kept");
+
+    // Gone and back before the start: say to start again.
+    plug(&f, "Test Phones");
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    begin(cx, &f, 120.0);
+    unplug(&f, "Test Phones");
+    plug(&f, "Test Phones");
+    f.media.set_now(120.2);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("Recording stopped: Test Phones dropped out; start the take again."),
+        "{said}"
+    );
+
+    // A playback scheduled at 200.3: gone, unreported, at 200.1.
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    unplug_quietly(&f, "Test Phones");
+    f.media.set_now(200.1);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(message(cx, &f.view).starts_with("The playback stopped. Test Phones is not connected"));
+}
+
+#[gpui_kit::test]
+fn a_take_stopped_before_its_film_started_has_no_output_note(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    unplug_quietly(&f, "Test Phones");
+    f.media.set_now(100.2);
+    f.view.update(cx, |view, _| view.finish_take());
+    let said = message(cx, &f.view);
+    assert!(!said.contains("may have played"), "{said}");
+}
+
+#[gpui_kit::test]
 fn a_playing_film_is_set_again_only_when_its_device_dropped(cx: &mut TestAppContext) {
     let f = on_test_phones(cx);
     f.media.set_now(200.0);
@@ -1499,22 +1587,43 @@ fn a_playing_film_is_set_again_only_when_its_device_dropped(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
-fn a_take_notes_a_drop_between_ticks_and_sets_the_route_after_it(cx: &mut TestAppContext) {
+fn a_take_notes_a_drop_between_ticks_and_sets_the_route_again_at_once(cx: &mut TestAppContext) {
     let f = on_test_phones(cx);
     begin(cx, &f, 100.0);
+    f.media.set_now(100.5); // the film plays from 100.4
+    frame(cx, f.window);
     let sets = |f: &Fixture| f.media.0.borrow().output_sets.len();
     let before = sets(&f);
+    // Gone and back between two ticks: noted, and set again at once, so
+    // the film does not play out loud for the rest of the take.
     unplug(&f, "Test Phones");
     plug(&f, "Test Phones");
+    f.media.set_now(100.6);
     frame(cx, f.window);
-    assert_eq!(sets(&f), before, "not during the take");
-    f.media.set_now(100.5);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(sets(&f), before + 1, "during the take");
+    f.media.set_now(100.7);
     press(cx, f.window, &["space"]);
     assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
-    // Before the next start, the route is set again.
+    // Set already: the next start needs nothing.
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     assert_eq!(sets(&f), before + 1);
+
+    // Gone during a take and back only later: set again once it is back.
+    press(cx, f.window, &["p"]);
+    begin(cx, &f, 300.0);
+    f.media.set_now(300.5);
+    frame(cx, f.window);
+    unplug(&f, "Test Phones");
+    f.media.set_now(300.6);
+    frame(cx, f.window);
+    assert_eq!(sets(&f), before + 1, "nothing to set while it is gone");
+    plug(&f, "Test Phones");
+    f.media.set_now(300.7);
+    frame(cx, f.window);
+    assert_eq!(sets(&f), before + 2, "set as soon as it is back");
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
 }
 
 #[gpui_kit::test]
@@ -1524,9 +1633,11 @@ fn a_take_checks_its_output_as_it_stops_and_keeps_the_note_until_saved(cx: &mut 
     // A file where c's takes belong: the first save fails.
     fs::write(f.dir.join("takes/c"), b"").expect("blocker");
     begin(cx, &f, 100.0);
+    f.media.set_now(101.0); // c's film plays from 100.9
+    frame(cx, f.window);
     // Gone, and stopped before any tick saw it.
     unplug_quietly(&f, "Test Phones");
-    f.media.set_now(100.5);
+    f.media.set_now(101.5);
     f.view.update(cx, |view, _| view.finish_take());
     let lost = "Test Phones was disconnected during the take";
     assert!(
@@ -1545,6 +1656,93 @@ fn a_take_checks_its_output_as_it_stops_and_keeps_the_note_until_saved(cx: &mut 
         "{said}"
     );
     assert!(said.contains(lost), "{said}");
+}
+
+#[gpui_kit::test]
+fn a_system_output_take_notes_a_change_at_its_automatic_end(cx: &mut TestAppContext) {
+    // Line a: its film plays from 102.4 and the take ends by itself at
+    // film 2.5 (its slot and the tail), host 104.9.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    // Changed without a report, and the next tick is the take's end.
+    f.media.0.borrow_mut().default_output = "External Headphones".to_owned();
+    f.media.set_now(105.5);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("The system output changed to External Headphones"),
+        "{said}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_system_output_take_notes_a_change_made_during_its_pre_roll(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    // Line a's film starts at 102.4: changed before, seen before it plays.
+    f.media.0.borrow_mut().default_output = "External Headphones".to_owned();
+    f.media.0.borrow_mut().generation += 1;
+    f.media.set_now(101.0);
+    frame(cx, f.window);
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    f.media.set_now(103.5);
+    press(cx, f.window, &["space"]);
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("The system output changed to External Headphones"),
+        "{said}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_system_output_unread_at_the_start_gives_no_false_note(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.0.borrow_mut().objects_unreadable = true;
+    begin(cx, &f, 100.0);
+    f.media.0.borrow_mut().objects_unreadable = false;
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    f.media.set_now(103.5);
+    press(cx, f.window, &["space"]);
+    let said = message(cx, &f.view);
+    assert!(!said.contains("system output"), "{said}");
+}
+
+#[gpui_kit::test]
+fn a_take_warning_stays_through_a_retake(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    unplug(&f, "Test Phones");
+    plug(&f, "Test Phones");
+    f.media.set_now(100.6);
+    frame(cx, f.window);
+    // R: the take ends and the next starts at once.
+    f.media.set_now(100.7);
+    press(cx, f.window, &["r"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let lost = "Test Phones was disconnected during the take";
+    assert!(
+        message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
+    // Until the next take's result, which has none.
+    f.media.send(100.75, 2400);
+    settle(cx, &f);
+    f.media.set_now(101.5);
+    frame(cx, f.window);
+    press(cx, f.window, &["space"]);
+    assert!(
+        !message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
 }
 
 #[gpui_kit::test]
@@ -1636,6 +1834,8 @@ fn a_take_watches_the_output_it_started_on(cx: &mut TestAppContext) {
     // [output] device cleared mid-take, then the phones go: still lost.
     let f = on_test_phones(cx);
     begin(cx, &f, 100.0);
+    f.media.set_now(100.5); // the film plays
+    frame(cx, f.window);
     clear_output_on_disk(cx, &f);
     unplug(&f, "Test Phones");
     frame(cx, f.window);
@@ -4709,6 +4909,29 @@ fn the_film_comes_back_when_the_output_goes_during_the_measurement(cx: &mut Test
         f.media.0.borrow().output_sets.last(),
         Some(&Some("Test Phones".to_owned()))
     );
+}
+
+#[gpui_kit::test]
+fn a_reconnect_during_the_latency_measurement_cancels_it(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Test Phones")).expect("output");
+    });
+    to_latency_step(cx, &f);
+    press(cx, f.window, &["space"]);
+    some_calibration(cx, &f, 10);
+    assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    // Back between two ticks as another device: the beeps may have
+    // played elsewhere meanwhile.
+    unplug(&f, "Test Phones");
+    plug(&f, "Test Phones");
+    some_calibration(cx, &f, 1);
+    assert!(!f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    let err = setup_of(cx, &f)
+        .latency
+        .expect("an outcome")
+        .expect_err("cancelled");
+    assert_eq!(err, super::latency::OUTPUT_CHANGED);
+    assert!(message(cx, &f.view).contains("press Space to measure again"));
 }
 
 #[gpui_kit::test]
