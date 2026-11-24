@@ -23,6 +23,7 @@ use super::clock::FilmClock;
 use super::{Media, RecordingWindow, bind_keys, load};
 
 mod passages;
+mod rescue;
 
 const DEVICE: &str = "Test Mic";
 const LATENCY_S: f64 = 0.05;

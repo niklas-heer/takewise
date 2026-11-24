@@ -526,6 +526,15 @@ pub struct RecordingWindow {
     /// The route in use and the local day the remembered setup was last
     /// looked up for.
     remembered_for: Option<(takewise_core::Route, jiff::civil::Date)>,
+    /// Where audio goes that cannot be saved into the project when the
+    /// window closes (`rescue/` beside the settings, see
+    /// `takewise_core::rescue`); none in tests unless a test sets one.
+    rescue_root: Option<PathBuf>,
+    /// The takes and passages that were only in memory when closing was
+    /// last refused: asked again about the same audio, the window writes
+    /// its rescue copy and closes. Audio that came since is refused for
+    /// once first, so its narrator hears of it.
+    close_refused: Option<(usize, usize)>,
 }
 
 impl RecordingWindow {
@@ -540,24 +549,7 @@ impl RecordingWindow {
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        // Closing the window or quitting mid-take still keeps the take; the
-        // window stays open while audio exists only in memory.
-        let this = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
-            this.update(cx, |view, cx| {
-                cx.notify();
-                if view.keeps_unsaved_audio() {
-                    return false;
-                }
-                view.shutdown();
-                true
-            })
-            .unwrap_or(true)
-        });
-        let on_quit = cx.on_app_quit(|view, _| {
-            view.shutdown();
-            async {}
-        });
+        let on_quit = Self::keep_audio_when_closing(window, cx);
         let handle = window.window_handle();
         let me = cx.weak_entity();
         let key = folder_key(&dir);
@@ -631,6 +623,8 @@ impl RecordingWindow {
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
             remembered_for: None,
+            rescue_root: None,
+            close_refused: None,
         };
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
@@ -639,6 +633,31 @@ impl RecordingWindow {
         view.apply_output();
         view.park();
         view
+    }
+
+    /// Closing the window or quitting mid-take still keeps the take; the
+    /// window stays open while audio exists only in memory, until it has a
+    /// rescue copy. Quitting from outside (the Dock, a logout) cannot be
+    /// refused: GPUI hears of it once it is underway, so `shutdown` then
+    /// saves or rescues what it can. Returns the quit handler's
+    /// subscription, to be kept.
+    fn keep_audio_when_closing(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            this.update(cx, |view, cx| {
+                cx.notify();
+                if view.keeps_unsaved_audio() {
+                    return false;
+                }
+                view.shutdown();
+                true
+            })
+            .unwrap_or(true)
+        });
+        cx.on_app_quit(|view, _| {
+            view.shutdown();
+            async {}
+        })
     }
 
     /// Adopts takes left by a recording that ended without a commit (a
@@ -665,6 +684,12 @@ impl RecordingWindow {
     /// and tries once more to save what waits. Returns whether audio is
     /// still only in memory, which closing would lose; the window then
     /// stays open, says why, and keeps retrying.
+    ///
+    /// Asked again while that audio still cannot be saved, it writes a
+    /// rescue copy (see `takewise_core::rescue`) and lets the window
+    /// close: a project whose disk is gone for good must not leave Force
+    /// Quit, which loses the audio, as the only way out. Audio that has
+    /// its rescue copy never holds the window.
     fn keeps_unsaved_audio(&mut self) -> bool {
         if self.recorder.is_recording() {
             self.finish_take();
@@ -673,21 +698,95 @@ impl RecordingWindow {
             let update = self.recorder.save_unsaved_now(&self.dir);
             self.show(update);
         }
-        let (takes, passages) = self.recorder.in_memory_only();
-        if takes + passages == 0 {
+        if !self.recorder.needs_rescue() {
+            self.close_refused = None;
             return false;
         }
+        let (takes, passages) = self.recorder.in_memory_only();
+        let asked_before = self.close_refused.replace((takes, passages)) == Some((takes, passages));
+        let rescue_failed = if asked_before && self.rescue_root.is_some() {
+            match self.rescue_unsaved() {
+                Ok(()) => {
+                    self.close_refused = None;
+                    return false;
+                }
+                Err(err) => Some(err),
+            }
+        } else {
+            None
+        };
         self.message = Some(not_closing_note(
             takes,
             passages,
             self.recorder.save_error(),
+            match &rescue_failed {
+                Some(err) => RescueOffer::Failed(err),
+                None => self
+                    .rescue_root
+                    .as_deref()
+                    .map_or(RescueOffer::None, RescueOffer::Into),
+            },
         ));
         true
     }
 
+    /// Writes a rescue copy of the audio that is only in memory and has
+    /// none yet, and says where it is.
+    fn rescue_unsaved(&mut self) -> Result<(), String> {
+        let root = self
+            .rescue_root
+            .clone()
+            .ok_or("there is no folder for rescue copies")?;
+        #[cfg(test)]
+        start::isolated::assert_temporary(&root);
+        let at = jiff::Timestamp::now();
+        if let Some(rescued) = self.recorder.rescue(&root, &self.dir, at)? {
+            let note = rescued_note(&rescued);
+            // The window may be gone before anyone reads its message.
+            eprintln!("takewise: {note}");
+            self.message = Some(note);
+        }
+        Ok(())
+    }
+
+    /// When the window or the app is going for good: audio that is still
+    /// only in memory gets its rescue copy, whether or not closing was
+    /// asked about before (a quit from the Dock or a logout is not).
+    fn rescue_at_exit(&mut self) {
+        if !self.recorder.needs_rescue() {
+            return;
+        }
+        if let Err(err) = self.rescue_unsaved() {
+            let (takes, passages) = self.recorder.in_memory_only();
+            let note = format!(
+                "{} could be neither saved nor rescued and is lost: {err}",
+                counted(takes, passages)
+            );
+            eprintln!("takewise: {note}");
+            self.message = Some(note);
+        }
+    }
+
+    /// Says when this project has audio in the rescue folder, from a
+    /// window that could not save it.
+    fn note_rescued(&mut self) {
+        let Some(root) = &self.rescue_root else {
+            return;
+        };
+        let notes: Vec<String> = tw::rescue::notices(root, &self.dir)
+            .into_iter()
+            .map(|notice| format!("Rescued audio: {}.", notice.message))
+            .collect();
+        if !notes.is_empty() {
+            // Whatever else opening had to say, this must not go unsaid.
+            self.message = recorder::join(self.message.take(), Some(notes.join(" ")));
+        }
+    }
+
     /// Ends whatever runs: commits a take in progress (if it has audio),
     /// stops playback and the meter, and cancels the checks (their tools are
-    /// killed; the takes are checked when the window opens again).
+    /// killed; the takes are checked when the window opens again). Audio
+    /// that still cannot be saved into the project gets a rescue copy.
     fn shutdown(&mut self) {
         self.calibrating = None;
         if self.recorder.is_recording() {
@@ -701,6 +800,7 @@ impl RecordingWindow {
                 self.show(update);
             }
         }
+        self.rescue_at_exit();
         self.recorder.stop_playback(&mut *self.media);
         self.recorder.keep_meter(&mut *self.media, None);
         self.media.stop_channel_meter();
@@ -1456,26 +1556,71 @@ impl RecordingWindow {
     }
 }
 
-/// Why the window does not close: `takes` and `passages` exist only in
-/// memory, and saving them failed with `error`.
-fn not_closing_note(takes: usize, passages: usize, error: Option<&str>) -> String {
+/// "1 take and 2 passages".
+fn counted(takes: usize, passages: usize) -> String {
     let count = |n: usize, one: &str, many: &str| match n {
         0 => None,
         1 => Some(format!("1 {one}")),
         n => Some(format!("{n} {many}")),
     };
-    let what = [
+    [
         count(takes, "take", "takes"),
         count(passages, "passage", "passages"),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
-    .join(" and ");
+    .join(" and ")
+}
+
+/// What a window that does not close says about the rescue copy.
+#[derive(Clone, Copy)]
+enum RescueOffer<'a> {
+    /// There is no folder for one.
+    None,
+    /// Closing again writes one into this folder.
+    Into(&'a Path),
+    /// Writing one failed, with this error.
+    Failed(&'a str),
+}
+
+/// Why the window does not close: `takes` and `passages` exist only in
+/// memory, and saving them failed with `error`.
+fn not_closing_note(
+    takes: usize,
+    passages: usize,
+    error: Option<&str>,
+    rescue: RescueOffer<'_>,
+) -> String {
+    let what = counted(takes, passages);
     let is = if takes + passages == 1 { "is" } else { "are" };
     let why = error.map(|err| format!(" ({err})")).unwrap_or_default();
+    let retrying = "Takewise keeps trying to save every 2 s; free disk space or fix the problem, then close the window again.";
+    match rescue {
+        RescueOffer::None => {
+            format!("Not closing: {what} {is} only in memory, not saved yet{why}. {retrying}")
+        }
+        RescueOffer::Into(folder) => format!(
+            "Not closing: {what} {is} only in memory, not saved yet{why}. {retrying} If it cannot be fixed, close again now: Takewise then writes a rescue copy to {} and closes.",
+            folder.display()
+        ),
+        RescueOffer::Failed(err) => format!(
+            "Not closing: {what} {is} only in memory, not saved yet{why}, and the rescue copy could not be written either ({err}). {retrying}"
+        ),
+    }
+}
+
+/// Where the rescue copies of audio that could not be saved are.
+fn rescued_note(rescued: &recorder::Rescued) -> String {
+    let what = counted(rescued.takes, rescued.passages);
+    let (was, copy) = if rescued.takes + rescued.passages == 1 {
+        ("was", "a rescue copy is")
+    } else {
+        ("were", "rescue copies are")
+    };
     format!(
-        "Not closing: {what} {is} only in memory, not saved yet{why}. Takewise keeps trying to save every 2 s; free disk space or fix the problem, then close the window again."
+        "{what} could not be saved into the project and {was} only in memory: {copy} in {}. `takewise status` says how to bring the audio back.",
+        rescued.folder.display()
     )
 }
 

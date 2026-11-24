@@ -69,6 +69,8 @@ Each line's `passage` names the passage it belongs to, by the id of the passage'
 }
 ```
 
+`problems` block an export; `notices` inform. One notice to act on with the narrator is `rescued-audio`: the window could not save a take or passage into the project (its disk was full or gone) and kept the audio in the folder the message names, with the steps to bring it back ([reference](reference.md#rescued-audio)).
+
 ## 3. The narrator records
 
 ```sh

@@ -10,11 +10,12 @@
 //! thread, which holds the audio's lock until the takes are there.
 
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use takewise_core::passage::{self, Latency};
+use takewise_core::rescue::Rescue;
 use takewise_core::takes::FULL_SCALE;
 use takewise_core::timing::film_shift_s;
 use takewise_core::{
@@ -146,6 +147,8 @@ struct Stopped {
     /// What to say with its takes: why it stopped, dropouts, a film that
     /// stalled.
     notes: Option<String>,
+    /// Its rescue copy, once one is written (see [`Recorder::rescue`]).
+    rescued: Option<PathBuf>,
 }
 
 impl Stopped {
@@ -197,6 +200,40 @@ struct Unsaved {
     lock: Option<WavLock>,
     /// Whether the partial WAV already holds every sample.
     complete: bool,
+    /// Its rescue copy, once one is written (see [`Recorder::rescue`]).
+    rescued: Option<PathBuf>,
+}
+
+/// Whether a stopped take or passage is whole on disk, where a repair
+/// finds it once the window is gone: its partial audio holds every sample
+/// and is there, with its metadata.
+fn on_disk(complete: bool, files: Option<(&Path, &Path)>) -> bool {
+    complete && files.is_some_and(|(wav, meta)| wav.is_file() && meta.is_file())
+}
+
+impl Unsaved {
+    /// Whether closing now would lose the take: it is not whole on disk.
+    fn only_in_memory(&self) -> bool {
+        let files = self.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
+        !on_disk(self.complete, files)
+    }
+}
+
+impl Stopped {
+    /// Whether closing now would lose the passage: it is not whole on disk.
+    fn only_in_memory(&self) -> bool {
+        let files = self.unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
+        !on_disk(self.unsaved.complete, files)
+    }
+}
+
+/// The rescue copies [`Recorder::rescue`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rescued {
+    /// The folder they are in.
+    pub folder: PathBuf,
+    pub takes: usize,
+    pub passages: usize,
 }
 
 enum Warmup {
@@ -358,27 +395,89 @@ impl Recorder {
     /// saved, and not complete on disk either, where a repair would find
     /// it after the window closed. Closing now would lose them.
     pub fn in_memory_only(&self) -> (usize, usize) {
-        let on_disk = |complete: bool, files: Option<(&Path, &Path)>| {
-            complete && files.is_some_and(|(wav, meta)| wav.is_file() && meta.is_file())
+        let takes = self.unsaved.iter().filter(|u| u.only_in_memory()).count();
+        let passages = self.unsaved_passages.iter();
+        (takes, passages.filter(|s| s.only_in_memory()).count())
+    }
+
+    /// Whether audio exists only in memory and has no rescue copy either:
+    /// closing now would lose it for good.
+    pub fn needs_rescue(&self) -> bool {
+        let takes = self.unsaved.iter();
+        let passages = self.unsaved_passages.iter();
+        takes
+            .filter(|u| u.only_in_memory())
+            .any(|u| u.rescued.is_none())
+            || passages
+                .filter(|s| s.only_in_memory())
+                .any(|s| s.rescued.is_none())
+    }
+
+    /// Writes a rescue copy of every stopped take and passage whose audio
+    /// is only in memory and has none yet, into a new folder in `root`
+    /// (see [`takewise_core::rescue`]): the audio and everything the
+    /// project of `dir` would store with it. The audio stays in memory,
+    /// and saving it into the project is still retried.
+    ///
+    /// `Ok(None)` when nothing needed one. On an error some copies may
+    /// have been written; what has none yet still needs one, and this can
+    /// be called again.
+    pub fn rescue(
+        &mut self,
+        root: &Path,
+        dir: &Path,
+        at: jiff::Timestamp,
+    ) -> Result<Option<Rescued>, String> {
+        if !self.needs_rescue() {
+            return Ok(None);
+        }
+        let mut rescue = Rescue::create(root, dir, at).map_err(|err| err.to_string())?;
+        // What was copied, to be marked once the folder is durable.
+        let (mut takes, mut passages) = (Vec::new(), Vec::new());
+        let mut failed = None;
+        for (index, unsaved) in self.unsaved.iter().enumerate() {
+            if !unsaved.only_in_memory() || unsaved.rescued.is_some() {
+                continue;
+            }
+            match rescue.add_take(&unsaved.line, &unsaved.input, &unsaved.samples) {
+                Ok(wav) => takes.push((index, wav)),
+                Err(err) => failed = failed.or(Some(err.to_string())),
+            }
+        }
+        for (index, stopped) in self.unsaved_passages.iter().enumerate() {
+            if !stopped.only_in_memory() || stopped.rescued.is_some() {
+                continue;
+            }
+            match rescue.add_passage(&stopped.unsaved.input, &stopped.unsaved.samples) {
+                Ok(wav) => passages.push((index, wav)),
+                Err(err) => failed = failed.or(Some(err.to_string())),
+            }
+        }
+        if takes.is_empty() && passages.is_empty() {
+            // Nothing could be copied: no empty folder is left behind.
+            let _ = std::fs::remove_dir(rescue.folder());
+            return Err(failed.unwrap_or_else(|| "nothing was copied".to_owned()));
+        }
+        let folder = rescue.finish().map_err(|err| err.to_string())?;
+        let rescued = Rescued {
+            folder,
+            takes: takes.len(),
+            passages: passages.len(),
         };
-        let takes = self
-            .unsaved
-            .iter()
-            .filter(|unsaved| {
-                let files = unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
-                !on_disk(unsaved.complete, files)
-            })
-            .count();
-        let passages = self
-            .unsaved_passages
-            .iter()
-            .filter(|stopped| {
-                let unsaved = &stopped.unsaved;
-                let files = unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
-                !on_disk(unsaved.complete, files)
-            })
-            .count();
-        (takes, passages)
+        for (index, wav) in takes {
+            if let Some(unsaved) = self.unsaved.get_mut(index) {
+                unsaved.rescued = Some(wav);
+            }
+        }
+        for (index, wav) in passages {
+            if let Some(stopped) = self.unsaved_passages.get_mut(index) {
+                stopped.rescued = Some(wav);
+            }
+        }
+        match failed {
+            Some(err) => Err(err),
+            None => Ok(Some(rescued)),
+        }
     }
 
     /// Why saving failed last, while a take or passage waits to be saved.
@@ -832,6 +931,7 @@ impl Recorder {
             partial: take.partial,
             lock: written.lock,
             complete: written.complete,
+            rescued: None,
         };
         let mut update = self.save(dir, unsaved);
         update.message = join(update.message, placement.notes);
@@ -886,6 +986,7 @@ impl Recorder {
                 complete: written.complete,
             },
             notes: placement.notes,
+            rescued: None,
         };
         self.publish(dir, stopped)
     }
@@ -1005,7 +1106,8 @@ impl Recorder {
             match publish(dir, &mut stopped.unsaved) {
                 Ok(id) => {
                     let note = "The passage that could not be saved is saved now.".to_owned();
-                    stopped.notes = join(Some(note), stopped.notes.take());
+                    let note = join(Some(note), spare_copy_note(stopped.rescued.as_deref()));
+                    stopped.notes = join(note, stopped.notes.take());
                     self.uncut.push(stopped.published(id));
                 }
                 Err(err) => {
@@ -1020,19 +1122,18 @@ impl Recorder {
         let mut update = Update::default();
         let mut left = Vec::new();
         for mut unsaved in mem::take(&mut self.unsaved) {
+            let spare = spare_copy_note(unsaved.rescued.as_deref());
             match save(dir, &mut unsaved) {
                 Ok(saved) if update.committed.is_none() => {
                     let committed = saved.take;
-                    update.message = join(
-                        saved.note,
-                        Some(format!(
-                            "Saved the earlier take of {} as take {}.",
-                            committed.line, committed.take
-                        )),
+                    let note = format!(
+                        "Saved the earlier take of {} as take {}.",
+                        committed.line, committed.take
                     );
+                    update.message = join(saved.note, join(Some(note), spare));
                     update.committed = Some(committed);
                 }
-                Ok(saved) => update.message = join(update.message.take(), saved.note),
+                Ok(saved) => update.message = join(update.message.take(), join(saved.note, spare)),
                 Err(err) => {
                     self.save_error = Some(err);
                     left.push(unsaved);
@@ -1713,6 +1814,16 @@ thread_local! {
 #[cfg(test)]
 pub fn commits_fail(fail: bool) {
     COMMITS_FAIL.set(fail);
+}
+
+/// What to say when audio with a rescue copy at `wav` was saved into its
+/// project after all: the copy is spare now. Nothing removes it.
+fn spare_copy_note(wav: Option<&Path>) -> Option<String> {
+    let wav = wav?;
+    Some(format!(
+        "Its rescue copy {} is no longer needed.",
+        wav.display()
+    ))
 }
 
 /// "Audio dropout at 0:05." for the dropouts of a take whose first sample

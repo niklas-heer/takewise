@@ -797,6 +797,57 @@ fn the_window_stays_open_while_a_passage_is_only_in_memory(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
+fn closing_again_rescues_a_passage_that_cannot_be_saved(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    use_settings(cx, &f);
+    // A file where the passages' directory belongs: the passage can be
+    // neither begun nor published.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    let blocker = f.dir.join("takes/.passages");
+    fs::write(&blocker, b"").expect("blocker");
+    read_from_a(cx, &f, "shift-space", 7.5);
+    f.media.set_now(host(7.5));
+    press(cx, f.window, &["space"]);
+    assert!(!recording(cx, &f));
+
+    assert!(!VisualTestContext::from_window(f.window, cx).simulate_close());
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.starts_with("Not closing: 1 passage is only in memory")
+            && shown.contains("writes a rescue copy to"),
+        "{shown}"
+    );
+    assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
+
+    // The passage whole, with its lines as they were read and the film
+    // time of its first sample: everything it takes to cut it.
+    let (folder, copy) = rescue::rescued(&f.dir);
+    assert_eq!(copy.kind, tw::rescue::Kind::Passage);
+    assert_eq!(copy.lines, ["a", "b", "c"]);
+    assert_eq!(copy.samples, 69 * 4800);
+    assert_eq!(copy.sidecar["kind"], "passage");
+    assert_eq!(
+        copy.sidecar["lines"][1]["snapshot"]["text"],
+        "Second sentence."
+    );
+    let first = copy.sidecar["first_sample_film_s"]
+        .as_f64()
+        .expect("placed");
+    assert!((first - FIRST_FILM_S).abs() < 1e-6, "{first}");
+    let (samples, _) = tw::read_take_wav(&folder.join(&copy.audio)).expect("the copy");
+    assert_eq!(samples.len(), 69 * 4800);
+    assert_eq!(recorded_takes(&f.dir), []);
+
+    // Brought back by hand, a repair publishes it and cuts its takes.
+    fs::remove_file(blocker).expect("unblock");
+    let report = rescue::bring_back(&f.dir, &folder, &copy);
+    assert_eq!(report.passages_published.len(), 1, "{report:?}");
+    assert_eq!(recorded_takes(&f.dir), takes_of(&["a", "b"]));
+    let wavs = passage_files(&f.dir, ".wav");
+    assert_eq!(tw::read_take_wav(&wavs[0]).expect("the passage").0, samples);
+}
+
+#[gpui_kit::test]
 fn closing_mid_passage_keeps_it_and_cuts_its_takes(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     read_from_a(cx, &f, "shift-space", 7.5);

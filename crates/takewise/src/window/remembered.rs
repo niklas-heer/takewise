@@ -21,14 +21,18 @@ pub const BLUETOOTH_HINT: &str = "Bluetooth delay can change after reconnecting;
 
 impl RecordingWindow {
     /// Uses the settings file `settings` (none: no defaults, nothing
-    /// remembered): device choices are saved there as defaults for new
-    /// projects, and the remembered setup beside it applies to this
-    /// project now, as when the window opens.
+    /// remembered, no rescue copies): device choices are saved there as
+    /// defaults for new projects, the remembered setup beside it applies
+    /// to this project now, as when the window opens, and audio that
+    /// cannot be saved into the project when the window closes is rescued
+    /// into `rescue/` beside it.
     pub(super) fn use_settings(&mut self, settings: Option<PathBuf>) {
         self.remembered_path = settings.as_deref().map(remembered::beside);
+        self.rescue_root = settings.as_deref().map(takewise_core::rescue::beside);
         self.defaults_path = settings;
         self.remembered_for = None;
         self.check_inputs();
+        self.note_rescued();
     }
 
     /// Between takes, on the route in use: applies the remembered latency
