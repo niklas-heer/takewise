@@ -635,9 +635,11 @@ pub struct RecordingWindow {
     take_route: Option<output::TakeRoute>,
     /// When the window last ticked, from a frame or from its timer.
     ticked_at: Option<f64>,
-    /// The last take's warning about its output, kept in sight until the
-    /// next take's result.
+    /// The last take's warning about its output ("Take N of line: …"),
+    /// carried into a retake (R) right after it; any other action drops it.
     take_warning: Option<String>,
+    /// Since when device lookups have been failing, while they do.
+    lookup_failed_since: Option<f64>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -734,6 +736,7 @@ impl RecordingWindow {
             take_route: None,
             ticked_at: None,
             take_warning: None,
+            lookup_failed_since: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1240,11 +1243,11 @@ impl RecordingWindow {
         if self.blocked().is_some() {
             return;
         }
-        if let Err(problem) = self.sync_output(true) {
+        if let Err(problem) = self.route_for_start() {
             self.message = Some(problem.for_recording());
             return;
         }
-        self.message.clone_from(&self.take_warning);
+        self.message = None;
         self.peak_meter.clear();
         self.scroll.reset();
         self.panel.picker = None;
@@ -1266,7 +1269,7 @@ impl RecordingWindow {
     fn finish_take(&mut self) {
         // Whatever stops it (Space, R, closing), its route is checked
         // before its result is made.
-        self.check_take_route();
+        self.check_take_route(true);
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
         self.pause_checks_while_recording();
@@ -1421,12 +1424,12 @@ impl RecordingWindow {
         if let (Some(take), Some(peak)) = (&update.committed, update.peak_dbfs) {
             self.take_peaks.insert((take.line.clone(), take.take), peak);
         }
-        // A take's warning about its output stays in sight until the next
-        // take's result, through a retake (R) that starts at once.
-        if update.route_note.is_some() {
-            self.take_warning.clone_from(&update.route_note);
-        } else if update.committed.is_some() {
-            self.take_warning = None;
+        // A take's warning about its output, to carry into a retake.
+        if let Some(note) = &update.route_note {
+            self.take_warning = Some(match &update.committed {
+                Some(take) => format!("Take {} of {}: {note}", take.take, take.line),
+                None => note.clone(),
+            });
         }
         let success = self.took(update.committed);
         let passage = update.passage.map(|passage| self.took_passage(&passage));
@@ -1437,6 +1440,7 @@ impl RecordingWindow {
     }
 
     fn record(&mut self, _: &Record, _: &mut Window, cx: &mut Context<Self>) {
+        self.other_action();
         if self.recorder.is_recording() {
             self.finish_take();
         } else if self.recorder.is_playing() {
@@ -1451,12 +1455,24 @@ impl RecordingWindow {
         if self.recorder.is_recording() {
             self.finish_take();
         }
+        // The take just ended may have played elsewhere: still said while
+        // the next one starts, or with why it cannot.
+        let warning = self.take_warning.take();
         self.recorder.stop_playback(&mut *self.media);
         self.start_take();
+        if warning.is_some() {
+            self.message = recorder::join(warning, self.message.take());
+        }
         cx.notify();
     }
 
+    /// Any action but a retake: the last take's warning is not carried on.
+    fn other_action(&mut self) {
+        self.take_warning = None;
+    }
+
     fn choose(&mut self, _: &Choose, _: &mut Window, cx: &mut Context<Self>) {
+        self.other_action();
         if self.recorder.is_recording() {
             return;
         }
@@ -1474,6 +1490,7 @@ impl RecordingWindow {
     }
 
     fn play(&mut self, _: &PlayInContext, _: &mut Window, cx: &mut Context<Self>) {
+        self.other_action();
         if self.recorder.is_recording() {
             return;
         }
@@ -1493,7 +1510,7 @@ impl RecordingWindow {
             cx.notify();
             return;
         };
-        if let Err(problem) = self.sync_output(true) {
+        if let Err(problem) = self.route_for_start() {
             self.message = Some(problem.for_playback());
             cx.notify();
             return;
@@ -1509,6 +1526,7 @@ impl RecordingWindow {
     }
 
     fn mark(&mut self, _: &MarkStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.other_action();
         cx.notify();
         if self.recorder.is_recording_passage() {
             self.message = Some(
@@ -1569,6 +1587,7 @@ impl RecordingWindow {
     }
 
     fn edit(&mut self, _: &Edit, window: &mut Window, cx: &mut Context<Self>) {
+        self.other_action();
         if self.recorder.is_recording() || self.recorder.is_playing() {
             return;
         }
@@ -1631,6 +1650,7 @@ impl RecordingWindow {
     }
 
     fn move_line(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.other_action();
         if self.recorder.is_recording() {
             return;
         }
@@ -1689,6 +1709,7 @@ impl RecordingWindow {
     }
 
     fn move_take(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.other_action();
         if self.recorder.is_recording() {
             return;
         }

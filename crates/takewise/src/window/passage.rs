@@ -22,6 +22,7 @@ impl RecordingWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.other_action();
         if self.recorder.is_recording() {
             self.finish_take();
         } else if self.recorder.is_playing() {
@@ -101,6 +102,7 @@ impl RecordingWindow {
     /// from the selected take's line (a pre-roll before it) to the
     /// passage's end; stops a playback that runs.
     pub(super) fn play_passage(&mut self, _: &PlayPassage, _: &mut Window, cx: &mut Context<Self>) {
+        self.other_action();
         cx.notify();
         if self.recorder.is_recording() {
             return;
@@ -110,7 +112,7 @@ impl RecordingWindow {
             return;
         }
         let started = self.selected_piece().and_then(|piece| {
-            self.sync_output(true)
+            self.route_for_start()
                 .map_err(|problem| problem.for_playback())?;
             self.recorder
                 .start_passage_playback(&mut *self.media, &self.project, &piece)
@@ -126,6 +128,7 @@ impl RecordingWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.other_action();
         cx.notify();
         if self.recorder.is_recording() {
             return;

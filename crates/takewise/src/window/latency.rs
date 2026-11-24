@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use gpui_kit::AnyElement;
 use takewise_core::{self as tw, CalibrationInfo, Route};
 
+use takewise_media::DeviceLookup;
+
+use super::output::Seen;
 use super::setup::{Setup, calibration_needed, line};
 use super::{RecordingWindow, colors};
 use crate::calibrate::{self, Measurement, Run};
@@ -34,10 +37,16 @@ pub struct Calibrating {
     output: OutputIdentity,
 }
 
-/// Which output device plays: its UID and CoreAudio object (`None` when
-/// it could not be read). A device that went away and came back keeps its
-/// UID but has another object.
-type OutputIdentity = Option<(String, Option<u32>)>;
+/// Which output device plays: the device the players are set to (its UID
+/// and CoreAudio object), or the system output's object; not known when it
+/// could not be read. A device that went away and came back keeps its UID
+/// but has another object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputIdentity {
+    Device(String, u32),
+    System(u32),
+    Unknown,
+}
 
 /// Why a calibration ended when its output dropped out or changed.
 pub const OUTPUT_CHANGED: &str =
@@ -150,27 +159,37 @@ impl RecordingWindow {
     /// The output device the film plays through now: the one the players
     /// are set to, or the system's default output.
     fn output_identity(&self) -> OutputIdentity {
-        let uid = match &self.applied_device {
-            Some((uid, _)) => uid.clone(),
-            None => self.media.default_output_uid()?.1,
-        };
-        let object = self.media.output_object(&uid);
-        Some((uid, object))
+        match (&self.film_output, &self.applied_device) {
+            (Some(_), Some((uid, object))) => OutputIdentity::Device(uid.clone(), *object),
+            (Some(_), None) => OutputIdentity::Unknown,
+            (None, _) => match self.media.default_output_object() {
+                DeviceLookup::Present(object) => OutputIdentity::System(object),
+                DeviceLookup::Absent | DeviceLookup::Unknown => OutputIdentity::Unknown,
+            },
+        }
     }
 
-    /// Before anything sets the output again: cancels a calibration whose
-    /// output device dropped out or changed since it began (a reconnect
-    /// gives it another object), whose beeps may have played elsewhere.
+    /// Every tick, before anything sets the output again: cancels a
+    /// calibration whose output device dropped out or changed since it
+    /// began (a reconnect gives it another object), whose beeps may have
+    /// played elsewhere. One property read; a single failed read does not
+    /// cancel it (see [`LOOKUP_GRACE_S`]).
+    ///
+    /// [`LOOKUP_GRACE_S`]: super::output::LOOKUP_GRACE_S
     pub(super) fn cancel_calibration_if_output_dropped(&mut self) {
         let Some(calibrating) = &self.calibrating else {
             return;
         };
-        let began = calibrating.output.clone();
-        // Not known when it began: nothing to compare.
-        if began.as_ref().is_none_or(|(_, object)| object.is_none()) {
-            return;
-        }
-        if self.output_identity() == began {
+        let seen = match calibrating.output.clone() {
+            OutputIdentity::Device(uid, object) => self.see(&uid, object),
+            OutputIdentity::System(object) => {
+                let lookup = self.media.default_output_object();
+                self.seen_lookup(lookup, object)
+            }
+            // Not known when it began: nothing to compare.
+            OutputIdentity::Unknown => return,
+        };
+        if !matches!(seen, Seen::Dropped(_)) {
             return;
         }
         self.end_calibration();

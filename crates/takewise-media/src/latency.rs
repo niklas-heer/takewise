@@ -15,10 +15,10 @@ use objc2_core_audio::{
     kAudioDeviceTransportTypeBuiltIn, kAudioDeviceTransportTypeUSB,
     kAudioDeviceUnsupportedFormatError, kAudioHardwareBadDeviceError,
     kAudioHardwareIllegalOperationError, kAudioHardwareNotRunningError,
-    kAudioHardwarePropertyTranslateUIDToDevice, kAudioHardwareUnsupportedOperationError,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioStreamPropertyLatency,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyTranslateUIDToDevice,
+    kAudioHardwareUnsupportedOperationError, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioStreamPropertyLatency,
 };
 use objc2_core_foundation::CFString;
 
@@ -256,6 +256,52 @@ fn nominal_rate(id: AudioObjectID) -> Option<f64> {
 
 /// The CoreAudio object id of the device with this UID.
 pub(crate) fn device_id(device_uid: &str) -> Option<AudioObjectID> {
+    match lookup_device(device_uid) {
+        DeviceLookup::Present(id) => Some(id),
+        DeviceLookup::Absent | DeviceLookup::Unknown => None,
+    }
+}
+
+/// What CoreAudio says of a device, looked up by UID or as the default
+/// output: there (with its object), not there, or no answer (the read
+/// failed, which says nothing about the device).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceLookup {
+    Present(AudioObjectID),
+    Absent,
+    Unknown,
+}
+
+/// The CoreAudio object of the system's default output device: one
+/// property read, cheap enough for every frame.
+pub(crate) fn default_output_object() -> DeviceLookup {
+    let addr = address(
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+    );
+    let mut id: AudioObjectID = 0;
+    let mut size = u32_size::<AudioObjectID>();
+    // SAFETY: the result is one AudioObjectID; its size is given in bytes,
+    // and the property takes no qualifier.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject.cast_unsigned(),
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut id).cast::<c_void>(),
+        )
+    };
+    match (status, id) {
+        (0, 0) => DeviceLookup::Absent,
+        (0, id) => DeviceLookup::Present(id),
+        _ => DeviceLookup::Unknown,
+    }
+}
+
+/// [`DeviceLookup`] of the device with this UID: one property read.
+pub(crate) fn lookup_device(device_uid: &str) -> DeviceLookup {
     let cf = CFString::from_str(device_uid);
     let cf_ref: *const CFString = &raw const *cf;
     let addr = address(
@@ -276,7 +322,12 @@ pub(crate) fn device_id(device_uid: &str) -> Option<AudioObjectID> {
             NonNull::from(&mut id).cast::<c_void>(),
         )
     };
-    (status == 0 && id != 0).then_some(id)
+    match (status, id) {
+        // kAudioObjectUnknown: no device has this UID.
+        (0, 0) => DeviceLookup::Absent,
+        (0, id) => DeviceLookup::Present(id),
+        _ => DeviceLookup::Unknown,
+    }
 }
 
 fn first_stream(id: AudioObjectID, scope: AudioObjectPropertyScope) -> Option<AudioObjectID> {

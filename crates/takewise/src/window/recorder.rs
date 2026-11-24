@@ -79,6 +79,19 @@ pub fn calibration_matches(config: &ProjectConfig, route: &Route) -> bool {
     config.calibration.is_some() && !takewise_core::effective_latency_offset(config, route).1
 }
 
+/// Whether a playback or a take's film may start, as the window says from
+/// its output before each tick.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StartHold {
+    /// It may.
+    #[default]
+    Go,
+    /// Not yet: the output could not be checked just now.
+    Wait,
+    /// No: the output can no longer be used, for this reason.
+    Stop(String),
+}
+
 /// What a tick or a stop produced, for the window to show.
 #[derive(Debug, Default)]
 pub struct Update {
@@ -144,9 +157,9 @@ pub struct Recorder {
     /// Published passages whose takes are being cut, or wait to be cut
     /// again.
     uncut: Vec<Uncut>,
-    /// Why a playback or a take's film must not start at this tick (its
-    /// output can no longer be used), as the window says before each tick.
-    start_hold: Option<String>,
+    /// Whether a playback or a take's film may start at this tick, as the
+    /// window says before each tick from its output.
+    start_hold: StartHold,
 }
 
 /// A stopped passage that is not published yet.
@@ -419,7 +432,7 @@ impl Recorder {
             read_last: None,
             unsaved_passages: Vec::new(),
             uncut: Vec::new(),
-            start_hold: None,
+            start_hold: StartHold::Go,
         }
     }
 
@@ -978,9 +991,8 @@ impl Recorder {
             };
         }
         let mut placement = place(&take, &written, estimated, unplayed_s);
-        // Only a film that played can have played elsewhere.
-        let now = media.host_now_s();
-        let lost = take.route_lost.take().filter(|_| take.clock.playing(now));
+        // Only a film that ran can have played elsewhere.
+        let lost = take.route_lost.take().filter(|_| take.clock.ran());
         placement.notes = join(placement.notes, lost.clone());
         if let Some(passage) = take.passage.take() {
             placement.notes = join(why, placement.notes);
@@ -1379,10 +1391,10 @@ impl Recorder {
         }
     }
 
-    /// Before each tick: why a playback or a take's film that is about to
-    /// start must not (`None`: it may).
-    pub fn hold_start(&mut self, why: Option<String>) {
-        self.start_hold = why;
+    /// Before each tick: whether a playback or a take's film that is about
+    /// to start, or whose start is to come, may go on.
+    pub fn hold_start(&mut self, hold: StartHold) {
+        self.start_hold = hold;
     }
 
     /// A playback opened and not playing yet at host time `now`: its take
@@ -1392,19 +1404,19 @@ impl Recorder {
             if playback.started.is_none() || now < playback.starts_host_s)
     }
 
-    /// A take recording whose film does not play yet at host time `now`:
-    /// not scheduled, or scheduled and its start is to come.
-    pub fn film_waiting(&self, now: f64) -> bool {
-        matches!(&self.phase, Phase::Recording(take) if !take.clock.playing(now))
+    /// A take recording whose film was not seen running yet: not
+    /// scheduled, its start to come, or a player that has not moved.
+    pub fn film_waiting(&self) -> bool {
+        matches!(&self.phase, Phase::Recording(take) if !take.clock.ran())
     }
 
     /// The output the film plays through went away or changed during the
-    /// take: the take goes on, and its result says `note`. Only once its
-    /// film plays (`now`), since before that nothing was heard; returns
-    /// whether the note was taken.
-    pub fn note_route(&mut self, note: String, now: f64) -> bool {
+    /// take: the take goes on, and its result says `note`, once. Only once
+    /// its film was seen running, since before that nothing was heard;
+    /// returns whether the note was taken.
+    pub fn note_route(&mut self, note: String) -> bool {
         match &mut self.phase {
-            Phase::Recording(take) if take.clock.playing(now) => {
+            Phase::Recording(take) if take.clock.ran() => {
                 take.route_lost.get_or_insert(note);
                 true
             }
@@ -1456,18 +1468,23 @@ impl Recorder {
 
     /// The part of [`Recorder::tick`] that depends on what runs.
     fn tick_phase(&mut self, media: &mut dyn Media, dir: &Path, now: f64) -> Update {
-        let hold = self.start_hold.take();
+        let hold = mem::take(&mut self.start_hold);
         match &mut self.phase {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
                 let progress = take.writer.progress();
                 // The film is scheduled once the first buffer is in; not
-                // when its output can no longer be used, and a start still
-                // to come is called off then.
+                // when its output can no longer be used: a start not yet
+                // seen running is called off then, whatever the time, the
+                // film paused at once. One not confirmed waits.
                 let failure = match hold {
-                    Some(why) if !take.clock.playing(now) && progress.first_host_s.is_some() => {
+                    StartHold::Stop(why)
+                        if !take.clock.ran() && progress.first_host_s.is_some() =>
+                    {
+                        media.film_pause();
                         Some(why)
                     }
+                    StartHold::Wait if !take.clock.started() => None,
                     _ => start_film(take, media, &progress, now),
                 };
                 let mut message = begin_on_disk(take, dir, &progress);
@@ -1503,13 +1520,17 @@ impl Recorder {
                         ..Update::default()
                     }
                 }
-                _ if hold.is_some() => {
+                _ if matches!(hold, StartHold::Stop(_)) => {
                     self.stop_playback(media);
+                    let StartHold::Stop(why) = hold else {
+                        return Update::default();
+                    };
                     Update {
-                        message: hold,
+                        message: Some(why),
                         ..Update::default()
                     }
                 }
+                None if hold == StartHold::Wait => Update::default(),
                 None if media.take_ready() && media.film_ready() => {
                     match start_both(media, playback, now) {
                         Ok(tb) => {

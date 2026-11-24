@@ -37,7 +37,7 @@ use gpui_kit::{
 };
 use takewise_core::{self as tw, AvailableInput, Project, RECORD_RATE, TakeRef, Timebase};
 use takewise_media::{
-    CaptureBuffer, DeviceInfo, FilmPlayer, Frame, Monitor, OutputSource, Transport,
+    CaptureBuffer, DeviceInfo, DeviceLookup, FilmPlayer, Frame, Monitor, OutputSource, Transport,
 };
 
 use super::checks::{Checker, SharedTranscriber, worker_tag};
@@ -636,9 +636,14 @@ impl Media for DemoMedia {
             .as_ref()
             .map(|name| format!("demo:{name}"))
     }
-    fn output_object(&self, uid: &str) -> Option<u32> {
-        let name = uid.strip_prefix("demo:")?;
-        self.output_connected(name).then_some(1)
+    fn output_object(&self, uid: &str) -> DeviceLookup {
+        match uid.strip_prefix("demo:") {
+            Some(name) if self.output_connected(name) => DeviceLookup::Present(1),
+            _ => DeviceLookup::Absent,
+        }
+    }
+    fn default_output_object(&self) -> DeviceLookup {
+        DeviceLookup::Present(2)
     }
     fn default_output_uid(&self) -> Option<(String, String)> {
         Some((SPEAKERS.to_owned(), format!("demo:{SPEAKERS}")))

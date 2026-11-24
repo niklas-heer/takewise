@@ -17,7 +17,7 @@ use gpui_kit::{
 use takewise_core::{
     self as tw, AvailableInput, EventKind, Field, FilmInfo, Project, RecordedInput, Timebase,
 };
-use takewise_media::{CaptureBuffer, DeviceInfo, Frame, OutputSource, Transport};
+use takewise_media::{CaptureBuffer, DeviceInfo, DeviceLookup, Frame, OutputSource, Transport};
 
 use super::checks::{Checker, Checks, SharedTranscriber, worker_tag};
 use super::clock::FilmClock;
@@ -31,6 +31,7 @@ const DEVICE: &str = "Test Mic";
 const LATENCY_S: f64 = 0.05;
 
 /// The fake's state, shared between the window and the test.
+#[allow(clippy::struct_excessive_bools)]
 struct Fake {
     now: f64,
     inputs: Vec<AvailableInput>,
@@ -63,9 +64,14 @@ struct Fake {
     objects: std::collections::HashMap<String, u32>,
     /// The system's default output.
     default_output: String,
-    /// Whether no device's CoreAudio object can be read (gone again just
-    /// after it was found, or CoreAudio refusing).
+    /// Whether every device reads as absent (gone again just after it was
+    /// found), or every read fails (CoreAudio not answering), and how many
+    /// device lookups were made.
     objects_unreadable: bool,
+    lookups_fail: bool,
+    lookups: usize,
+    /// How many times the output devices were listed (by name).
+    listings: usize,
     /// Whether an opened take is still loading.
     take_loading: bool,
     /// Where the film plays (`None`: the system default).
@@ -151,6 +157,9 @@ impl FakeMedia {
             objects: std::collections::HashMap::new(),
             default_output: "MacBook Speakers".to_owned(),
             objects_unreadable: false,
+            lookups_fail: false,
+            lookups: 0,
+            listings: 0,
             take_loading: false,
             film_output: None,
             take: None,
@@ -344,21 +353,44 @@ impl Media for FakeMedia {
             .as_ref()
             .map(|name| format!("uid:{name}"))
     }
-    fn output_object(&self, uid: &str) -> Option<u32> {
-        let name = uid.strip_prefix("uid:")?;
-        let fake = self.0.borrow();
+    fn output_object(&self, uid: &str) -> DeviceLookup {
+        let Some(name) = uid.strip_prefix("uid:") else {
+            return DeviceLookup::Absent;
+        };
+        let mut fake = self.0.borrow_mut();
+        fake.lookups += 1;
+        if fake.lookups_fail {
+            return DeviceLookup::Unknown;
+        }
         if fake.objects_unreadable {
-            return None;
+            return DeviceLookup::Absent;
         }
         let connected = fake.outputs.iter().any(|output| output.name == name)
             || fake.hidden_outputs.iter().any(|hidden| hidden == name);
-        connected.then(|| fake.objects.get(name).copied().unwrap_or(1))
+        if connected {
+            DeviceLookup::Present(fake.objects.get(name).copied().unwrap_or(1))
+        } else {
+            DeviceLookup::Absent
+        }
+    }
+    fn default_output_object(&self) -> DeviceLookup {
+        let fake = self.0.borrow();
+        if fake.lookups_fail {
+            return DeviceLookup::Unknown;
+        }
+        // Another object for another device, and for the same one plugged
+        // in again.
+        let name = &fake.default_output;
+        let base: u32 = name.bytes().map(u32::from).sum();
+        DeviceLookup::Present(base * 1000 + fake.objects.get(name).copied().unwrap_or(1))
     }
     fn default_output_uid(&self) -> Option<(String, String)> {
+        self.0.borrow_mut().listings += 1;
         let name = self.0.borrow().default_output.clone();
         Some((name.clone(), format!("uid:{name}")))
     }
     fn output_connected(&self, device: &str) -> bool {
+        self.0.borrow_mut().listings += 1;
         let fake = self.0.borrow();
         fake.outputs.iter().any(|output| output.name == device)
             || fake.hidden_outputs.iter().any(|name| name == device)
@@ -1562,6 +1594,160 @@ fn a_take_stopped_before_its_film_started_has_no_output_note(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn a_route_loss_calls_off_a_start_whose_time_already_came(cx: &mut TestAppContext) {
+    // `begin` schedules d's film for 100.4. At 100.42 the start time has
+    // come, but the player was not read back running yet: the window's
+    // stop still holds, and the film is paused at once.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.set_now(100.42);
+    let pauses = f.media.0.borrow().pauses.len();
+    f.view.update(cx, |view, _| {
+        view.recorder
+            .hold_start(super::recorder::StartHold::Stop("gone".to_owned()));
+        let update = view.recorder.tick(&mut *view.media, &view.dir);
+        view.show(update);
+    });
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert!(f.media.0.borrow().pauses.len() > pauses, "paused");
+    assert!(message(cx, &f.view).contains("Recording stopped: gone"));
+}
+
+#[gpui_kit::test]
+fn a_stalled_film_gives_no_output_note(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    // The player never moves: stopped where it was scheduled from.
+    f.media.0.borrow_mut().timebase = Some(Timebase {
+        rate: 0.0,
+        film_anchor_s: 6.0,
+        host_anchor_s: 100.4,
+    });
+    f.media.set_now(100.6);
+    frame(cx, f.window);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.7);
+    frame(cx, f.window);
+    let said = message(cx, &f.view);
+    assert!(!said.contains("may have played"), "it never ran: {said}");
+}
+
+#[gpui_kit::test]
+fn every_drop_in_a_take_is_set_again_and_warned_once(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    let sets = |f: &Fixture| f.media.0.borrow().output_sets.len();
+    let before = sets(&f);
+    for (n, at) in [(1, 100.6), (2, 100.7)] {
+        unplug(&f, "Test Phones");
+        plug(&f, "Test Phones");
+        f.media.set_now(at);
+        frame(cx, f.window);
+        assert_eq!(sets(&f), before + n, "drop {n} set again");
+    }
+    f.media.set_now(100.8);
+    press(cx, f.window, &["space"]);
+    let said = message(cx, &f.view);
+    assert_eq!(
+        said.matches("was disconnected during the take").count(),
+        1,
+        "{said}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_failed_lookup_is_not_a_drop(cx: &mut TestAppContext) {
+    // A playback: no rebind, no stop on a lookup that fails for a moment.
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    let sets = f.media.0.borrow().output_sets.len();
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.0.borrow_mut().generation += 1;
+    f.media.set_now(200.1);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(200.2);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().output_sets.len(), sets, "not set again");
+    press(cx, f.window, &["p"]);
+
+    // A take whose film is about to be scheduled waits, and then starts.
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.set_now(300.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(300.05, 2400);
+    settle(cx, &f);
+    let plays = f.media.0.borrow().plays.len();
+    f.media.set_now(300.1);
+    frame(cx, f.window);
+    assert!(
+        f.view.read_with(cx, |view, _| view.recorder.is_recording()),
+        "it waits"
+    );
+    assert_eq!(f.media.0.borrow().plays.len(), plays, "not scheduled yet");
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(300.2);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(f.media.0.borrow().plays.len(), plays + 1, "scheduled now");
+
+    // Failing for longer than the grace: then it counts as gone.
+    f.media.set_now(300.7);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().lookups_fail = true;
+    for at in [300.8, 301.0, 301.4] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    f.media.set_now(301.5);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+}
+
+#[gpui_kit::test]
+fn a_take_reads_its_device_cheaply_every_tick(cx: &mut TestAppContext) {
+    // Gone mid-take: no device listing per frame while it stays gone.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.6);
+    frame(cx, f.window);
+    let (listings, lookups) = {
+        let fake = f.media.0.borrow();
+        (fake.listings, fake.lookups)
+    };
+    for n in 1..=5 {
+        f.media.set_now(100.6 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    let fake = f.media.0.borrow();
+    assert_eq!(fake.listings, listings, "no listing while it is gone");
+    assert!(
+        fake.lookups - lookups <= 15,
+        "{} lookups in 5 ticks",
+        fake.lookups - lookups
+    );
+    drop(fake);
+
+    // On the system output: no name or UID read per frame.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0);
+    let listings = f.media.0.borrow().listings;
+    for n in 1..=5 {
+        f.media.set_now(100.1 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    assert_eq!(f.media.0.borrow().listings, listings);
+}
+
+#[gpui_kit::test]
 fn a_playing_film_is_set_again_only_when_its_device_dropped(cx: &mut TestAppContext) {
     let f = on_test_phones(cx);
     f.media.set_now(200.0);
@@ -1673,7 +1859,7 @@ fn a_system_output_take_notes_a_change_at_its_automatic_end(cx: &mut TestAppCont
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
     let said = message(cx, &f.view);
     assert!(
-        said.contains("The system output changed to External Headphones"),
+        said.contains("The system output changed from MacBook Speakers to External Headphones"),
         "{said}"
     );
 }
@@ -1693,7 +1879,7 @@ fn a_system_output_take_notes_a_change_made_during_its_pre_roll(cx: &mut TestApp
     press(cx, f.window, &["space"]);
     let said = message(cx, &f.view);
     assert!(
-        said.contains("The system output changed to External Headphones"),
+        said.contains("The system output changed from MacBook Speakers to External Headphones"),
         "{said}"
     );
 }
@@ -1712,6 +1898,51 @@ fn a_system_output_unread_at_the_start_gives_no_false_note(cx: &mut TestAppConte
     assert!(!said.contains("system output"), "{said}");
 }
 
+/// A take of line d whose phones dropped and came back while its film ran,
+/// stopped with Space: its result warns.
+fn warned_take(cx: &mut TestAppContext, f: &Fixture, at: f64) {
+    begin(cx, f, at);
+    f.media.set_now(at + 0.5);
+    frame(cx, f.window);
+    unplug(f, "Test Phones");
+    plug(f, "Test Phones");
+    f.media.set_now(at + 0.6);
+    frame(cx, f.window);
+    f.media.set_now(at + 0.7);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+}
+
+#[gpui_kit::test]
+fn a_take_warning_is_carried_only_into_a_retake(cx: &mut TestAppContext) {
+    let lost = "Test Phones was disconnected during the take";
+    // Any other action first: not carried.
+    let f = on_test_phones(cx);
+    warned_take(cx, &f, 100.0);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p", "p"]);
+    press(cx, f.window, &["r"]);
+    assert!(
+        !message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
+
+    // R refused, the output gone again: the warning and the refusal.
+    let f = on_test_phones(cx);
+    warned_take(cx, &f, 100.0);
+    unplug(&f, "Test Phones");
+    f.media.set_now(101.0);
+    press(cx, f.window, &["r"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert!(said.starts_with(&format!("Take 2 of d: {lost}")), "{said}");
+    assert!(
+        said.contains("Test Phones is not connected, so Takewise does not record"),
+        "{said}"
+    );
+}
+
 #[gpui_kit::test]
 fn a_take_warning_stays_through_a_retake(cx: &mut TestAppContext) {
     let f = on_test_phones(cx);
@@ -1728,7 +1959,7 @@ fn a_take_warning_stays_through_a_retake(cx: &mut TestAppContext) {
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
     let lost = "Test Phones was disconnected during the take";
     assert!(
-        message(cx, &f.view).contains(lost),
+        message(cx, &f.view).starts_with(&format!("Take 2 of d: {lost}")),
         "{}",
         message(cx, &f.view)
     );
@@ -1757,7 +1988,7 @@ fn a_take_on_the_system_output_notes_another_default(cx: &mut TestAppContext) {
     press(cx, f.window, &["space"]);
     let said = message(cx, &f.view);
     assert!(
-        said.contains("The system output changed to External Headphones during the take: the film may have played out loud"),
+        said.contains("The system output changed from MacBook Speakers to External Headphones during the take: listen before you choose it."),
         "{said}"
     );
 
@@ -1883,6 +2114,8 @@ fn an_output_lost_during_a_take_keeps_the_take_and_says_so(cx: &mut TestAppConte
     let f = on_test_phones(cx);
     begin(cx, &f, 100.0);
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    f.media.set_now(100.5); // the film is seen playing
+    frame(cx, f.window);
     unplug(&f, "Test Phones");
     f.media.set_now(102.5);
     frame(cx, f.window);
@@ -4919,6 +5152,12 @@ fn a_reconnect_during_the_latency_measurement_cancels_it(cx: &mut TestAppContext
     to_latency_step(cx, &f);
     press(cx, f.window, &["space"]);
     some_calibration(cx, &f, 10);
+    assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    // A lookup that fails for a moment is no reason to stop.
+    f.media.0.borrow_mut().lookups_fail = true;
+    some_calibration(cx, &f, 3);
+    f.media.0.borrow_mut().lookups_fail = false;
+    some_calibration(cx, &f, 1);
     assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
     // Back between two ticks as another device: the beeps may have
     // played elsewhere meanwhile.

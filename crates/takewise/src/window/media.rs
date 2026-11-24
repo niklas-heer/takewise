@@ -1,12 +1,14 @@
 //! The media calls the window makes, behind a trait so tests can replace
 //! AVPlayer, CoreAudio and the host clock with a fake.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
 use takewise_core::{AvailableInput, Timebase};
 use takewise_media::{
-    Capture, CaptureBuffer, ChannelMeter, DeviceInfo, FilmPlayer, Frame, Monitor, TakePlayer,
+    Capture, CaptureBuffer, ChannelMeter, DeviceInfo, DeviceLookup, FilmPlayer, Frame, Monitor,
+    TakePlayer,
 };
 
 /// Everything the window needs from the film player, the take player, the
@@ -77,9 +79,14 @@ pub trait Media {
     fn applied_output_uid(&self) -> Option<String>;
     /// The CoreAudio object of the device with this UID while it is
     /// connected: a device that went away and came back has a new one, so
-    /// comparing objects tells a reconnect from no change.
-    fn output_object(&self, uid: &str) -> Option<u32>;
-    /// The system's default output: its name and UID.
+    /// comparing objects tells a reconnect from no change. A failed read is
+    /// [`DeviceLookup::Unknown`], not absent. One property read.
+    fn output_object(&self, uid: &str) -> DeviceLookup;
+    /// The CoreAudio object of the system's default output: one property
+    /// read, for every frame.
+    fn default_output_object(&self) -> DeviceLookup;
+    /// The system's default output: its name and UID (lists devices: not
+    /// for every frame).
     fn default_output_uid(&self) -> Option<(String, String)>;
     /// The name of the system's default output device.
     fn default_output(&self) -> Option<String>;
@@ -115,6 +122,43 @@ pub struct RealMedia {
     take: Option<TakePlayer>,
     capture: Option<Capture>,
     meter: Option<ChannelMeter>,
+    /// What costs listing the devices, which the window asks for while it
+    /// draws: kept until the devices change (see [`Listed`]).
+    outputs: Listed<Vec<DeviceInfo>>,
+    default_output: Listed<Option<String>>,
+    buffer: Listed<Option<(String, Option<u32>)>>,
+}
+
+/// How long a listing is kept should device changes go unreported.
+const LIST_FRESH_S: f64 = 2.0;
+
+/// A value that costs listing the devices, kept while the device
+/// generation stays the same and for at most [`LIST_FRESH_S`].
+#[derive(Debug, Default)]
+pub struct Listed<T>(RefCell<Option<(u64, f64, T)>>);
+
+impl<T: Clone> Listed<T> {
+    /// The kept value, or a new one from `fetch` when the devices changed
+    /// (`generation`), it is older than [`LIST_FRESH_S`] at `now`, or
+    /// `keep` refuses it.
+    pub fn get(
+        &self,
+        generation: u64,
+        now: f64,
+        keep: impl FnOnce(&T) -> bool,
+        fetch: impl FnOnce() -> T,
+    ) -> T {
+        if let Some((seen, at, value)) = &*self.0.borrow()
+            && *seen == generation
+            && now - at < LIST_FRESH_S
+            && keep(value)
+        {
+            return value.clone();
+        }
+        let value = fetch();
+        *self.0.borrow_mut() = Some((generation, now, value.clone()));
+        value
+    }
 }
 
 impl RealMedia {
@@ -127,6 +171,9 @@ impl RealMedia {
             take: None,
             capture: None,
             meter: None,
+            outputs: Listed::default(),
+            default_output: Listed::default(),
+            buffer: Listed::default(),
         })
     }
 }
@@ -246,11 +293,23 @@ impl Media for RealMedia {
     }
 
     fn outputs(&self) -> Vec<DeviceInfo> {
-        takewise_media::output_devices().unwrap_or_default()
+        let (generation, now) = (self.device_generation(), self.host_now_s());
+        self.outputs.get(
+            generation,
+            now,
+            |_| true,
+            || takewise_media::output_devices().unwrap_or_default(),
+        )
     }
 
     fn default_output(&self) -> Option<String> {
-        takewise_media::default_output().ok().map(|d| d.name)
+        let (generation, now) = (self.device_generation(), self.host_now_s());
+        self.default_output.get(
+            generation,
+            now,
+            |_| true,
+            || takewise_media::default_output().ok().map(|d| d.name),
+        )
     }
 
     fn output_connected(&self, device: &str) -> bool {
@@ -265,8 +324,12 @@ impl Media for RealMedia {
         self.output_uid.clone()
     }
 
-    fn output_object(&self, uid: &str) -> Option<u32> {
+    fn output_object(&self, uid: &str) -> DeviceLookup {
         takewise_media::output_object(uid)
+    }
+
+    fn default_output_object(&self) -> DeviceLookup {
+        takewise_media::default_output_object()
     }
 
     fn default_output_uid(&self) -> Option<(String, String)> {
@@ -310,7 +373,19 @@ impl Media for RealMedia {
     }
 
     fn buffer_frames(&self, device: &str) -> Option<u32> {
-        takewise_media::buffer_frames(device).ok()
+        let (generation, now) = (self.device_generation(), self.host_now_s());
+        let kept = |value: &Option<(String, Option<u32>)>| {
+            value.as_ref().is_some_and(|(name, _)| name == device)
+        };
+        let fetch = || {
+            Some((
+                device.to_owned(),
+                takewise_media::buffer_frames(device).ok(),
+            ))
+        };
+        self.buffer
+            .get(generation, now, kept, fetch)
+            .and_then(|(_, frames)| frames)
     }
 
     fn monitor_unavailable(&self) -> Option<String> {
@@ -319,5 +394,38 @@ impl Media for RealMedia {
 
     fn microphone_permission(&self) -> takewise_core::MicPermission {
         takewise_media::microphone_permission()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::Listed;
+
+    #[test]
+    fn a_listing_is_kept_until_the_devices_change_or_it_is_old() {
+        let listed = Listed::default();
+        let fetched = Cell::new(0);
+        let get = |generation, now| {
+            listed.get(
+                generation,
+                now,
+                |_| true,
+                || {
+                    fetched.set(fetched.get() + 1);
+                    fetched.get()
+                },
+            )
+        };
+        assert_eq!(get(0, 10.0), 1);
+        assert_eq!(get(0, 11.0), 1, "the same devices: kept");
+        assert_eq!(get(1, 11.0), 2, "the devices changed");
+        assert_eq!(get(1, 13.5), 3, "older than two seconds");
+        assert_eq!(
+            listed.get(1, 13.6, |value| *value != 3, || 9),
+            9,
+            "refused by the caller"
+        );
     }
 }

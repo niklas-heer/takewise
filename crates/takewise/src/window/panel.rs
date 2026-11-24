@@ -318,11 +318,16 @@ impl RecordingWindow {
     /// input's current one.
     pub(super) fn current_route(&self) -> Route {
         let mut route = Route::of(&self.project.config);
-        // The device the players are set to while it is there; not known
-        // while it is gone (they may have fallen back to the default).
-        route.output = match &self.film_output {
-            Some(name) => Some(name.clone()).filter(|name| self.media.output_connected(name)),
-            None => self.media.default_output(),
+        // The device the players are set to while it is there (one property
+        // read); not known while it is gone (they may have fallen back to
+        // the default).
+        route.output = match (&self.film_output, &self.applied_device) {
+            (Some(name), Some((uid, _))) => {
+                let gone = self.media.output_object(uid) == takewise_media::DeviceLookup::Absent;
+                (!gone).then(|| name.clone())
+            }
+            (Some(_), None) => None,
+            (None, _) => self.media.default_output(),
         };
         route.buffer_frames = route
             .input

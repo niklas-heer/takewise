@@ -9,22 +9,47 @@
 //!
 //! The applied device has *dropped* when it is gone or has another object
 //! than when it was set (it went away and came back, perhaps between two
-//! ticks: the players may have fallen back to the default meanwhile). The
-//! route is set again only when it must be: the configured one differs
-//! from the applied one, or the applied device dropped, or setting it
-//! failed. Other device changes leave a playing film alone.
+//! ticks; macOS gives a reconnected device a new object). A lookup that
+//! fails says nothing about the device: it is tried again for
+//! [`LOOKUP_GRACE_S`] before it counts as a drop, and meanwhile nothing is
+//! set again, stopped or cancelled, and a start waits. The route is set
+//! again only when it must be: the configured one differs from the applied
+//! one, or the applied device dropped, or setting it failed.
 //!
-//! Device changes ([`Media::device_generation`]) are acted on at the next
-//! tick, with a poll every two seconds as the fallback, and right before a
-//! playback or a take's film is scheduled the applied device is checked
-//! once more. A playback whose route drops stops; a take goes on, watching
-//! the device it started on (or, on the system output, which device that
-//! is), and its result says that the film may have played elsewhere.
+//! Each tick does a constant number of single CoreAudio property reads
+//! (the device's object, the default output's object); listing devices,
+//! names and UIDs is left to starts, device changes
+//! ([`Media::device_generation`]) and a poll every two seconds. Right
+//! before a playback or a take's film is scheduled, and until the take's
+//! film is seen playing, the device is checked again. A playback whose
+//! route drops stops; a take goes on, watching the device it started on
+//! (or, on the system output, which device that is), setting it again
+//! after every drop, and its result says once that the film may have
+//! played elsewhere.
 //!
 //! [`Media::output_connected`]: super::Media::output_connected
 //! [`Media::device_generation`]: super::Media::device_generation
 
+use takewise_media::DeviceLookup;
+
 use super::RecordingWindow;
+use super::recorder::StartHold;
+
+/// How long a failing device lookup is tried again before it counts as a
+/// drop.
+pub const LOOKUP_GRACE_S: f64 = 0.5;
+
+/// What a device lookup says against the object it was seen as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seen {
+    /// The same object: nothing happened.
+    Same,
+    /// Gone (`None`), or another object: it went away and perhaps came
+    /// back.
+    Dropped(Option<u32>),
+    /// The lookup failed, within [`LOOKUP_GRACE_S`]: not known yet.
+    Unsure,
+}
 
 /// Why the configured output cannot be used now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +58,8 @@ pub enum OutputProblem {
     Missing(String),
     /// It is connected, but the players could not be set to it.
     Failed { name: String, error: String },
+    /// Its lookup failed just now: not known to be there yet.
+    Unconfirmed(String),
 }
 
 impl OutputProblem {
@@ -43,6 +70,9 @@ impl OutputProblem {
                 format!("{name} is not connected: connect it or pick another output (A).")
             }
             Self::Failed { name, error } => format!("Cannot play through {name}: {error}."),
+            Self::Unconfirmed(name) => {
+                format!("{name} could not be checked just now; press it again.")
+            }
         }
     }
 
@@ -55,21 +85,67 @@ impl OutputProblem {
             Self::Failed { name, error } => format!(
                 "Cannot play through {name} ({error}), so Takewise does not record. Pick another output, or System output, in the audio panel (A)."
             ),
+            Self::Unconfirmed(name) => {
+                format!(
+                    "{name} could not be checked just now, so Takewise does not record yet; try again."
+                )
+            }
         }
     }
 }
 
 impl RecordingWindow {
+    /// One lookup of the device `uid`, seen before as `object`. A failed
+    /// read counts as a drop only once reads failed for
+    /// [`LOOKUP_GRACE_S`].
+    pub(super) fn see(&mut self, uid: &str, object: u32) -> Seen {
+        self.seen_lookup(self.media.output_object(uid), object)
+    }
+
+    pub(super) fn seen_lookup(&mut self, lookup: DeviceLookup, object: u32) -> Seen {
+        match lookup {
+            DeviceLookup::Present(now) => {
+                self.lookup_failed_since = None;
+                if now == object {
+                    Seen::Same
+                } else {
+                    Seen::Dropped(Some(now))
+                }
+            }
+            DeviceLookup::Absent => {
+                self.lookup_failed_since = None;
+                Seen::Dropped(None)
+            }
+            DeviceLookup::Unknown => {
+                let now = self.media.host_now_s();
+                let since = *self.lookup_failed_since.get_or_insert(now);
+                if now - since >= LOOKUP_GRACE_S {
+                    Seen::Dropped(None)
+                } else {
+                    Seen::Unsure
+                }
+            }
+        }
+    }
+
     /// Puts the players on the configured route: the configured device, or
     /// the system output when none is configured; set only when it must be
     /// (see the module). Whether the applied device dropped is always
-    /// checked; with `recheck`, also whether the configured device is there
-    /// by name (a start, a device change, the poll), without, not while
-    /// the applied device is in place. A missing device leaves the players
-    /// alone and is said in the error; a route that could not be set stays
-    /// due to be set again.
+    /// checked, with one property read; with `recheck`, also whether the
+    /// configured device is there by name (a start, a device change, the
+    /// poll). A missing or unconfirmed device leaves the players alone and
+    /// is said in the error; a route that could not be set stays due.
     pub(super) fn sync_output(&mut self, recheck: bool) -> Result<(), OutputProblem> {
-        if self.applied_dropped() {
+        if let (Some(name), Some((uid, object))) =
+            (self.film_output.clone(), self.applied_device.clone())
+        {
+            match self.see(&uid, object) {
+                Seen::Same => {}
+                Seen::Dropped(_) => self.route_due = true,
+                Seen::Unsure => return Err(OutputProblem::Unconfirmed(name)),
+            }
+        } else if self.film_output.is_some() {
+            // Set, but its object never read: not known.
             self.route_due = true;
         }
         let Some(name) = self.project.config.output.device.clone() else {
@@ -99,37 +175,51 @@ impl RecordingWindow {
             return Err(OutputProblem::Missing(name));
         }
         if self.route_due || !applied {
-            if let Err(error) = self.media.set_output(Some(&name)) {
-                self.output_error = Some(error.clone());
-                self.route_due = true;
-                return Err(OutputProblem::Failed { name, error });
-            }
-            self.film_output = Some(name.clone());
-            self.applied_device = self.media.applied_output_uid().and_then(|uid| {
-                let object = self.media.output_object(&uid)?;
-                Some((uid, object))
-            });
-            if self.applied_device.is_none() {
-                // Gone again between the lookup and now: the route is not
-                // known to be there, so it stays due and nothing starts.
-                self.output_missing = Some(name.clone());
-                return Err(OutputProblem::Missing(name));
-            }
-            self.route_due = false;
+            self.set_route(&name)?;
         }
         self.output_missing = None;
         self.output_error = None;
         Ok(())
     }
 
-    /// Whether the device the players were set to is gone, or is another
-    /// CoreAudio object than then (it went away and came back).
-    fn applied_dropped(&self) -> bool {
-        match (&self.film_output, &self.applied_device) {
-            (Some(_), Some((uid, object))) => self.media.output_object(uid) != Some(*object),
-            // Set, but its object could not be read then: not known.
-            (Some(_), None) => true,
-            (None, _) => false,
+    /// Sets the players to the device `name` and reads which object it is.
+    /// Not confirmed (gone again, or the read failed): the route stays due,
+    /// and nothing may start on it.
+    fn set_route(&mut self, name: &str) -> Result<(), OutputProblem> {
+        if let Err(error) = self.media.set_output(Some(name)) {
+            self.output_error = Some(error.clone());
+            self.route_due = true;
+            return Err(OutputProblem::Failed {
+                name: name.to_owned(),
+                error,
+            });
+        }
+        self.film_output = Some(name.to_owned());
+        self.route_due = true;
+        self.applied_device = None;
+        let uid = self.media.applied_output_uid();
+        match uid.as_deref().map(|uid| self.media.output_object(uid)) {
+            Some(DeviceLookup::Present(object)) => {
+                self.applied_device = uid.map(|uid| (uid, object));
+                self.route_due = false;
+                Ok(())
+            }
+            Some(DeviceLookup::Unknown) => Err(OutputProblem::Unconfirmed(name.to_owned())),
+            _ => {
+                self.output_missing = Some(name.to_owned());
+                Err(OutputProblem::Missing(name.to_owned()))
+            }
+        }
+    }
+
+    /// Before P, Shift+P or a take: the route checked and set as needed. A
+    /// device that could not be looked up just now lets it begin: its
+    /// start waits (see [`RecordingWindow::hold_start`]) until the device
+    /// is confirmed, or counts as gone.
+    pub(super) fn route_for_start(&mut self) -> Result<(), OutputProblem> {
+        match self.sync_output(true) {
+            Err(OutputProblem::Unconfirmed(_)) => Ok(()),
+            other => other,
         }
     }
 
@@ -144,7 +234,8 @@ impl RecordingWindow {
     /// Between takes and during a playback (a device change, the poll, a
     /// reload): follows the configured route. Says when a missing output
     /// came back, unless the window is saying something else; stops a
-    /// playback whose route can no longer be used.
+    /// playback whose route can no longer be used, but not on a lookup that
+    /// failed once.
     pub(super) fn follow_output(&mut self) {
         let was_missing = self.output_missing.clone();
         match self.sync_output(true) {
@@ -164,6 +255,7 @@ impl RecordingWindow {
                     }
                 }
             }
+            Err(OutputProblem::Unconfirmed(_)) => {}
             Err(problem) => {
                 if self.recorder.is_playing() {
                     self.recorder.stop_playback(&mut *self.media);
@@ -196,8 +288,7 @@ impl RecordingWindow {
             self.output_checked_at = now;
         }
         if recording {
-            self.check_take_route();
-            self.restore_take_route();
+            self.check_take_route(changed || due);
         } else if changed || due {
             self.follow_output();
         }
@@ -205,94 +296,79 @@ impl RecordingWindow {
 
     /// When a take starts: the route it plays the film through, to watch.
     pub(super) fn snapshot_take_route(&mut self) {
-        self.take_route = match &self.film_output {
-            Some(name) => Some(TakeRoute {
+        self.take_route = if let Some(name) = &self.film_output {
+            Some(TakeRoute {
                 name: name.clone(),
                 uid: self.applied_device.as_ref().map(|(uid, _)| uid.clone()),
                 object: self.applied_device.as_ref().map(|(_, object)| *object),
                 system: false,
-                noted: false,
-            }),
-            None => self
-                .media
+                tried: None,
+            })
+        } else {
+            let object = match self.media.default_output_object() {
+                DeviceLookup::Present(object) => Some(object),
+                DeviceLookup::Absent | DeviceLookup::Unknown => None,
+            };
+            // Its name and UID are read once, here.
+            self.media
                 .default_output_uid()
                 .map(|(name, uid)| TakeRoute {
                     name,
-                    object: self.media.output_object(&uid),
                     uid: Some(uid),
+                    object,
                     system: true,
-                    noted: false,
-                }),
+                    tried: None,
+                })
         };
     }
 
-    /// Whether the device of the take's route dropped: gone, or another
-    /// CoreAudio object than when the take started. Not known (false) when
-    /// its object could not be read then.
-    fn take_device_dropped(&self, route: &TakeRoute) -> bool {
-        match (&route.uid, route.object) {
-            (Some(uid), Some(object)) => self.media.output_object(uid) != Some(object),
-            _ => false,
-        }
-    }
-
-    /// Checks the route a take started on, every tick and as it stops: a
-    /// device that dropped (gone, or back as another object), or on the
-    /// system output another default output, is noted on the take once its
-    /// film plays (a change during the pre-roll is noted then, not lost),
-    /// and the route is set again.
-    pub(super) fn check_take_route(&mut self) {
+    /// Checks the route a take started on, every tick (one property read)
+    /// and as it stops. Once the take's film was seen playing, a drop of its
+    /// device, or on the system output another default output, is noted
+    /// on the take (said once with its result), and after every drop the
+    /// route is set again as soon as the device is back: at once when it is
+    /// seen back, else tried again on a device change or the poll (`event`).
+    pub(super) fn check_take_route(&mut self, event: bool) {
         let Some(route) = self.take_route.clone() else {
             return;
         };
-        if route.noted {
+        if route.system {
+            self.check_system_route(&route);
             return;
         }
-        let dropped = self.take_device_dropped(&route);
-        let note = if route.system {
-            let other = self
-                .media
-                .default_output_uid()
-                .filter(|(_, uid)| route.uid.as_ref().is_some_and(|was| was != uid));
-            match other {
-                Some((name, _)) => Some(format!(
-                    "The system output changed to {name} during the take: the film may have played out loud; listen before you choose it."
-                )),
-                None => dropped.then(|| format!(
-                    "The system output ({}) dropped out during the take: the film may have played out loud; listen before you choose it.",
-                    route.name
-                )),
-            }
-        } else {
-            dropped.then(|| format!(
-                "{} was disconnected during the take, so the film may have played elsewhere, out loud: listen before you choose it.",
-                route.name
-            ))
-        };
-        let now = self.media.host_now_s();
-        if let Some(note) = note
-            && self.recorder.note_route(note, now)
-        {
-            if let Some(route) = &mut self.take_route {
-                route.noted = true;
-            }
-            self.route_due = true;
-        }
-    }
-
-    /// During a take that noted its device dropped: once the device is back,
-    /// the route is set again at once (the take is marked already, so a
-    /// glitch costs nothing), so the film does not play out loud for the
-    /// rest of it.
-    fn restore_take_route(&mut self) {
-        let Some(route) = &self.take_route else {
+        let (Some(uid), Some(object)) = (route.uid.clone(), route.object) else {
             return;
         };
+        let back = match self.see(&uid, object) {
+            Seen::Same | Seen::Unsure => return,
+            Seen::Dropped(back) => back,
+        };
+        let note = format!(
+            "{} was disconnected during the take, so the film may have played elsewhere, out loud: listen before you choose it.",
+            route.name
+        );
+        if !self.recorder.note_route(note) {
+            // Its film has not been seen playing: the start is held instead.
+            return;
+        }
+        // Set again after the take at the latest.
+        self.route_due = true;
         let configured = self.project.config.output.device.as_ref();
-        if !route.noted || route.system || configured != Some(&route.name) || !self.route_due {
+        if configured != Some(&route.name) {
             return;
         }
-        if self.sync_output(true).is_ok()
+        // Back as another object: set it again at once (the take is noted,
+        // so a glitch costs nothing), once per object unless devices changed.
+        let Some(back) = back else {
+            return;
+        };
+        if route.tried == Some(back) && !event {
+            return;
+        }
+        if let Some(route) = &mut self.take_route {
+            route.tried = Some(back);
+        }
+        if self.set_route(&route.name).is_ok()
             && let Some(route) = &mut self.take_route
         {
             route.uid = self.applied_device.as_ref().map(|(uid, _)| uid.clone());
@@ -300,37 +376,89 @@ impl RecordingWindow {
         }
     }
 
+    /// A take on the system output: the default output's object is compared
+    /// every tick (one property read), its name looked up only when it
+    /// changed.
+    fn check_system_route(&mut self, route: &TakeRoute) {
+        let lookup = self.media.default_output_object();
+        let Some(object) = route.object else {
+            // Not read when the take started: from the first read on.
+            if let (DeviceLookup::Present(object), Some(route)) = (lookup, &mut self.take_route) {
+                route.object = Some(object);
+            }
+            return;
+        };
+        let now = match self.seen_lookup(lookup, object) {
+            Seen::Same | Seen::Unsure => return,
+            Seen::Dropped(now) => now,
+        };
+        let other = now
+            .and_then(|_| self.media.default_output_uid())
+            .filter(|(_, uid)| route.uid.as_ref() != Some(uid));
+        let note = match &other {
+            Some((name, _)) => format!(
+                "The system output changed from {} to {name} during the take: listen before you choose it.",
+                route.name
+            ),
+            None => format!(
+                "The system output ({}) dropped out during the take: listen before you choose it.",
+                route.name
+            ),
+        };
+        if self.recorder.note_route(note)
+            && let Some(route) = &mut self.take_route
+        {
+            // Followed from here, so a later change is seen too.
+            route.object = now;
+            if let Some((name, uid)) = other {
+                route.name = name;
+                route.uid = Some(uid);
+            }
+        }
+    }
+
     /// Each tick before the recorder starts a playback or a take's film, or
-    /// while that start is scheduled but has not come: why it must not
-    /// start, if the route can no longer be used. The applied device is
-    /// looked up right now, whatever the devices are said to have done: a
-    /// playback follows the configured route (set again when the device
-    /// dropped and is back); a take checks the device it started on.
+    /// while the take's film was not yet seen playing: whether it may start.
+    /// The applied device is looked up right now (one property read),
+    /// whatever the devices are said to have done: a playback follows the
+    /// configured route (set again when the device dropped and is back); a
+    /// take checks the device it started on. A lookup that failed makes it
+    /// wait, not stop.
     pub(super) fn hold_start(&mut self) {
         let now = self.media.host_now_s();
-        let problem = if self.recorder.playback_waiting(now) {
-            self.sync_output(false)
-                .err()
-                .map(|problem| format!("The playback stopped. {}", problem.for_playback()))
-        } else if self.recorder.film_waiting(now) {
-            self.take_route
-                .clone()
-                .filter(|route| !route.system && self.take_device_dropped(route))
-                .map(|route| {
-                    let back = route
-                        .uid
-                        .as_ref()
-                        .is_some_and(|uid| self.media.output_object(uid).is_some());
-                    if back {
-                        format!("{} dropped out; start the take again.", route.name)
-                    } else {
-                        OutputProblem::Missing(route.name).for_recording()
-                    }
-                })
+        let hold = if self.recorder.playback_waiting(now) {
+            match self.sync_output(false) {
+                Ok(()) => StartHold::Go,
+                Err(OutputProblem::Unconfirmed(_)) => StartHold::Wait,
+                Err(problem) => {
+                    StartHold::Stop(format!("The playback stopped. {}", problem.for_playback()))
+                }
+            }
+        } else if self.recorder.film_waiting() {
+            self.take_start_hold()
         } else {
-            None
+            StartHold::Go
         };
-        self.recorder.hold_start(problem);
+        self.recorder.hold_start(hold);
+    }
+
+    fn take_start_hold(&mut self) -> StartHold {
+        let Some(route) = self.take_route.clone().filter(|route| !route.system) else {
+            return StartHold::Go;
+        };
+        let (Some(uid), Some(object)) = (route.uid, route.object) else {
+            return StartHold::Go;
+        };
+        match self.see(&uid, object) {
+            Seen::Same => StartHold::Go,
+            Seen::Unsure => StartHold::Wait,
+            Seen::Dropped(Some(_)) => {
+                StartHold::Stop(format!("{} dropped out; start the take again.", route.name))
+            }
+            Seen::Dropped(None) => {
+                StartHold::Stop(OutputProblem::Missing(route.name).for_recording())
+            }
+        }
     }
 
     /// What the panel says under the output when the configured one is not
@@ -350,14 +478,14 @@ impl RecordingWindow {
 
 /// The output a take started on: its name, the device's UID and CoreAudio
 /// object (each `None` when it could not be read), whether it is the
-/// system output (whose device can change during the take), and whether
-/// its loss was noted. A reload that changes `[output] device` does not
-/// change it.
+/// system output (whose device can change during the take), and the object
+/// it was last set again to after a drop. A reload that changes
+/// `[output] device` does not change it.
 #[derive(Debug, Clone)]
 pub struct TakeRoute {
     name: String,
     uid: Option<String>,
     object: Option<u32>,
     system: bool,
-    noted: bool,
+    tried: Option<u32>,
 }

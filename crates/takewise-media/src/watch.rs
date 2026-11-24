@@ -13,7 +13,7 @@ use objc2_core_audio::{
     kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
 };
 
-use crate::latency::{address, device_id};
+use crate::latency::{DeviceLookup, address, lookup_device};
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static LISTENING: OnceLock<bool> = OnceLock::new();
@@ -33,10 +33,17 @@ pub fn watching_devices() -> bool {
 }
 
 /// The CoreAudio object of the device with this UID while it is
-/// connected. A device that went away and came back keeps its UID but gets
-/// a new object, so comparing objects tells a reconnect from no change.
-pub fn output_object(uid: &str) -> Option<u32> {
-    device_id(uid)
+/// connected ([`DeviceLookup::Present`]): a device that went away and came
+/// back keeps its UID but gets a new object, so comparing objects tells a
+/// reconnect from no change. One property read.
+pub fn output_object(uid: &str) -> DeviceLookup {
+    lookup_device(uid)
+}
+
+/// The CoreAudio object of the system's default output: one property
+/// read, to compare every frame; resolve its name only when it changes.
+pub fn default_output_object() -> DeviceLookup {
+    crate::latency::default_output_object()
 }
 
 fn listen() -> bool {
