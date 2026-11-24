@@ -201,87 +201,27 @@ impl RecordingWindow {
 
     /// Plays the film and the takes (and later the monitor) through `name`.
     pub(super) fn choose_output(&mut self, name: &str) {
+        let playing = self.recorder.is_playing();
         // The route change reloads the project, which moves the film and
-        // the takes to the new output when it can.
+        // the takes to the new output when it can, and stops a playback
+        // when it cannot.
         let Some(note) = self.change_route(None, Some(name)) else {
             return;
         };
-        let said = match self.sync_output() {
+        let said = match self.sync_output(false) {
             Ok(()) => format!("The film and your takes play through {name}."),
-            Err(err) => {
+            Err(problem) => {
                 // A playback goes on where it was only if nothing changed;
                 // the narrator asked to hear it elsewhere, so it stops.
-                let stopped = if self.recorder.is_playing() {
-                    self.recorder.stop_playback(&mut *self.media);
-                    " Playback stopped."
-                } else {
-                    ""
-                };
-                format!("Saved {name} as the output. {err}{stopped}")
+                self.recorder.stop_playback(&mut *self.media);
+                let stopped = if playing { " Playback stopped." } else { "" };
+                format!(
+                    "Saved {name} as the output. {}{stopped}",
+                    problem.for_playback()
+                )
             }
         };
         self.message = Some(format!("{said}{note}"));
-    }
-
-    /// When the window opens: plays the film and the takes through the
-    /// configured output, and says so when it is missing.
-    pub(super) fn apply_output(&mut self) {
-        if let Err(err) = self.sync_output() {
-            self.message = Some(err);
-        }
-    }
-
-    /// Puts the film and the takes on the configured output when they are
-    /// not on it: forgets an output in use that is gone, and applies the
-    /// configured one once it is connected (at open, plugged in later, or
-    /// changed in `project.toml`). With none configured they play through
-    /// the system's default output. Returns why the configured output
-    /// cannot be used, in words, if it cannot: then nothing may play.
-    pub(super) fn sync_output(&mut self) -> Result<(), String> {
-        let connected = self.media.outputs();
-        let is_connected = |name: &str| connected.iter().any(|o| o.name == name);
-        if self
-            .film_output
-            .as_deref()
-            .is_some_and(|name| !is_connected(name))
-        {
-            self.film_output = None;
-        }
-        let configured = self.project.config.output.device.clone();
-        if configured == self.film_output {
-            return Ok(());
-        }
-        match configured {
-            None => {
-                self.media
-                    .set_output(None)
-                    .map_err(|err| format!("Cannot play through the system output: {err}."))?;
-                self.film_output = None;
-            }
-            Some(name) if !is_connected(&name) => {
-                return Err(format!(
-                    "{name} is not connected: connect it or pick another output (A)."
-                ));
-            }
-            Some(name) => {
-                self.media
-                    .set_output(Some(&name))
-                    .map_err(|err| format!("Cannot play through {name}: {err}."))?;
-                self.film_output = Some(name);
-            }
-        }
-        Ok(())
-    }
-
-    /// What the panel says under the output when the configured output is
-    /// not the one in use.
-    pub(super) fn output_note(&self) -> Option<String> {
-        let configured = self.project.config.output.device.as_ref()?;
-        (self.film_output.as_ref() != Some(configured)).then(|| {
-            format!(
-                "{configured} is not connected: nothing plays until it is, or pick another output."
-            )
-        })
     }
 
     /// Switches the input device to 48 kHz; recording stays off when it
@@ -346,12 +286,12 @@ impl RecordingWindow {
     /// input's current one.
     pub(super) fn current_route(&self) -> Route {
         let mut route = Route::of(&self.project.config);
-        let connected = self.media.outputs();
-        route.output = self
-            .film_output
-            .clone()
-            .filter(|name| connected.iter().any(|o| &o.name == name))
-            .or_else(|| self.media.default_output());
+        // The device the players are set to while it is there; not known
+        // while it is gone (they may have fallen back to the default).
+        route.output = match &self.film_output {
+            Some(name) => Some(name.clone()).filter(|name| self.media.output_connected(name)),
+            None => self.media.default_output(),
+        };
         route.buffer_frames = route
             .input
             .as_deref()

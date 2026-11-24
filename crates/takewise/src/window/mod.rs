@@ -19,6 +19,7 @@ mod lines;
 mod media;
 mod meter;
 mod model;
+mod output;
 mod panel;
 mod passage;
 mod prompter;
@@ -616,11 +617,18 @@ pub struct RecordingWindow {
     /// Whether the window offers to install a missing model (not in tests
     /// unless a test says so).
     offers_model: bool,
-    /// The output the film was last set to play through; `None` is the
-    /// system default (none chosen, or the chosen one could not be used).
+    /// The output the players are set to (the applied route): `None` is
+    /// the system's default output. It changes only when the players do
+    /// (see `output`), whether or not the device is still there.
     film_output: Option<String>,
-    /// When a playback last checked that its output is still there.
+    /// The configured output while it is not connected, and why the
+    /// players could not be set to a connected one.
+    output_missing: Option<String>,
+    output_error: Option<String>,
+    /// When a playback or a take last checked its output, and the output
+    /// lost while the take records, to say so once it ends.
     output_checked_at: f64,
+    take_output_lost: Option<String>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -708,7 +716,10 @@ impl RecordingWindow {
             models_dir,
             offers_model: false,
             film_output: None,
+            output_missing: None,
+            output_error: None,
             output_checked_at: 0.0,
+            take_output_lost: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1159,39 +1170,6 @@ impl RecordingWindow {
         self.inputs_checked_at = Some(self.media.host_now_s());
     }
 
-    /// Moves the film and the takes to the configured output once it can
-    /// be used, and says so when it was missing until now.
-    fn follow_output(&mut self) {
-        let missing = self.output_note().is_some();
-        if self.sync_output().is_ok()
-            && missing
-            && let Some(name) = &self.film_output
-        {
-            self.message = Some(format!(
-                "{name} is connected: the film and your takes play there."
-            ));
-        }
-    }
-
-    /// While a playback runs: stops it, saying why, when the output it
-    /// plays through is gone, rather than letting it go on elsewhere.
-    fn watch_output(&mut self, now: f64) {
-        if !self.recorder.is_playing() || now < self.output_checked_at + INPUT_CHECK_S {
-            return;
-        }
-        self.output_checked_at = now;
-        let Some(name) = self.film_output.clone() else {
-            return;
-        };
-        if !self.media.outputs().iter().any(|o| o.name == name) {
-            self.recorder.stop_playback(&mut *self.media);
-            self.film_output = None;
-            self.message = Some(format!(
-                "{name} was disconnected, so the playback stopped. Connect it or pick another output (A)."
-            ));
-        }
-    }
-
     /// Rests the film where the current line's take would start.
     fn park(&mut self) {
         let Some(line) = self.project.script.lines.get(self.line) else {
@@ -1217,11 +1195,12 @@ impl RecordingWindow {
         if self.blocked().is_some() {
             return;
         }
-        if let Err(err) = self.sync_output() {
-            self.message = Some(err);
+        if let Err(problem) = self.sync_output(true) {
+            self.message = Some(problem.for_recording());
             return;
         }
         self.message = None;
+        self.take_output_lost = None;
         self.peak_meter.clear();
         self.scroll.reset();
         self.panel.picker = None;
@@ -1242,6 +1221,7 @@ impl RecordingWindow {
     fn finish_take(&mut self) {
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
+        self.note_lost_output();
         self.pause_checks_while_recording();
     }
 
@@ -1302,6 +1282,7 @@ impl RecordingWindow {
         );
         let update = self.recorder.tick(&mut *self.media, &self.dir);
         self.show(update);
+        self.note_lost_output();
         self.follow_reading();
         self.pause_checks_while_recording();
         self.tick_setup(now);
@@ -1457,8 +1438,8 @@ impl RecordingWindow {
             cx.notify();
             return;
         };
-        if let Err(err) = self.sync_output() {
-            self.message = Some(err);
+        if let Err(problem) = self.sync_output(true) {
+            self.message = Some(problem.for_playback());
             cx.notify();
             return;
         }

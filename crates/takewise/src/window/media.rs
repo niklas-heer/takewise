@@ -48,9 +48,9 @@ pub trait Media {
     /// The capture's last error, such as an unplugged device.
     fn capture_error(&self) -> Option<String>;
 
-    /// Opens a take (or a passage) for playback, through the output set
-    /// with [`Media::set_output`]; it loads asynchronously. Fails when that
-    /// output cannot be used, rather than playing elsewhere.
+    /// Opens a take (or a passage) for playback, through the output last
+    /// set with [`Media::set_output`] (the very device the film plays
+    /// through, not looked up again); it loads asynchronously.
     fn open_take(&mut self, path: &Path) -> Result<(), String>;
     fn take_ready(&self) -> bool;
     /// Plays take time `take_s` at `host_s` (a negative `take_s` delays the
@@ -61,8 +61,13 @@ pub trait Media {
     fn take_set_gain_db(&mut self, db: f64);
     fn stop_take(&mut self);
 
-    /// The connected output devices.
+    /// The connected output devices, as the panel lists them.
     fn outputs(&self) -> Vec<DeviceInfo>;
+    /// Whether an output device with this name is connected, by the same
+    /// lookup [`Media::set_output`] uses (a device whose configuration
+    /// cannot be read now, such as Bluetooth headphones switching profile,
+    /// is still there).
+    fn output_connected(&self, device: &str) -> bool;
     /// The name of the system's default output device.
     fn default_output(&self) -> Option<String>;
     /// Plays the film and the takes through the output device with this
@@ -90,8 +95,10 @@ pub trait Media {
 /// The real media: AVPlayer for the film and takes, cpal for capture.
 pub struct RealMedia {
     film: FilmPlayer,
-    /// The output the film and takes were last set to play through.
-    output: Option<String>,
+    /// The CoreAudio UID of the output the film and takes were last set to
+    /// play through (`None`: the system's default output); every player
+    /// opened later gets this same device.
+    output_uid: Option<String>,
     take: Option<TakePlayer>,
     capture: Option<Capture>,
     meter: Option<ChannelMeter>,
@@ -103,7 +110,7 @@ impl RealMedia {
         let film = FilmPlayer::open(film).map_err(|err| err.to_string())?;
         Ok(Self {
             film,
-            output: None,
+            output_uid: None,
             take: None,
             capture: None,
             meter: None,
@@ -122,10 +129,7 @@ impl Media for RealMedia {
 
     fn film_open(&mut self, path: &Path) -> Result<(), String> {
         let film = FilmPlayer::open(path).map_err(|err| err.to_string())?;
-        if let Some(output) = &self.output {
-            film.set_output_device(output)
-                .map_err(|err| err.to_string())?;
-        }
+        film.set_output_uid(self.output_uid.as_deref());
         self.film.pause();
         self.film = film;
         Ok(())
@@ -202,10 +206,7 @@ impl Media for RealMedia {
         self.stop_take();
         self.take = None;
         let take = TakePlayer::open(path).map_err(|err| err.to_string())?;
-        if let Some(output) = &self.output {
-            take.set_output_device(output)
-                .map_err(|err| format!("Cannot play through {output}: {err}."))?;
-        }
+        take.set_output_uid(self.output_uid.as_deref());
         self.take = Some(take);
         Ok(())
     }
@@ -239,6 +240,10 @@ impl Media for RealMedia {
         takewise_media::default_output().ok().map(|d| d.name)
     }
 
+    fn output_connected(&self, device: &str) -> bool {
+        takewise_media::output_uid(device).is_ok()
+    }
+
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
         // One lookup for both players: once the device is found, setting
         // its UID cannot fail, so the film and the take never part.
@@ -250,7 +255,7 @@ impl Media for RealMedia {
         if let Some(take) = &self.take {
             take.set_output_uid(uid.as_deref());
         }
-        self.output = device.map(str::to_owned);
+        self.output_uid = uid;
         Ok(())
     }
 

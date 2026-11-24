@@ -46,6 +46,13 @@ struct Fake {
     /// Why `film_play_at` fails, when it does.
     play_error: Option<String>,
     outputs: Vec<DeviceInfo>,
+    /// Outputs that are connected but missing from `outputs()`, as a
+    /// device whose configuration cannot be read just then.
+    hidden_outputs: Vec<String>,
+    /// Every output set, in order (`None`: the system's default output).
+    output_sets: Vec<Option<String>>,
+    /// Whether an opened take is still loading.
+    take_loading: bool,
     /// Where the film plays (`None`: the system default).
     film_output: Option<String>,
     /// The take open for playback, if one is.
@@ -121,6 +128,9 @@ impl FakeMedia {
                 ),
                 output("Built-in Output", Transport::BuiltIn, OutputSource::Unknown),
             ],
+            hidden_outputs: Vec::new(),
+            output_sets: Vec::new(),
+            take_loading: false,
             film_output: None,
             take: None,
             take_output_error: None,
@@ -273,16 +283,10 @@ impl Media for FakeMedia {
         self.0.borrow().capture_error.clone()
     }
     fn open_take(&mut self, path: &Path) -> Result<(), String> {
+        // On the device the film was last set to, as the real media: it is
+        // not looked up again.
         let mut fake = self.0.borrow_mut();
-        fake.take = None;
         let output = fake.film_output.clone();
-        if let Some(name) = &output
-            && !fake.outputs.iter().any(|o| &o.name == name)
-        {
-            return Err(format!(
-                "Cannot play through {name}: no output device named {name:?}."
-            ));
-        }
         fake.opened_takes.push(path.to_owned());
         fake.take = Some(OpenTake {
             output,
@@ -291,7 +295,7 @@ impl Media for FakeMedia {
         Ok(())
     }
     fn take_ready(&self) -> bool {
-        true
+        !self.0.borrow().take_loading
     }
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {
         self.0.borrow_mut().take_plays.push((take_s, host_s));
@@ -309,19 +313,25 @@ impl Media for FakeMedia {
     fn default_output(&self) -> Option<String> {
         Some("MacBook Speakers".to_owned())
     }
+    fn output_connected(&self, device: &str) -> bool {
+        let fake = self.0.borrow();
+        fake.outputs.iter().any(|output| output.name == device)
+            || fake.hidden_outputs.iter().any(|name| name == device)
+    }
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
-        let mut fake = self.0.borrow_mut();
         if let Some(device) = device
-            && !fake.outputs.iter().any(|output| output.name == device)
+            && !self.output_connected(device)
         {
             return Err(format!("no output device named {device:?}"));
         }
+        let mut fake = self.0.borrow_mut();
         if fake.take.is_some()
             && let Some(err) = fake.take_output_error.clone()
         {
             return Err(err);
         }
         fake.film_output = device.map(str::to_owned);
+        fake.output_sets.push(device.map(str::to_owned));
         if let Some(take) = &mut fake.take {
             take.output = device.map(str::to_owned);
         }
@@ -905,6 +915,13 @@ fn an_output_the_take_cannot_use_changes_nothing_and_stops_playback(cx: &mut Tes
             .as_deref(),
         Some("Test Phones")
     );
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.output_note())
+            .as_deref(),
+        Some("External Headphones could not be used: the take refused"),
+        "connected, but not in use"
+    );
 }
 
 #[gpui_kit::test]
@@ -1010,12 +1027,19 @@ fn a_missing_output_refuses_playback_until_it_is_connected(cx: &mut TestAppConte
     });
 
     // P and Space play nothing on the system output (Shift+P goes the
-    // same way, see the passage tests).
+    // same way, see the passage tests); a take says why it matters.
     press(cx, f.window, &["down", "down", "down"]); // d
-    for key in ["p", "space"] {
+    let not_recording = format!(
+        "{PHONES} is not connected, so Takewise does not record: the film would play out loud into your microphone. Connect it, or pick another output, or System output, in the audio panel (A)."
+    );
+    for (key, said) in [
+        ("p", &missing),
+        ("space", &not_recording),
+        ("r", &not_recording),
+    ] {
         f.view.update(cx, |view, _| view.message = None);
         press(cx, f.window, &[key]);
-        assert_eq!(message(cx, &f.view), missing, "{key}");
+        assert_eq!(&message(cx, &f.view), said, "{key}");
         f.view.read_with(cx, |view, _| {
             assert!(!view.recorder.is_playing() && !view.recorder.is_recording());
         });
@@ -1038,6 +1062,26 @@ fn a_missing_output_refuses_playback_until_it_is_connected(cx: &mut TestAppConte
         format!("{PHONES} is connected: the film and your takes play there.")
     );
     assert_eq!(f.view.read_with(cx, |view, _| view.output_note()), None);
+    // Back again after another drop: said only in place of nothing, or of
+    // what was said about it, never over something else.
+    unplug(&f, PHONES);
+    f.media.set_now(106.0);
+    frame(cx, f.window);
+    f.view.update(cx, |view, _| {
+        view.message = Some("Chose d take 1.".to_owned());
+    });
+    f.media.0.borrow_mut().outputs.push(output(
+        PHONES,
+        Transport::Bluetooth,
+        OutputSource::Headphones,
+    ));
+    f.media.set_now(109.0);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().output_sets.last(),
+        Some(&Some(PHONES.to_owned()))
+    );
+    assert_eq!(message(cx, &f.view), "Chose d take 1.");
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     frame(cx, f.window);
@@ -1057,10 +1101,187 @@ fn a_missing_output_refuses_playback_until_it_is_connected(cx: &mut TestAppConte
     f.media.set_now(203.0);
     frame(cx, f.window);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        message(cx, &f.view),
+        format!("The playback stopped. {missing}")
+    );
+}
+
+/// The window on a project whose output is Test Phones, with a take of
+/// line d selected.
+fn on_test_phones(cx: &mut TestAppContext) -> Fixture {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Test Phones")).expect("output");
+        commit_outside(dir, "d");
+    });
+    press(cx, f.window, &["down", "down", "down"]); // d
+    assert_eq!(
+        f.media.0.borrow().film_output.as_deref(),
+        Some("Test Phones")
+    );
+    f
+}
+
+fn unplug(f: &Fixture, name: &str) {
+    f.media.0.borrow_mut().outputs.retain(|o| o.name != name);
+}
+
+/// Removes `[output] device`: the system output, by choice.
+fn clear_output_on_disk(cx: &mut TestAppContext, f: &Fixture) {
+    let path = f.dir.join("project.toml");
+    let text = fs::read_to_string(&path).expect("project.toml");
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with("device = \"Test Phones\""))
+        .collect();
+    fs::write(&path, kept.join("\n")).expect("project.toml");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(config(&f.dir).output.device, None);
+}
+
+#[gpui_kit::test]
+fn a_lost_output_keeps_the_players_until_the_route_changes(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    unplug(&f, "Test Phones");
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    f.view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.film_output.as_deref(),
+            Some("Test Phones"),
+            "still applied"
+        );
+        assert!(
+            view.output_note()
+                .is_some_and(|n| n.contains("not connected"))
+        );
+    });
+
+    // The system output by choice: the players move there, and P plays.
+    clear_output_on_disk(cx, &f);
+    assert_eq!(f.media.0.borrow().film_output, None);
+    assert_eq!(f.media.0.borrow().output_sets.last(), Some(&None));
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        f.media.0.borrow().take.as_ref().map(|t| t.output.clone()),
+        Some(None)
+    );
+    press(cx, f.window, &["p"]);
+
+    // The phones come back: nothing moves, the system output was chosen.
+    f.media.0.borrow_mut().outputs.push(output(
+        "Test Phones",
+        Transport::Usb,
+        OutputSource::Unknown,
+    ));
+    f.media.set_now(300.0);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().film_output, None);
+    assert_eq!(
+        f.view.read_with(cx, |view, _| view.film_output.clone()),
+        None
+    );
+}
+
+#[gpui_kit::test]
+fn the_route_changes_for_a_take_still_loading(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().take_loading = true;
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().take_plays.len(), 0, "still loading");
+    unplug(&f, "Test Phones");
+    clear_output_on_disk(cx, &f);
+    assert_eq!(
+        f.media.0.borrow().take.as_ref().map(|t| t.output.clone()),
+        Some(None),
+        "the loading take moved to the system output with the film"
+    );
+    f.media.0.borrow_mut().take_loading = false;
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().take_plays.len(), 1, "and starts there");
+}
+
+#[gpui_kit::test]
+fn another_missing_output_set_on_disk_stops_a_playback(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    tw::set_route(&f.dir, None, Some("Gone Phones")).expect("output");
+    f.view.update(cx, |view, _| view.reload());
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        message(cx, &f.view),
+        "The playback stopped. Gone Phones is not connected: connect it or pick another output (A)."
+    );
+}
+
+#[gpui_kit::test]
+fn every_playback_sets_its_output_again(cx: &mut TestAppContext) {
+    // A device that dropped out and came back between two checks may
+    // have left the players on the default: P sets it again.
+    let f = on_test_phones(cx);
+    let sets = |f: &Fixture| f.media.0.borrow().output_sets.len();
+    let before = sets(&f);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    assert_eq!(sets(&f), before + 1);
+    assert_eq!(
+        f.media.0.borrow().output_sets.last(),
+        Some(&Some("Test Phones".to_owned()))
+    );
+    press(cx, f.window, &["p", "p"]);
+    assert_eq!(sets(&f), before + 2);
+}
+
+#[gpui_kit::test]
+fn an_output_that_does_not_list_its_configuration_is_still_there(cx: &mut TestAppContext) {
+    // Bluetooth headphones switching profile can drop out of the list
+    // while the device is found by name.
+    let f = on_test_phones(cx);
+    unplug(&f, "Test Phones");
+    f.media
+        .0
+        .borrow_mut()
+        .hidden_outputs
+        .push("Test Phones".to_owned());
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    assert_eq!(f.view.read_with(cx, |view, _| view.output_note()), None);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn an_output_lost_during_a_take_keeps_the_take_and_says_so(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    unplug(&f, "Test Phones");
+    f.media.set_now(102.5);
+    frame(cx, f.window);
     assert!(
-        message(cx, &f.view).starts_with(&format!("{PHONES} was disconnected")),
-        "{}",
-        message(cx, &f.view)
+        f.view.read_with(cx, |view, _| view.recorder.is_recording()),
+        "it records on"
+    );
+    f.media.set_now(102.6);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2, "the take is kept");
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains(
+            "Test Phones was disconnected during the take, so the film may have played elsewhere"
+        ),
+        "{said}"
     );
 }
 
