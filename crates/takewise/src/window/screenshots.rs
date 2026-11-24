@@ -628,8 +628,11 @@ impl Media for DemoMedia {
     fn applied_output_uid(&self) -> Option<String> {
         None
     }
-    fn output_uid_connected(&self, _: &str) -> bool {
-        true
+    fn output_object(&self, _: &str) -> Option<u32> {
+        Some(1)
+    }
+    fn default_output_uid(&self) -> Option<(String, String)> {
+        Some((SPEAKERS.to_owned(), SPEAKERS.to_owned()))
     }
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
         let Some(device) = device else {

@@ -93,6 +93,14 @@ pub fn default_output() -> Result<DeviceInfo> {
     info(&device, false)
 }
 
+/// The system's default output device: its name and CoreAudio UID.
+pub fn default_output_uid() -> Result<(String, String)> {
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or(Error::NoDefaultDevice("output"))?;
+    Ok((name(&device)?, uid(&device)?))
+}
+
 fn info(device: &cpal::Device, input: bool) -> Result<DeviceInfo> {
     let name = name(device)?;
     let config = if input {

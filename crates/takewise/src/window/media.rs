@@ -73,10 +73,14 @@ pub trait Media {
     /// something changed since the last.
     fn device_generation(&self) -> u64;
     /// The UID of the device the players were last set to (`None`: the
-    /// system's default output), and whether a device with a given UID is
-    /// connected: how a take watches the very output it started on.
+    /// system's default output).
     fn applied_output_uid(&self) -> Option<String>;
-    fn output_uid_connected(&self, uid: &str) -> bool;
+    /// The CoreAudio object of the device with this UID while it is
+    /// connected: a device that went away and came back has a new one, so
+    /// comparing objects tells a reconnect from no change.
+    fn output_object(&self, uid: &str) -> Option<u32>;
+    /// The system's default output: its name and UID.
+    fn default_output_uid(&self) -> Option<(String, String)>;
     /// The name of the system's default output device.
     fn default_output(&self) -> Option<String>;
     /// Plays the film and the takes through the output device with this
@@ -261,8 +265,12 @@ impl Media for RealMedia {
         self.output_uid.clone()
     }
 
-    fn output_uid_connected(&self, uid: &str) -> bool {
-        takewise_media::output_uid_present(uid)
+    fn output_object(&self, uid: &str) -> Option<u32> {
+        takewise_media::output_object(uid)
+    }
+
+    fn default_output_uid(&self) -> Option<(String, String)> {
+        takewise_media::default_output_uid().ok()
     }
 
     fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {

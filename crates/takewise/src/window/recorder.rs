@@ -205,6 +205,9 @@ struct Unsaved {
     complete: bool,
     /// Its rescue copy, once one is written (see [`Recorder::rescue`]).
     rescued: Option<PathBuf>,
+    /// What to say of the take with its result (its dropouts, an output
+    /// lost during it), also when it is saved only on a later try.
+    notes: Option<String>,
 }
 
 /// Whether a stopped take or passage is whole on disk, where a repair
@@ -321,8 +324,9 @@ struct Take {
     film_ended_host_s: Option<f64>,
     /// The passage, when the take records one: several lines in one go.
     passage: Option<PassageTake>,
-    /// The output the film played through, when it went away during the
-    /// take: said with the take's result.
+    /// What happened to the output the film played through during the
+    /// take (it went away, or the system output changed): said with the
+    /// take's result.
     route_lost: Option<String>,
 }
 
@@ -967,10 +971,9 @@ impl Recorder {
             };
         }
         let mut placement = place(&take, &written, estimated, unplayed_s);
-        placement.notes = join(
-            placement.notes,
-            take.route_lost.take().map(|name| lost_note(&name)),
-        );
+        // Only a film that played can have played elsewhere.
+        let lost = take.route_lost.take().filter(|_| take.clock.started());
+        placement.notes = join(placement.notes, lost);
         if let Some(passage) = take.passage.take() {
             placement.notes = join(why, placement.notes);
             return self.publish_passage(dir, passage, written, placement);
@@ -1019,6 +1022,7 @@ impl Recorder {
             lock: written.lock,
             complete: written.complete,
             rescued: None,
+            notes: placement.notes.clone(),
         };
         let mut update = self.save(dir, unsaved);
         update.message = join(update.message, placement.notes);
@@ -1217,10 +1221,14 @@ impl Recorder {
                         "Saved the earlier take of {} as take {}.",
                         committed.line, committed.take
                     );
-                    update.message = join(saved.note, join(Some(note), spare));
+                    let note = join(Some(note), unsaved.notes.take());
+                    update.message = join(saved.note, join(note, spare));
                     update.committed = Some(committed);
                 }
-                Ok(saved) => update.message = join(update.message.take(), join(saved.note, spare)),
+                Ok(saved) => {
+                    let note = join(saved.note, join(unsaved.notes.take(), spare));
+                    update.message = join(update.message.take(), note);
+                }
                 Err(err) => {
                     self.save_error = Some(err);
                     left.push(unsaved);
@@ -1374,11 +1382,17 @@ impl Recorder {
         matches!(&self.phase, Phase::Recording(take) if !take.clock.started())
     }
 
-    /// The output the film plays through went away during the take; the
-    /// take goes on, and its result says so.
-    pub fn note_route_lost(&mut self, output: &str) {
-        if let Phase::Recording(take) = &mut self.phase {
-            take.route_lost.get_or_insert_with(|| output.to_owned());
+    /// The output the film plays through went away or changed during the
+    /// take: the take goes on, and its result says `note`. Only once its
+    /// film started, since before that nothing played; returns whether the
+    /// note was taken.
+    pub fn note_route(&mut self, note: String) -> bool {
+        match &mut self.phase {
+            Phase::Recording(take) if take.clock.started() => {
+                take.route_lost.get_or_insert(note);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1636,13 +1650,6 @@ fn start_both(media: &mut dyn Media, playback: &Playback, now: f64) -> Result<Ti
         media.take_play_at(begin - take_host, begin)?;
     }
     Ok(tb)
-}
-
-/// What a take whose output went away while it recorded says.
-fn lost_note(output: &str) -> String {
-    format!(
-        "{output} was disconnected during the take, so the film may have played elsewhere, out loud: listen before you choose it."
-    )
 }
 
 /// Where a stopped take lies on the film.

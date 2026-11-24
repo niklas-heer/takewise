@@ -32,8 +32,8 @@ mod watch;
 pub use about::{About, show_about_panel};
 pub use capture::{CAPTURE_RATE, Capture, CaptureBuffer};
 pub use devices::{
-    DeviceInfo, OutputSource, Transport, default_input, default_output, input_devices,
-    output_devices, output_uid,
+    DeviceInfo, OutputSource, Transport, default_input, default_output, default_output_uid,
+    input_devices, output_devices, output_uid,
 };
 pub use error::{Error, Result};
 pub use latency::{buffer_frames, input_latency_s, set_nominal_sample_rate};
@@ -42,7 +42,7 @@ pub use monitor::Monitor;
 pub use permission::microphone_permission;
 pub use player::{FilmPlayer, TakePlayer, host_time_now_s, pump_run_loop};
 pub use takewise_core::Timebase;
-pub use watch::{device_generation, output_uid_present, watching_devices};
+pub use watch::{device_generation, output_object, watching_devices};
 
 /// A decoded video frame (NV12 full range, IOSurface-backed) for GPUI's
 /// `surface()`, which takes exactly this type.

@@ -32,9 +32,11 @@ pub fn watching_devices() -> bool {
     *LISTENING.get_or_init(listen)
 }
 
-/// Whether the device with this CoreAudio UID is connected now.
-pub fn output_uid_present(uid: &str) -> bool {
-    device_id(uid).is_some()
+/// The CoreAudio object of the device with this UID while it is
+/// connected. A device that went away and came back keeps its UID but gets
+/// a new object, so comparing objects tells a reconnect from no change.
+pub fn output_object(uid: &str) -> Option<u32> {
+    device_id(uid)
 }
 
 fn listen() -> bool {

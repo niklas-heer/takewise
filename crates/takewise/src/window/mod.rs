@@ -622,12 +622,13 @@ pub struct RecordingWindow {
     /// players could not be set to a connected one.
     output_missing: Option<String>,
     output_error: Option<String>,
-    /// Whether the route must be set again before it is used (the devices
-    /// changed, or it was seen missing or failed since it was last set),
-    /// and the device generation as `sync_output` and the watch last saw it.
+    /// Whether the route must be set again before it is used (its device
+    /// dropped, was seen missing, or setting it failed), and the device
+    /// generation as the watch last saw it.
     route_due: bool,
-    devices_seen: u64,
     devices_watched: u64,
+    /// The device the players are set to: its UID and CoreAudio object.
+    applied_device: Option<(String, u32)>,
     /// When a playback or a take last polled its output, and the route a
     /// take started on, which it watches.
     output_checked_at: f64,
@@ -725,8 +726,8 @@ impl RecordingWindow {
             output_error: None,
             output_checked_at: 0.0,
             route_due: false,
-            devices_seen: 0,
             devices_watched: 0,
+            applied_device: None,
             take_route: None,
             ticked_at: None,
             calibrating: None,
@@ -1259,6 +1260,9 @@ impl RecordingWindow {
     }
 
     fn finish_take(&mut self) {
+        // Whatever stops it (Space, R, closing), its route is checked
+        // before its result is made.
+        self.check_take_route(true);
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
         self.pause_checks_while_recording();
