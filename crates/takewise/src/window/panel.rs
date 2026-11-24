@@ -79,6 +79,15 @@ pub fn calibration_note(config: &tw::ProjectConfig, route: &Route) -> Option<Str
     stale
 }
 
+/// What a route change does to `[output] device`.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum OutputChoice<'a> {
+    Keep,
+    /// Clear it: the system's default output.
+    System,
+    Device(&'a str),
+}
+
 /// Which picker shows its options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Picker {
@@ -148,13 +157,19 @@ impl RecordingWindow {
     fn change_route(
         &mut self,
         input: Option<(&str, u16)>,
-        output: Option<&str>,
+        output: OutputChoice<'_>,
     ) -> Option<&'static str> {
         if !self.pickers_enabled() {
             self.message = Some(format!("{BETWEEN_TAKES} Stop the take first."));
             return None;
         }
-        if let Err(err) = tw::set_route(&self.dir, input, output) {
+        let saved = match output {
+            OutputChoice::Keep => tw::set_route(&self.dir, input, None),
+            OutputChoice::Device(name) => tw::set_route(&self.dir, input, Some(name)),
+            OutputChoice::System => tw::set_route(&self.dir, input, None)
+                .and_then(|()| tw::clear_output_device(&self.dir)),
+        };
+        if let Err(err) = saved {
             self.message = Some(format!("Could not save the devices: {err}"));
             return None;
         }
@@ -184,7 +199,7 @@ impl RecordingWindow {
         } else {
             1
         };
-        if let Some(note) = self.change_route(Some((name, channel)), None) {
+        if let Some(note) = self.change_route(Some((name, channel)), OutputChoice::Keep) {
             self.message = Some(format!("Recording from {name}, channel {channel}.{note}"));
         }
     }
@@ -194,18 +209,35 @@ impl RecordingWindow {
         let Some(device) = self.project.config.input.device.clone() else {
             return;
         };
-        if let Some(note) = self.change_route(Some((&device, channel)), None) {
+        if let Some(note) = self.change_route(Some((&device, channel)), OutputChoice::Keep) {
             self.message = Some(format!("Recording from {device}, channel {channel}.{note}"));
         }
     }
 
     /// Plays the film and the takes (and later the monitor) through `name`.
     pub(super) fn choose_output(&mut self, name: &str) {
+        self.choose_route_output(OutputChoice::Device(name));
+    }
+
+    /// The panel's "System output": clears `[output] device`, so the film
+    /// and the takes play through the Mac's default output, by choice.
+    pub(super) fn choose_system_output(&mut self) {
+        self.choose_route_output(OutputChoice::System);
+    }
+
+    fn choose_route_output(&mut self, choice: OutputChoice<'_>) {
         let playing = self.recorder.is_playing();
+        let name = match choice {
+            OutputChoice::Device(name) => name.to_owned(),
+            _ => self.media.default_output().map_or_else(
+                || "the system output".to_owned(),
+                |name| format!("the system output ({name})"),
+            ),
+        };
         // The route change reloads the project, which moves the film and
         // the takes to the new output when it can, and stops a playback
         // when it cannot.
-        let Some(note) = self.change_route(None, Some(name)) else {
+        let Some(note) = self.change_route(None, choice) else {
             return;
         };
         let said = match self.sync_output(false) {
@@ -444,29 +476,51 @@ impl RecordingWindow {
             .when(!enabled, |el| {
                 el.tooltip(|_, cx| cx.new(|_| Tip(BETWEEN_TAKES.into())).into())
             });
-        let list = div()
-            .flex()
-            .flex_col()
-            .children(options.into_iter().enumerate().map(|(i, name)| {
-                let chosen = selected == Some(name.as_str());
-                let pick = name.clone();
-                div()
-                    .id((id, i + 1))
-                    .px(px(10.))
-                    .py(px(5.))
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .when(chosen, |el| el.text_color(rgb(colors::ACCENT)))
-                    .hover(|style| style.bg(rgb(colors::SELECTED)))
-                    .child(name)
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        match which {
-                            Picker::Input => view.choose_input(&pick),
-                            Picker::Output => view.choose_output(&pick),
-                        }
-                        cx.notify();
-                    }))
-            }));
+        // The output can also be none: the Mac's default output.
+        let system = (which == Picker::Output).then(|| {
+            let label = self.media.default_output().map_or_else(
+                || "System output".to_owned(),
+                |name| format!("System output ({name})"),
+            );
+            div()
+                .id(("output-system", 0_usize))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(selected.is_none(), |el| el.text_color(rgb(colors::ACCENT)))
+                .hover(|style| style.bg(rgb(colors::SELECTED)))
+                .child(label)
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.choose_system_output();
+                    cx.notify();
+                }))
+        });
+        let list =
+            div()
+                .flex()
+                .flex_col()
+                .children(system)
+                .children(options.into_iter().enumerate().map(|(i, name)| {
+                    let chosen = selected == Some(name.as_str());
+                    let pick = name.clone();
+                    div()
+                        .id((id, i + 1))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .when(chosen, |el| el.text_color(rgb(colors::ACCENT)))
+                        .hover(|style| style.bg(rgb(colors::SELECTED)))
+                        .child(name)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            match which {
+                                Picker::Input => view.choose_input(&pick),
+                                Picker::Output => view.choose_output(&pick),
+                            }
+                            cx.notify();
+                        }))
+                }));
         div()
             .flex()
             .flex_col()

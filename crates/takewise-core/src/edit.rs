@@ -325,6 +325,18 @@ pub fn set_route(dir: &Path, input: Option<(&str, u16)>, output: Option<&str>) -
     })
 }
 
+/// Removes `[output] device` under the lock, keeping the file's comments
+/// and layout: the film and the takes play through the system's default
+/// output, by choice.
+pub fn clear_output_device(dir: &Path) -> Result<()> {
+    edit_project(dir, |doc| {
+        if let Some(table) = doc.get_mut("output").and_then(Item::as_table_mut) {
+            table.remove("device");
+        }
+        Ok(())
+    })
+}
+
 /// The levels [`set_volumes`] writes; `None` leaves that value as it is.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Volumes {
@@ -703,6 +715,18 @@ text = "Third."
         set_calibration(&dir, -30, &info).unwrap();
         let config = crate::project::read_config(&dir).unwrap();
         assert_eq!(config.calibration, Some(info));
+    }
+
+    #[test]
+    fn clear_output_device_leaves_the_system_output() {
+        let (_tmp, dir) = project();
+        clear_output_device(&dir).unwrap();
+        set_route(&dir, None, Some("Phones")).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.output.device.as_deref(), Some("Phones"));
+        clear_output_device(&dir).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.output.device, None);
     }
 
     #[test]

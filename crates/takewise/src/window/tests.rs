@@ -1209,6 +1209,25 @@ fn the_route_changes_for_a_take_still_loading(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn system_output_in_the_panel_is_the_way_out_of_a_missing_output(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("or System output, in the audio panel (A)"));
+    f.view.update(cx, |view, _| view.choose_system_output());
+    assert_eq!(config(&f.dir).output.device, None, "cleared by choice");
+    assert_eq!(
+        message(cx, &f.view),
+        "The film and your takes play through the system output (MacBook Speakers)."
+    );
+    assert_eq!(f.media.0.borrow().film_output, None);
+    assert_eq!(f.view.read_with(cx, |view, _| view.output_note()), None);
+    record_take(cx, &f);
+    assert_eq!(recorded(&f.dir).len(), 2, "the take is recorded now");
+}
+
+#[gpui_kit::test]
 fn another_missing_output_set_on_disk_stops_a_playback(cx: &mut TestAppContext) {
     let f = on_test_phones(cx);
     f.media.set_now(200.0);

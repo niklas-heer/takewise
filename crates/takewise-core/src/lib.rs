@@ -35,8 +35,9 @@ pub mod words;
 
 pub use check::Transcript;
 pub use edit::{
-    Field, ScriptVersion, Volumes, script_version, set_calibration, set_export, set_film_info,
-    set_latency_offset, set_line_field, set_route, set_setup, set_volumes,
+    Field, ScriptVersion, Volumes, clear_output_device, script_version, set_calibration,
+    set_export, set_film_info, set_latency_offset, set_line_field, set_route, set_setup,
+    set_volumes,
 };
 pub use error::{Error, Result};
 pub use export::{

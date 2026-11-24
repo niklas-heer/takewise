@@ -150,7 +150,7 @@ The first finding is the reason shown under the take. These are automated checks
 
 <p align="center"><img src="docs/images/audio-panel.png" alt="The audio panel: the input &quot;USB Audio Interface&quot;, a live meter for each of its two channels with channel 1 moving, and the output; below it the input meter with a red &quot;near clipping · K clears&quot; light." width="374"><br><sub>The audio panel, and a peak near clipping.</sub></p>
 
-Press A for the audio panel. Pick the input and the channel your microphone is on: every channel has its own meter, so the one that moves is yours. Then pick the output your headphones are on: the film and the takes you play back both play there. The input meter shows a target band and a near-clipping light that stays red until you clear it with K or start the next take.
+Press A for the audio panel. Pick the input and the channel your microphone is on: every channel has its own meter, so the one that moves is yours. Then pick the output your headphones are on: the film and the takes you play back both play there. While it is not connected, Takewise neither plays nor records, rather than let the film play out loud into your microphone; **System output** at the top of the list uses the Mac's default output instead, on purpose. The input meter shows a target band and a near-clipping light that stays red until you clear it with K or start the next take.
 
 Takewise records at 48 kHz from an input running at that rate. For an input set to another rate, the panel offers **Switch to 48 kHz**.
 
