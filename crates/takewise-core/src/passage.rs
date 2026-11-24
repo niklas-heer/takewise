@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::check::{Boundary, PieceContext};
 use crate::error::{Error, Result, io};
-use crate::fsutil::{lock, write_atomic};
+use crate::fsutil::{LockedFile, lock, write_atomic};
 use crate::ledger::{self, Chosen, Event, EventKind, Ledger, PassagePiece, Snapshot};
 use crate::project::{Project, TAKES_DIR};
 use crate::script::{Problem, is_valid_id};
@@ -966,9 +966,9 @@ pub(crate) fn repair(dir: &Path, report: &mut RepairReport) -> Result<()> {
             continue;
         };
         // A live recording holds the lock; never touch its files.
-        if file.try_lock().is_err() {
+        let Ok(file) = LockedFile::try_lock(file) else {
             continue;
-        }
+        };
         if fix_wav_lengths(&file)
             .and_then(|()| file.sync_all())
             .is_err()

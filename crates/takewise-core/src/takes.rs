@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, io};
-use crate::fsutil::lock;
+use crate::fsutil::{LockedFile, lock};
 use crate::ledger::{
     self, Chosen, Event, EventKind, Judged, Ledger, PassagePiece, Recorded, Snapshot, Verdict,
 };
@@ -453,7 +453,7 @@ fn take_spec(sample_rate: u32) -> hound::WavSpec {
 /// leaves the file as a crash would.
 #[derive(Debug)]
 pub struct PartialWav {
-    file: fs::File,
+    file: LockedFile,
     path: PathBuf,
     /// Offset of the data chunk's length field; the data follows it.
     data_len_at: u64,
@@ -464,7 +464,9 @@ pub struct PartialWav {
 /// Keeps a finished take's audio locked until it is committed.
 #[derive(Debug)]
 pub struct WavLock {
-    _file: fs::File,
+    /// Held for its lock alone.
+    #[allow(dead_code)]
+    file: LockedFile,
 }
 
 impl WavLock {
@@ -479,11 +481,8 @@ impl WavLock {
             .truncate(false)
             .open(path)
             .map_err(io(path))?;
-        file.try_lock().map_err(|err| match err {
-            fs::TryLockError::Error(err) => io(path)(err),
-            fs::TryLockError::WouldBlock => io(path)(std::io::ErrorKind::WouldBlock.into()),
-        })?;
-        Ok(Self { _file: file })
+        let file = LockedFile::try_lock(file).map_err(io(path))?;
+        Ok(Self { file })
     }
 }
 
@@ -498,10 +497,7 @@ impl PartialWav {
             .create_new(true)
             .open(path)
             .map_err(io(path))?;
-        file.try_lock().map_err(|err| match err {
-            fs::TryLockError::Error(err) => io(path)(err),
-            fs::TryLockError::WouldBlock => io(path)(std::io::ErrorKind::WouldBlock.into()),
-        })?;
+        let file = LockedFile::try_lock(file).map_err(io(path))?;
         // hound's own header, so streamed takes match finished ones.
         let mut header = std::io::Cursor::new(Vec::new());
         hound::WavWriter::new(&mut header, take_spec(sample_rate))
@@ -509,15 +505,14 @@ impl PartialWav {
             .map_err(wav_error(path))?;
         let mut header = header.into_inner();
         crate::wav::centre_mono(&mut header);
-        let mut this = Self {
+        (&*file).write_all(&header).map_err(io(path))?;
+        Ok(Self {
             data_len_at: header.len() as u64 - 4,
             file,
             path: path.to_path_buf(),
             samples: 0,
             flushed: 0,
-        };
-        this.file.write_all(&header).map_err(io(path))?;
-        Ok(this)
+        })
     }
 
     /// Appends samples, clamped to 24 bits. Not yet durable: see `flush`.
@@ -530,7 +525,7 @@ impl PartialWav {
                 [a, b, c]
             })
             .collect();
-        self.file.write_all(&bytes).map_err(io(&self.path))?;
+        (&*self.file).write_all(&bytes).map_err(io(&self.path))?;
         self.samples += samples.len() as u64;
         Ok(())
     }
@@ -558,7 +553,7 @@ impl PartialWav {
     /// Stops writing (after a failed write) but keeps the file locked, so
     /// nothing adopts it before the take is written again from memory.
     pub fn into_lock(self) -> WavLock {
-        WavLock { _file: self.file }
+        WavLock { file: self.file }
     }
 
     /// Flushes and fsyncs the file; it stays locked until the returned
@@ -841,7 +836,7 @@ pub(crate) fn scan(dir: &Path) -> Result<TakeFiles> {
 /// How a take's audio file is held.
 pub(crate) enum Hold {
     /// Locked here (released when dropped).
-    Free(#[allow(dead_code)] fs::File),
+    Free(#[allow(dead_code)] LockedFile),
     /// Locked by its recording window, which finishes the take itself.
     Recorder,
     /// Not openable for locking; treated as before locks.
@@ -854,10 +849,10 @@ pub(crate) fn hold(path: &Path) -> Hold {
     let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else {
         return Hold::Unopened;
     };
-    match file.try_lock() {
-        Ok(()) => Hold::Free(file),
-        Err(fs::TryLockError::WouldBlock) => Hold::Recorder,
-        Err(fs::TryLockError::Error(_)) => Hold::Unopened,
+    match LockedFile::try_lock(file) {
+        Ok(file) => Hold::Free(file),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Hold::Recorder,
+        Err(_) => Hold::Unopened,
     }
 }
 
@@ -884,10 +879,8 @@ fn repair_takes(dir: &Path) -> Result<RepairReport> {
     let ledger = ledger::read(dir)?;
     let mut adopted = BTreeSet::new();
     let mut metadata_without_audio = Vec::new();
-    // Audio renamed below stays locked until it is adopted: releasing and
-    // retaking the lock could find it still held by a process another
-    // thread is spawning (a child briefly shares this process's open
-    // files), and skip the take as if a recording held it.
+    // Audio renamed below stays locked until it is adopted, so nothing
+    // else can take it in between.
     let mut renamed: BTreeMap<PathBuf, Hold> = BTreeMap::new();
     for meta in scan(dir)?.unlogged_metadata(&ledger) {
         match interrupted_commit(dir, meta) {
@@ -979,9 +972,9 @@ fn adopt_partial(dir: &Path, meta: &Path) -> Result<Option<TakeRef>> {
         return Ok(None);
     };
     // A live recording holds the lock; never touch its files.
-    if file.try_lock().is_err() {
+    let Ok(file) = LockedFile::try_lock(file) else {
         return Ok(None);
-    }
+    };
     if fix_wav_lengths(&file)
         .and_then(|()| file.sync_all())
         .is_err()
@@ -1040,9 +1033,14 @@ mod tests {
         write_take_wav(&partial.wav, &[1000; 480], 48_000).unwrap();
         assert!(WavLock::acquire(&partial.wav).is_err(), "held");
         assert_eq!(repair(dir).unwrap().adopted, Vec::new());
+        // A process spawned meanwhile (ffmpeg for a check, on another
+        // thread) shares the locked file until it has started; the lock
+        // must not last that long.
+        let shared_with_a_child = lock.file.try_clone().unwrap();
         drop(lock);
         let adopted = repair(dir).unwrap().adopted;
         assert_eq!(adopted.len(), 1, "a crash leaves it adoptable");
+        drop(shared_with_a_child);
     }
 
     #[test]

@@ -9,10 +9,53 @@ use crate::error::{Result, io};
 
 pub const LOCK_FILE: &str = ".lock";
 
+/// A file whose exclusive advisory lock (`flock`) this holds, and releases
+/// when dropped.
+///
+/// The lock is released explicitly, not by closing the file: a process
+/// being spawned on another thread briefly shares this process's open
+/// files, and a lock that only ended with its last open copy would outlive
+/// its guard until that child has started. It still ends with the process,
+/// so a crash leaves nothing locked.
+#[derive(Debug)]
+pub(crate) struct LockedFile(File);
+
+impl LockedFile {
+    /// Locks `file` without waiting; `WouldBlock` when another holder has
+    /// it.
+    pub(crate) fn try_lock(file: File) -> std::io::Result<Self> {
+        match file.try_lock() {
+            Ok(()) => Ok(Self(file)),
+            Err(fs::TryLockError::WouldBlock) => Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(fs::TryLockError::Error(err)) => Err(err),
+        }
+    }
+
+    /// Locks `file`, waiting for other holders.
+    pub(crate) fn lock(file: File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl std::ops::Deref for LockedFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Holds the project's exclusive advisory lock until dropped.
 #[derive(Debug)]
 pub struct ProjectLock {
-    _file: File,
+    _file: LockedFile,
 }
 
 /// Takes the exclusive advisory lock on `<dir>/.lock`, waiting for other
@@ -32,7 +75,7 @@ pub fn lock(dir: &Path) -> Result<ProjectLock> {
         .truncate(false)
         .open(&path)
         .map_err(io(&path))?;
-    file.lock().map_err(io(&path))?;
+    let file = LockedFile::lock(file).map_err(io(&path))?;
     Ok(ProjectLock { _file: file })
 }
 
@@ -125,6 +168,29 @@ mod tests {
             lock(&missing).unwrap_err(),
             crate::error::Error::NotAProject(_)
         ));
+    }
+
+    #[test]
+    fn a_dropped_lock_is_free_while_a_copy_of_its_file_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audio");
+        std::fs::write(&path, b"").unwrap();
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let file = open();
+        // What a process being spawned holds until it has started.
+        let copy = file.try_clone().unwrap();
+        let held = LockedFile::try_lock(file).unwrap();
+        let busy = LockedFile::try_lock(open()).unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+        drop(held);
+        assert!(LockedFile::try_lock(open()).is_ok(), "free at once");
+        drop(copy);
     }
 
     #[test]

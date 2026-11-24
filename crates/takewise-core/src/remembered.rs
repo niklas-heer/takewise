@@ -156,7 +156,7 @@ fn update<T>(path: &Path, change: impl FnOnce(&mut Remembered, &Path) -> Result<
         .truncate(false)
         .open(&lock_path)
         .map_err(io(&lock_path))?;
-    lock.lock().map_err(io(&lock_path))?;
+    let _lock = crate::fsutil::LockedFile::lock(lock).map_err(io(&lock_path))?;
     let before = read(path)?;
     let mut remembered = before.clone();
     let out = change(&mut remembered, dir)?;
