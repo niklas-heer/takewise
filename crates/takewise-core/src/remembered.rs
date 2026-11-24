@@ -238,7 +238,9 @@ pub fn sync_latency(
 }
 
 /// What the window and `status` say about a latency offset copied from an
-/// earlier measurement, while it is the one in use on `route`.
+/// earlier measurement, while it is the one in use on `route`: only on a
+/// route known to be exactly the one it was measured on (see
+/// [`calibration_stale`]).
 pub fn latency_note(config: &ProjectConfig, route: &Route) -> Option<String> {
     let cal = config
         .calibration
@@ -473,6 +475,44 @@ mod tests {
             sync_latency(&home.remembered, &dir, &config, &route(512)).unwrap(),
             LatencySync::Unchanged
         );
+    }
+
+    #[test]
+    fn a_copied_offset_is_not_active_on_a_route_that_became_unknown() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        remember_latency(&home.remembered, -29, &measured("2026-11-23")).unwrap();
+        let dir = project(&tmp, "new.takewise");
+        let config = read_config(&dir).unwrap();
+        sync_latency(&home.remembered, &dir, &config, &route(512)).unwrap();
+        let config = read_config(&dir).unwrap();
+        let offset = |route: &Route| crate::route::effective_latency_offset(&config, route);
+        assert_eq!(offset(&route(512)), (-29, false));
+
+        // The interface is unplugged, or the output cannot be read: the
+        // copied offset is neither used nor said to be in use.
+        let no_buffer = Route {
+            buffer_frames: None,
+            ..route(512)
+        };
+        let no_output = Route {
+            output: None,
+            ..route(512)
+        };
+        for unresolved in [&no_buffer, &no_output] {
+            assert_eq!(offset(unresolved), (0, true), "{unresolved:?}");
+            assert_eq!(latency_note(&config, unresolved), None, "{unresolved:?}");
+            assert!(calibration_stale(&config, unresolved).is_some());
+            // Nothing is remembered for a route that is not whole.
+            assert_eq!(
+                sync_latency(&home.remembered, &dir, &config, unresolved).unwrap(),
+                LatencySync::Unchanged
+            );
+        }
+        assert_eq!(read_config(&dir).unwrap(), config, "kept for later");
+        // Known again: in use again.
+        assert_eq!(offset(&route(512)), (-29, false));
+        assert!(latency_note(&config, &route(512)).is_some());
     }
 
     #[test]

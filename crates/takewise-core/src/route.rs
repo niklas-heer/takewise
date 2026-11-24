@@ -50,7 +50,13 @@ impl Route {
 /// the input, the output or the buffer size differ from the ones
 /// `[calibration]` recorded, the record lacks the buffer size, or the
 /// project has an offset measured before calibrations were recorded.
-/// Unknown parts of `current` are not compared.
+///
+/// For a measurement made in this project, an unknown output or buffer
+/// size of `current` is not compared. An offset copied from an earlier
+/// measurement (`from = "remembered"`) was never checked here, so it fits
+/// only a route known to be exactly the one it was measured on: with the
+/// output or the buffer size unknown it does not, until they are known
+/// again.
 pub fn calibration_stale(config: &ProjectConfig, current: &Route) -> Option<String> {
     let again = "run `takewise calibrate --write` again";
     let Some(cal) = &config.calibration else {
@@ -84,10 +90,27 @@ pub fn calibration_stale(config: &ProjectConfig, current: &Route) -> Option<Stri
         }
         _ => {}
     }
-    (!changed.is_empty()).then(|| {
-        format!(
+    if !changed.is_empty() {
+        return Some(format!(
             "the latency calibration is stale: {}; {again}",
             changed.join(", ")
+        ));
+    }
+    if !cal.is_remembered() {
+        return None;
+    }
+    let mut unknown = Vec::new();
+    if current.output.is_none() {
+        unknown.push("the output in use");
+    }
+    if current.buffer_frames.is_none() {
+        unknown.push("the input's buffer size");
+    }
+    (!unknown.is_empty()).then(|| {
+        format!(
+            "the latency copied from an earlier measurement ({}) is not applied: {} cannot be read, so these may not be the devices it was measured on; it applies again once they can, or {again}",
+            cal.date,
+            unknown.join(" and ")
         )
     })
 }
@@ -97,7 +120,9 @@ pub fn calibration_stale(config: &ProjectConfig, current: &Route) -> Option<Stri
 /// [`calibration_stale`] finds the calibration still fits the route (the
 /// same input, output and buffer), else `(0, true)`. An offset measured on
 /// other devices would shift takes by the wrong amount, so none applies
-/// until `takewise calibrate --write` runs on this route.
+/// until `takewise calibrate --write` runs on this route; an offset copied
+/// from an earlier measurement applies only while the whole route is
+/// known.
 pub fn effective_latency_offset(config: &ProjectConfig, current: &Route) -> (i32, bool) {
     match calibration_stale(config, current) {
         Some(_) => (0, true),
@@ -233,6 +258,39 @@ mod tests {
             calibration_stale(&config, &route("Duo Main", None, None)),
             None
         );
+    }
+
+    #[test]
+    fn a_copied_offset_needs_the_whole_route_known() {
+        let mut config = config();
+        config.calibration.as_mut().unwrap().from = Some(crate::project::REMEMBERED.to_owned());
+        let known = route("Duo Main", Some("Duo Main"), Some(512));
+        assert_eq!(calibration_stale(&config, &known), None);
+        assert_eq!(effective_latency_offset(&config, &known), (7, false));
+        // The output or the buffer cannot be read: not applied.
+        for (unknown, what) in [
+            (
+                route("Duo Main", None, Some(512)),
+                "the output in use cannot",
+            ),
+            (
+                route("Duo Main", Some("Duo Main"), None),
+                "the input's buffer size cannot",
+            ),
+            (
+                route("Duo Main", None, None),
+                "the output in use and the input's buffer size cannot",
+            ),
+        ] {
+            let stale = calibration_stale(&config, &unknown).expect("not verified");
+            assert!(stale.contains(what), "{stale}");
+            assert!(stale.contains("(2026-11-23) is not applied"), "{stale}");
+            assert_eq!(effective_latency_offset(&config, &unknown), (0, true));
+        }
+        // A difference is still named as one.
+        let other = calibration_stale(&config, &route("Duo Main", Some("Speakers"), None))
+            .expect("stale on another output");
+        assert!(other.contains("output \"Speakers\""), "{other}");
     }
 
     #[test]
