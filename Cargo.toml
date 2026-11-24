@@ -17,12 +17,15 @@ takewise-media = { path = "crates/takewise-media" }
 # The macOS bridges; one version for takewise-media and the window, matching
 # the objc2 crates gpui-kit uses (CVPixelBuffer must be the same type).
 objc2 = "0.6.5"
+# The About panel (NSApplication), with the features gpui-kit's GPUI already
+# builds AppKit with, plus those of the panel's credits.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSAttributedString", "NSFont", "NSParagraphStyle", "NSText", "objc2-core-foundation"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "AVAsset", "AVTime", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2-core-audio-types"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime", "CMSync", "CMBase"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSDictionary", "NSValue", "NSDate", "NSRunLoop", "NSObject"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSDictionary", "NSValue", "NSDate", "NSRunLoop", "NSObject", "NSAttributedString", "NSRange"] }
 
 [workspace.lints.rust]
 # Denied everywhere but takewise-media, the macOS bridge crate

@@ -31,8 +31,10 @@ pub enum Error {
     },
     #[error("not available yet: monitoring needs a test on your setup")]
     MonitorUnavailable,
-    #[error("players run on the main thread only")]
+    #[error("players and panels run on the main thread only")]
     NotMainThread,
+    #[error("not a link: {0}")]
+    NotALink(String),
     #[error("the player has not loaded its media yet")]
     NotReady,
 }

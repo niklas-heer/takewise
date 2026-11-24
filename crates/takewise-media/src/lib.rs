@@ -1,6 +1,7 @@
 //! Takewise's macOS media bridges: the film and take players (AVPlayer),
 //! video frames for GPUI's `surface()`, microphone capture (cpal) and the
-//! CoreAudio latencies that place captured samples on the film.
+//! CoreAudio latencies that place captured samples on the film. Also the
+//! one AppKit call the window needs beyond GPUI: the standard About panel.
 //!
 //! Threading: [`FilmPlayer`] and [`TakePlayer`] wrap AVPlayer, which
 //! objc2 marks main-thread-only; create and call them on the main thread.
@@ -16,6 +17,7 @@
 #![allow(unsafe_code)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+mod about;
 mod capture;
 mod devices;
 mod error;
@@ -26,6 +28,7 @@ mod permission;
 mod player;
 mod video;
 
+pub use about::{About, show_about_panel};
 pub use capture::{CAPTURE_RATE, Capture, CaptureBuffer};
 pub use devices::{
     DeviceInfo, OutputSource, Transport, default_input, default_output, input_devices,

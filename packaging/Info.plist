@@ -24,6 +24,8 @@
 	<string>BUILD</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.video</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Niklas Heer</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>

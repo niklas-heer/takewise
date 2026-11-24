@@ -1,6 +1,6 @@
 # Takewise reference
 
-The details behind the [README](../README.md): every command's options and refusals, the start window, recording passages, the audio panel, the setup check, the export and building from source. The design and its reasons are in [design.md](design.md); an agent's whole loop, with the exact JSON, is in [agents.md](agents.md).
+The details behind the [README](../README.md): every command's options and refusals, the start window and the menu bar, recording passages, the audio panel, the setup check, the export and building from source. The design and its reasons are in [design.md](design.md); an agent's whole loop, with the exact JSON, is in [agents.md](agents.md).
 
 ## Command line
 
@@ -54,6 +54,14 @@ The word checks hear the language in `[check] language` (`en` by default), passe
 ## The start window
 
 Opening `Takewise.app` from the Dock or Finder shows the start window. **Open project…** (⌘O) opens a `.takewise` folder; any other folder asks for the finished film and starts a project there, in a new `<film>.takewise` folder inside it, unless the folder is empty or named `….takewise`. If that `<film>.takewise` project exists already for this film, it opens; if it belongs to another film of the same name, the new project is named after the film's full file name (`Promo.mov.takewise`). Recent projects are listed below; a project that is already open comes to the front instead of opening twice.
+
+## The menu bar
+
+The menu bar is the same in the start window and every recording window:
+
+- **Takewise:** **About Takewise** (the standard About panel: version and build, what Takewise is, and a link to the repository), **Install Command Line Tool…** (see [Building from source](#building-from-source)), Services, **Hide Takewise** (⌘H), **Hide Others** (⌥⌘H), **Show All**, and **Quit Takewise** (⌘Q). Quitting refuses while a take or passage exists only in memory, as closing a window does (see the `record` notes above).
+- **File:** **Open Project…** (⌘O), as in the start window.
+- **Help:** **Takewise Help** opens the README on GitHub, **Keyboard Shortcuts** its keys, **Release Notes** the GitHub release of the version running, and **Report an Issue…** a new issue.
 
 ## Passages in the window
 

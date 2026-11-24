@@ -7,26 +7,33 @@
 //! does not give its tests. `plays_film_frames` plays the film named by
 //! `TAKEWISE_SMOKE_FILM`; `routes_take_to_output` plays a silent take
 //! through `TAKEWISE_SMOKE_OUTPUT`, else an output that is not the system's
-//! default, as the window plays takes through the project's output. Capture needs microphone access for
-//! the app that runs the test (the terminal or the agent host).
+//! default, as the window plays takes through the project's output.
+//! `shows_about_panel` brings up the About panel for a moment; with
+//! `TAKEWISE_SMOKE_ABOUT_PNG` set it captures the panel there (this needs
+//! screen recording access for the app that runs the test). Capture needs
+//! microphone access for the app that runs the test (the terminal or the
+//! agent host).
 
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSApplication;
 use takewise_media::{
-    Capture, ChannelMeter, DeviceInfo, FilmPlayer, TakePlayer, Transport, default_input,
+    About, Capture, ChannelMeter, DeviceInfo, FilmPlayer, TakePlayer, Transport, default_input,
     default_output, host_time_now_s, input_devices, input_latency_s, output_devices, pump_run_loop,
-    set_nominal_sample_rate,
+    set_nominal_sample_rate, show_about_panel,
 };
 
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 6] = [
+const TESTS: [Test; 7] = [
     ("lists_input_devices", lists_input_devices),
     ("plays_film_frames", plays_film_frames),
     ("routes_take_to_output", routes_take_to_output),
+    ("shows_about_panel", shows_about_panel),
     ("captures_one_channel", captures_one_channel),
     ("meters_every_channel", meters_every_channel),
     ("switches_nominal_rate", switches_nominal_rate),
@@ -209,6 +216,45 @@ fn play_silence_through(wav: &std::path::Path, name: &str) -> Outcome {
     ensure(take.output_device_uid() == uid, || {
         "the take's output changed while it played".to_owned()
     })
+}
+
+/// The standard About panel opens with Takewise's credits.
+fn shows_about_panel() -> Outcome {
+    let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    show_about_panel(&About {
+        name: "Takewise",
+        version: "0.0.0-smoke",
+        description: "Record voiceover against a film, line by line or in passages.",
+        link_text: "github.com/niklas-heer/takewise",
+        link_url: "https://github.com/niklas-heer/takewise",
+    })
+    .map_err(|e| e.to_string())?;
+    pump_run_loop(0.5);
+    let windows = app.windows();
+    let shown: Vec<_> = (0..windows.count())
+        .map(|i| windows.objectAtIndex(i))
+        .filter(|w| w.isVisible())
+        .collect();
+    for window in &shown {
+        let frame = window.frame();
+        println!(
+            "    window {} at {:?}, {:?}",
+            window.windowNumber(),
+            frame.origin,
+            frame.size
+        );
+        if let Some(png) = std::env::var_os("TAKEWISE_SMOKE_ABOUT_PNG") {
+            let captured = std::process::Command::new("screencapture")
+                .args(["-x", "-o", &format!("-l{}", window.windowNumber())])
+                .arg(&png)
+                .status()
+                .map_err(|e| e.to_string())?;
+            println!("    captured to {}: {captured}", png.to_string_lossy());
+        }
+        window.close();
+    }
+    ensure(!shown.is_empty(), || "no About panel came up".to_owned())
 }
 
 /// `TAKEWISE_SMOKE_INPUT`, else the built-in microphone, else the default

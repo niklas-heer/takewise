@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 cpal = "0.18.2"
 objc2.workspace = true
+objc2-app-kit.workspace = true
 objc2-av-foundation.workspace = true
 objc2-core-audio.workspace = true
 objc2-core-foundation.workspace = true
@@ -21,6 +22,8 @@ thiserror = "2.0.21"
 
 [dev-dependencies]
 objc2-core-video.workspace = true
+# The smoke test finds the About panel among the app's windows.
+objc2-app-kit = { workspace = true, features = ["NSWindow"] }
 
 [[test]]
 name = "smoke"

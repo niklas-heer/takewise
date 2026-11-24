@@ -94,6 +94,34 @@ gpui_kit::actions!(
     ]
 );
 
+// The menu bar's own actions, handled by the app whichever window is in
+// front (see `menu_actions`).
+gpui_kit::actions!(
+    takewise_menu,
+    [
+        About,
+        Hide,
+        HideOthers,
+        ShowAll,
+        OpenHelp,
+        OpenKeys,
+        OpenReleaseNotes,
+        ReportIssue,
+    ]
+);
+
+/// Where the Help menu's items lead: the README, its keys, these release
+/// notes and a new issue.
+const HELP_URL: &str = "https://github.com/niklas-heer/takewise#readme";
+const KEYS_URL: &str = "https://github.com/niklas-heer/takewise#keys";
+const RELEASE_NOTES_URL: &str = concat!(
+    "https://github.com/niklas-heer/takewise/releases/tag/v",
+    env!("CARGO_PKG_VERSION")
+);
+const ISSUE_URL: &str = "https://github.com/niklas-heer/takewise/issues/new";
+/// What the About panel says Takewise is.
+const DESCRIPTION: &str = "Record voiceover against a film, line by line or in passages; every take is checked and the narration exported clean.";
+
 /// The key context of the window while no text is being edited.
 const CONTEXT: &str = "Recorder";
 /// The key context while the line's text is edited (E): the recording keys
@@ -155,8 +183,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("c", ToggleSetup, Some(SETUP)),
         KeyBinding::new("a", TogglePanel, Some(SETUP)),
         KeyBinding::new("escape", CancelEdit, Some(EDITING)),
+        // ⌘Q first: the menu shows a command's first binding.
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
     ]);
 }
 
@@ -300,22 +331,58 @@ pub fn run_start() {
     });
 }
 
-/// The keys, the app menu and quitting once the last window closed.
+/// The keys, the menu bar and quitting once the last window closed.
 fn set_up_app(cx: &mut App) {
     gpui_kit::init(cx);
     bind_keys(cx);
     start::bind_keys(cx);
+    cx.set_menus(menus());
+    menu_actions(cx);
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+}
+
+/// The menu bar: Takewise, File and Help. Its actions are the app's, so
+/// they work from the start window and every recording window alike.
+fn menus() -> Vec<Menu> {
+    vec![
+        Menu::new("Takewise").items([
+            MenuItem::action("About Takewise", About),
+            MenuItem::separator(),
+            MenuItem::action("Install Command Line Tool…", InstallCommand),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", gpui_kit::SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Hide Takewise", Hide),
+            MenuItem::action("Hide Others", HideOthers),
+            MenuItem::action("Show All", ShowAll),
+            MenuItem::separator(),
+            MenuItem::action("Quit Takewise", Quit),
+        ]),
+        Menu::new("File").items([MenuItem::action("Open Project…", start::OpenProject)]),
+        Menu::new("Help").items([
+            MenuItem::action("Takewise Help", OpenHelp),
+            MenuItem::action("Keyboard Shortcuts", OpenKeys),
+            MenuItem::action("Release Notes", OpenReleaseNotes),
+            MenuItem::separator(),
+            MenuItem::action("Report an Issue…", ReportIssue),
+        ]),
+    ]
+}
+
+/// What the menu bar's items do, for the whole app; a window may handle
+/// one itself first (the recording window says the outcome of Install
+/// Command Line Tool… in its own message line).
+fn menu_actions(cx: &mut App) {
     cx.on_action(|_: &Quit, cx: &mut App| {
         if !holds_unsaved_audio(cx) {
             cx.quit();
         }
     });
-    cx.set_menus([Menu::new("Takewise").items([
-        MenuItem::action("Open Project…", start::OpenProject),
-        MenuItem::action("Install Command Line Tool…", InstallCommand),
-        MenuItem::separator(),
-        MenuItem::action("Quit Takewise", Quit),
-    ])]);
     // From the menu with no window to show the outcome in, it is said in
     // a new start window.
     cx.on_action(|_: &InstallCommand, cx: &mut App| {
@@ -324,12 +391,25 @@ fn set_up_app(cx: &mut App) {
     cx.on_action(|_: &start::OpenProject, cx: &mut App| {
         let _ = start::open(cx);
     });
-    cx.on_window_closed(|cx, _| {
-        if cx.windows().is_empty() {
-            cx.quit();
+    cx.on_action(|_: &About, _: &mut App| {
+        let about = takewise_media::About {
+            name: "Takewise",
+            version: env!("CARGO_PKG_VERSION"),
+            description: DESCRIPTION,
+            link_text: "github.com/niklas-heer/takewise",
+            link_url: "https://github.com/niklas-heer/takewise",
+        };
+        if let Err(err) = takewise_media::show_about_panel(&about) {
+            eprintln!("error: cannot show the About panel: {err}");
         }
-    })
-    .detach();
+    });
+    cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
+    cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
+    cx.on_action(|_: &OpenHelp, cx: &mut App| cx.open_url(HELP_URL));
+    cx.on_action(|_: &OpenKeys, cx: &mut App| cx.open_url(KEYS_URL));
+    cx.on_action(|_: &OpenReleaseNotes, cx: &mut App| cx.open_url(RELEASE_NOTES_URL));
+    cx.on_action(|_: &ReportIssue, cx: &mut App| cx.open_url(ISSUE_URL));
 }
 
 /// The recording windows open in this app, by project folder.

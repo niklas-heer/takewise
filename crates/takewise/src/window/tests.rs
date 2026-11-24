@@ -2886,6 +2886,45 @@ fn the_voice_level_plays_takes_back_quieter(cx: &mut TestAppContext) {
         .read_with(cx, |view, _| assert_eq!(view.volumes.voice, 0.0));
 }
 
+#[gpui_kit::test]
+fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
+    use super::{OpenHelp, OpenKeys, OpenReleaseNotes, ReportIssue};
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    cx.update(super::menu_actions);
+    cx.update(|cx| {
+        for menu in super::menus() {
+            for item in menu.items {
+                if let gpui_kit::MenuItem::Action { name, action, .. } = item {
+                    assert!(cx.is_action_available(&*action), "{name} does nothing");
+                }
+            }
+        }
+    });
+    cx.dispatch_action(f.window, OpenHelp);
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/niklas-heer/takewise#readme")
+    );
+    cx.dispatch_action(f.window, OpenKeys);
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/niklas-heer/takewise#keys")
+    );
+    cx.dispatch_action(f.window, OpenReleaseNotes);
+    assert_eq!(
+        cx.opened_url(),
+        Some(format!(
+            "https://github.com/niklas-heer/takewise/releases/tag/v{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+    );
+    cx.dispatch_action(f.window, ReportIssue);
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/niklas-heer/takewise/issues/new")
+    );
+}
+
 /// −0.4 dBFS: near clipping, not clipped.
 const LOUD: i32 = 8_000_000;
 
