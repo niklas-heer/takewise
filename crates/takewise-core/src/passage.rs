@@ -822,8 +822,10 @@ pub struct PassageChoice {
 
 /// Chooses the piece of passage `id` for every line that has one, so the
 /// passage is used whole. Under the project lock it checks that every
-/// piece has a take and that each take's file exists, then appends all the
-/// `chosen` events in one write: either every line is chosen or none is.
+/// piece has a take and that each take's file exists, then adds all the
+/// `chosen` events at once, in a copy of the ledger renamed over it:
+/// either every line is chosen or none is, also when the write fails
+/// midway.
 ///
 /// Lines of the passage without a piece, and pieces whose line is no
 /// longer in the script, are skipped and keep their choice. Fails with
@@ -2173,6 +2175,48 @@ text = "Later."
             "{err:?}"
         );
         assert_eq!(chosen_events(&dir), before, "nothing appended");
+    }
+
+    #[test]
+    fn a_torn_choice_of_a_passage_chooses_no_line() {
+        let (_tmp, dir) = project();
+        let passage = publish(&dir, &abc(&dir), &spoken());
+        split(&dir, &passage.id).unwrap();
+        let before = fs::read(dir.join("takes.jsonl")).unwrap();
+        // The write of the three choices stops in the first event, right
+        // after it, and in the last one.
+        let one = serde_json::to_string(&Event::new(
+            "a",
+            1,
+            EventKind::Chosen(Chosen {
+                by: "narrator".to_owned(),
+            }),
+        ))
+        .unwrap()
+        .len()
+            + 1;
+        for torn in [0, one / 2, one, 2 * one, 3 * one - 1] {
+            ledger::tear_batches_after(Some(torn));
+            let failed = choose_passage(&dir, &passage.id, "narrator");
+            ledger::tear_batches_after(None);
+            assert!(failed.is_err(), "{torn}");
+            assert!(
+                fs::read(dir.join("takes.jsonl")).unwrap() == before,
+                "{torn}"
+            );
+            let state = fold(&Project::open(&dir).unwrap(), &read(&dir).unwrap());
+            let chosen: Vec<_> = state
+                .lines
+                .iter()
+                .filter_map(|l| l.chosen.clone())
+                .collect();
+            assert_eq!(chosen, vec![], "{torn}: a part of the passage was chosen");
+        }
+        let choice = choose_passage(&dir, &passage.id, "narrator").unwrap();
+        assert_eq!(choice.chosen.len(), 3);
+        let after = fs::read(dir.join("takes.jsonl")).unwrap();
+        assert!(after.starts_with(&before), "every earlier byte is kept");
+        assert_eq!(chosen_events(&dir).len(), 3);
     }
 
     #[test]

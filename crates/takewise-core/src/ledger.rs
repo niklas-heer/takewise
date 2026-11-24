@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, io};
-use crate::fsutil::lock;
+use crate::fsutil::{lock, rename_temp, sync_parent, write_temp};
 
 pub const LEDGER_FILE: &str = "takes.jsonl";
 
@@ -265,28 +265,12 @@ pub fn append(dir: &Path, event: &Event) -> Result<()> {
 /// Appends one event; the caller holds the project lock. When the file does
 /// not end in a newline (a torn line), the event still starts on its own line.
 pub(crate) fn append_locked(dir: &Path, event: &Event) -> Result<()> {
-    append_all_locked(dir, std::slice::from_ref(event))
-}
-
-/// Appends `events` in one `write`, so either all of them reach the ledger
-/// or none does; the caller holds the project lock. Each event is a line of
-/// its own, the first one also after a torn line.
-pub(crate) fn append_all_locked(dir: &Path, events: &[Event]) -> Result<()> {
-    if events.is_empty() {
-        return Ok(());
-    }
     let path = dir.join(LEDGER_FILE);
     let mut line = String::new();
     if !ends_with_newline(&path).map_err(io(&path))? {
         line.push('\n');
     }
-    for event in events {
-        line.push_str(&serde_json::to_string(event).map_err(|err| Error::Parse {
-            path: path.clone(),
-            message: err.to_string(),
-        })?);
-        line.push('\n');
-    }
+    line.push_str(&to_line(&path, event)?);
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -294,6 +278,76 @@ pub(crate) fn append_all_locked(dir: &Path, events: &[Event]) -> Result<()> {
         .map_err(io(&path))?;
     file.write_all(line.as_bytes()).map_err(io(&path))?;
     file.sync_data().map_err(io(&path))
+}
+
+/// One event as its ledger line, with the newline.
+fn to_line(path: &Path, event: &Event) -> Result<String> {
+    let mut line = serde_json::to_string(event).map_err(|err| Error::Parse {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// Adds `events` to the ledger so that either all of them reach it or none
+/// does; the caller holds the project lock. One event is appended as any
+/// other. Several lines appended in one `write` could tear between them,
+/// and a reader would take the lines before the tear as the whole batch.
+/// So a batch is written into a copy of the ledger, every byte the ledger
+/// has followed by the batch (each event a line of its own, the first one
+/// also after a torn line); the copy is fsynced and renamed over
+/// `takes.jsonl`, and the directory fsynced. A failure or a crash on the
+/// way leaves the ledger as it was. Nothing in it is changed or removed.
+pub(crate) fn append_all_locked(dir: &Path, events: &[Event]) -> Result<()> {
+    match events {
+        [] => return Ok(()),
+        [event] => return append_locked(dir, event),
+        _ => {}
+    }
+    let path = dir.join(LEDGER_FILE);
+    let mut bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(io(&path)(err)),
+    };
+    let kept = bytes.len();
+    if bytes.last().is_some_and(|last| *last != b'\n') {
+        bytes.push(b'\n');
+    }
+    for event in events {
+        bytes.extend_from_slice(to_line(&path, event)?.as_bytes());
+    }
+    let temp = write_temp(&path, |file| write_copy(file, &bytes, kept))?;
+    rename_temp(&temp, &path)?;
+    sync_parent(&path)
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+thread_local! {
+    static TEAR_BATCHES_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes writing a batch of events on this thread stop once `bytes` of the
+/// batch are written, as a failing disk can tear a write; `None` lets
+/// batches through again. For tests.
+#[cfg(any(test, feature = "test-faults"))]
+pub fn tear_batches_after(bytes: Option<usize>) {
+    TEAR_BATCHES_AFTER.set(bytes);
+}
+
+/// Writes the ledger's copy: `bytes`, whose first `kept` are the ledger as
+/// it is and the rest the batch.
+fn write_copy(file: &mut File, bytes: &[u8], kept: usize) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if let Some(torn) = TEAR_BATCHES_AFTER.get() {
+        file.write_all(bytes.get(..kept + torn).unwrap_or(bytes))?;
+        return Err(std::io::Error::other("the write was torn (test)"));
+    }
+    #[cfg(not(any(test, feature = "test-faults")))]
+    let _ = kept;
+    file.write_all(bytes)
 }
 
 /// True for a missing or empty file, too.
@@ -585,6 +639,49 @@ mod tests {
         let pieces: Vec<_> = ledger.pieces(&piece.id).collect();
         assert_eq!(pieces, vec![("hook", 2, &piece)]);
         assert_eq!(ledger.pieces("another").count(), 0);
+    }
+
+    #[test]
+    fn a_torn_batch_leaves_the_ledger_as_it_was() {
+        let tmp = crate::testutil::project_tempdir();
+        let dir = tmp.path();
+        let path = dir.join(LEDGER_FILE);
+        // An event, and a line an earlier crash tore.
+        let first = recorded(1);
+        append(dir, &first).unwrap();
+        let mut ledger = OpenOptions::new().append(true).open(&path).unwrap();
+        ledger.write_all(b"{\"v\":1,\"kind\":\"reco").unwrap();
+        drop(ledger);
+        let before = fs::read(&path).unwrap();
+        let files = fs::read_dir(dir).unwrap().count();
+        let batch = [recorded(2), recorded(3), recorded(4)];
+        // The newline that ends the torn line, then the three events.
+        let written: usize = 1 + batch
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap().len() + 1)
+            .sum::<usize>();
+
+        // The write stops after every possible number of bytes, also in
+        // the middle of an event and between two.
+        for torn in 0..written {
+            tear_batches_after(Some(torn));
+            let failed = append_all_locked(dir, &batch);
+            tear_batches_after(None);
+            assert!(failed.is_err(), "{torn}");
+            assert!(fs::read(&path).unwrap() == before, "{torn}: changed");
+            let read = read(dir).unwrap();
+            assert_eq!(read.events, std::slice::from_ref(&first), "{torn}: none");
+            let left = fs::read_dir(dir).unwrap().count();
+            assert_eq!(left, files, "{torn}: no copy is left");
+        }
+
+        append_all_locked(dir, &batch).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert!(after.starts_with(&before), "every earlier byte is kept");
+        assert_eq!(after.len(), before.len() + written);
+        let read = read(dir).unwrap();
+        assert_eq!(read.events.len(), 4);
+        assert_eq!(read.bad_lines, vec![2], "the torn line, on its own line");
     }
 
     #[test]
