@@ -137,9 +137,12 @@ impl RecordingWindow {
 
     /// Enter: the next step; the room step needs the voice step's reading,
     /// and the latency step is shown only when the calibration is missing
-    /// or does not match the devices in use.
+    /// or does not match the devices in use, or when a remembered one may
+    /// be measured again (a Bluetooth output).
     pub(super) fn setup_next(&mut self) {
-        let stale = calibration_needed(&self.project.config, &self.current_route()).is_some();
+        let route = self.current_route();
+        let stale = calibration_needed(&self.project.config, &route).is_some()
+            || self.remeasure_offered(&route);
         let calibrating = self.calibrating.is_some();
         let Some(setup) = &mut self.setup else {
             return;
@@ -245,14 +248,12 @@ impl RecordingWindow {
             floor_dbfs: room.floor_dbfs,
             gated: room.gated,
         };
-        if let Err(err) =
-            tw::room::save_room_tone(&self.dir, samples, RECORD_RATE, now, &room_input)
-        {
-            return Err(format!("Could not keep the room tone: {err}"));
-        }
+        let tone = tw::room::save_room_tone(&self.dir, samples, RECORD_RATE, now, &room_input)
+            .map_err(|err| format!("Could not keep the room tone: {err}"))?;
+        // The local date, as the narrator's day is meant.
+        let today = jiff::ZonedDateTime::now().date();
         let info = SetupInfo {
-            // The local date, as the narrator's day is meant.
-            date: jiff::ZonedDateTime::now().date().to_string(),
+            date: today.to_string(),
             input,
             channel: route.channel,
             output,
@@ -262,6 +263,9 @@ impl RecordingWindow {
         };
         let written = tw::set_setup(&self.dir, &info)
             .map_err(|err| format!("Could not save the setup check: {err}"));
+        if written.is_ok() {
+            self.remember_setup(&info, &tone, today);
+        }
         self.reload();
         self.check_inputs();
         written
@@ -295,8 +299,7 @@ impl RecordingWindow {
     /// built-in output does not say which it plays through, the warning is
     /// conditional.
     pub(super) fn output_warning(&self) -> Option<&'static str> {
-        let name = self.current_route().output?;
-        let output = self.media.outputs().into_iter().find(|o| o.name == name)?;
+        let output = self.output_in_use()?;
         match (output.transport, output.output_source) {
             (Transport::Bluetooth, _) => Some(
                 "Bluetooth headphones delay the film's sound and are not supported for recording; use wired headphones.",
@@ -309,6 +312,19 @@ impl RecordingWindow {
             ),
             (Transport::BuiltIn | Transport::Usb | Transport::Other, _) => None,
         }
+    }
+
+    /// The output the film plays through now, as CoreAudio describes it.
+    fn output_in_use(&self) -> Option<takewise_media::DeviceInfo> {
+        let name = self.current_route().output?;
+        self.media.outputs().into_iter().find(|o| o.name == name)
+    }
+
+    /// Whether the film plays through Bluetooth headphones, whose delay
+    /// can change after they reconnect.
+    pub(super) fn bluetooth_output(&self) -> bool {
+        self.output_in_use()
+            .is_some_and(|output| output.transport == Transport::Bluetooth)
     }
 
     /// The open step's content.

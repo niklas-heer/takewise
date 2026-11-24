@@ -3653,3 +3653,290 @@ fn a_note_for_an_open_project_shows_in_its_window(cx: &mut TestAppContext) {
     cx.update(|cx| super::tell_open(&f.dir.join("takes/.."), note.clone(), cx));
     assert_eq!(message(cx, &f.view), note);
 }
+
+/// The remembered setup of the test's own settings folder.
+fn remembered_store() -> PathBuf {
+    tw::remembered::beside(&super::start::isolate_settings())
+}
+
+/// Remembers `offset_ms` measured on the test mic and `output` with
+/// `buffer` frames on `date`.
+fn remember_measurement(output: &str, buffer: u32, offset_ms: i32, date: &str) {
+    let info = tw::CalibrationInfo {
+        input: DEVICE.to_owned(),
+        output: output.to_owned(),
+        buffer_frames: Some(buffer),
+        date: date.to_owned(),
+        from: None,
+    };
+    assert!(
+        tw::remembered::remember_latency(&remembered_store(), offset_ms, &info).expect("remember")
+    );
+}
+
+/// Uses the test's settings, as the window does when it opens.
+fn use_settings(cx: &mut TestAppContext, f: &Fixture) {
+    let settings = super::start::isolate_settings();
+    f.view
+        .update(cx, |view, _| view.use_settings(Some(settings)));
+    frame(cx, f.window);
+}
+
+#[gpui_kit::test]
+fn a_remembered_latency_applies_when_the_window_opens(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    remember_measurement("MacBook Speakers", 512, -29, "2026-11-23");
+    use_settings(cx, &f);
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(config.input.latency_offset_ms, -29);
+    let cal = config.calibration.expect("[calibration]");
+    assert!(cal.is_remembered(), "{cal:?}");
+    assert_eq!(
+        (cal.output.as_str(), cal.buffer_frames, cal.date.as_str()),
+        ("MacBook Speakers", Some(512), "2026-11-23")
+    );
+    let note = f
+        .view
+        .read_with(cx, |view, _| view.panel.remembered.clone())
+        .expect("a note");
+    assert_eq!(
+        note,
+        "Latency from an earlier measurement on these devices (2026-11-23)."
+    );
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.panel.calibration.clone()),
+        None
+    );
+    assert!(
+        message(cx, &f.view).contains("the latency measured on these devices on 2026-11-23"),
+        "{}",
+        message(cx, &f.view)
+    );
+    // Takes are placed with it.
+    let offset = line_offset_of_a_take(cx, &f);
+    assert!((offset - -2.429).abs() < 1e-6, "{offset}");
+}
+
+#[gpui_kit::test]
+fn a_remembered_latency_follows_the_route(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // Measured with another buffer on these speakers, and with this
+    // buffer on the phones.
+    remember_measurement("MacBook Speakers", 256, -25, "2026-11-22");
+    remember_measurement("Test Phones", 512, -29, "2026-11-23");
+    use_settings(cx, &f);
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(
+        config.calibration, None,
+        "another buffer size never applies"
+    );
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.panel.remembered.clone()),
+        None
+    );
+
+    f.view
+        .update(cx, |view, _| view.choose_output("Test Phones"));
+    frame(cx, f.window);
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(config.input.latency_offset_ms, -29);
+    assert!(config.calibration.expect("[calibration]").is_remembered());
+    let note = f
+        .view
+        .read_with(cx, |view, _| view.panel.remembered.clone())
+        .expect("a note");
+    assert!(!note.contains("Bluetooth"), "{note}");
+
+    // Back on the speakers nothing fits: the window says the calibration
+    // does not match, as before.
+    f.view
+        .update(cx, |view, _| view.choose_output("MacBook Speakers"));
+    frame(cx, f.window);
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.panel.remembered.clone()),
+        None
+    );
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.panel.calibration.clone())
+            .is_some_and(|note| note.contains("does not match these devices"))
+    );
+}
+
+#[gpui_kit::test]
+fn a_projects_own_calibration_wins_and_is_remembered(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        calibrate_on(dir, "MacBook Speakers");
+    });
+    remember_measurement("MacBook Speakers", 512, -29, "2026-11-20");
+    use_settings(cx, &f);
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(config.input.latency_offset_ms, 25);
+    assert!(!config.calibration.expect("[calibration]").is_remembered());
+    // It is newer than the one remembered, so it replaces it.
+    let remembered = tw::remembered::read(&remembered_store()).expect("remembered");
+    assert_eq!(remembered.latency.len(), 1, "{remembered:?}");
+    assert_eq!(remembered.latency[0].latency_offset_ms, 25);
+}
+
+#[gpui_kit::test]
+fn a_bluetooth_output_offers_to_measure_again(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.0.borrow_mut().outputs.push(output(
+        "WH-1000XM5",
+        Transport::Bluetooth,
+        OutputSource::Unknown,
+    ));
+    remember_measurement("WH-1000XM5", 512, -29, "2026-11-23");
+    use_settings(cx, &f);
+    f.view
+        .update(cx, |view, _| view.choose_output("WH-1000XM5"));
+    frame(cx, f.window);
+    let note = f
+        .view
+        .read_with(cx, |view, _| view.panel.remembered.clone())
+        .expect("a note");
+    assert_eq!(
+        note,
+        format!(
+            "Latency from an earlier measurement on these devices (2026-11-23). {}",
+            super::remembered::BLUETOOTH_HINT
+        )
+    );
+    // The setup check goes on to the latency step although it fits.
+    to_latency_step(cx, &f);
+}
+
+/// Saves a setup check's result in another project with the test mic and
+/// `output` today, and remembers it.
+fn remember_todays_setup(output: &str) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = tmp.path().join("other.takewise");
+    let info = FilmInfo {
+        duration_s: 20.0,
+        size: 0,
+        modified: "2026-11-22T00:00:00Z".to_owned(),
+    };
+    Project::init(&dir, Path::new("film.mp4"), info).expect("init");
+    let room = tw::room::RoomInput {
+        input: DEVICE,
+        channel: 1,
+        output,
+        floor_dbfs: -71.0,
+        gated: false,
+    };
+    let tone = tw::room::save_room_tone(&dir, &[1, 2, 3], 48_000, jiff::Timestamp::now(), &room)
+        .expect("room tone");
+    let today = jiff::ZonedDateTime::now().date();
+    let setup = tw::SetupInfo {
+        date: today.to_string(),
+        input: DEVICE.to_owned(),
+        channel: 1,
+        output: output.to_owned(),
+        room_floor_dbfs: Some(-71.0),
+        speech_to_noise_db: Some(50.0),
+        from: None,
+    };
+    tw::set_setup(&dir, &setup).expect("[setup]");
+    tw::remembered::remember_setup(&remembered_store(), &dir, &setup, &tone, today)
+        .expect("remember");
+}
+
+#[gpui_kit::test]
+fn todays_setup_check_is_adopted(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    remember_todays_setup("MacBook Speakers");
+    use_settings(cx, &f);
+    let setup = Project::open(&f.dir)
+        .expect("project")
+        .config
+        .setup
+        .expect("[setup] adopted");
+    assert!(setup.is_remembered(), "{setup:?}");
+    assert_eq!(setup.room_floor_dbfs, Some(-71.0));
+    let tones = tw::room::room_tones(&f.dir).expect("room tones");
+    assert_eq!(tones.len(), 1, "{tones:?}");
+    assert!(f.dir.join(&tones[0].file).is_file());
+    // Only the latency is still offered.
+    let offer = f
+        .view
+        .read_with(cx, |view, _| view.setup_offer.clone())
+        .expect("an offer");
+    assert_eq!(offer, "the latency is not calibrated for these devices");
+}
+
+#[gpui_kit::test]
+fn nothing_is_used_while_the_input_is_missing(cx: &mut TestAppContext) {
+    let f = open(cx, &[("Other Mic", 48_000)]);
+    remember_todays_setup("MacBook Speakers");
+    remember_measurement("MacBook Speakers", 512, -29, "2026-11-23");
+    use_settings(cx, &f);
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!((config.calibration, config.setup), (None, None));
+    // Once it is connected, both are used.
+    f.media.0.borrow_mut().inputs.push(AvailableInput {
+        name: DEVICE.to_owned(),
+        sample_rate: 48_000,
+    });
+    f.view.update(cx, |view, _| view.check_inputs());
+    let config = Project::open(&f.dir).expect("project").config;
+    assert!(config.calibration.is_some_and(|c| c.is_remembered()));
+    assert!(config.setup.is_some_and(|s| s.is_remembered()));
+}
+
+#[gpui_kit::test]
+fn a_setup_check_for_other_devices_is_not_adopted(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    remember_todays_setup("Test Phones");
+    use_settings(cx, &f);
+    assert_eq!(Project::open(&f.dir).expect("project").config.setup, None);
+    assert_eq!(tw::room::room_tones(&f.dir).expect("room tones"), []);
+    // Switching to those phones adopts it.
+    f.view
+        .update(cx, |view, _| view.choose_output("Test Phones"));
+    frame(cx, f.window);
+    let setup = Project::open(&f.dir).expect("project").config.setup;
+    assert!(setup.is_some_and(|s| s.is_remembered()));
+}
+
+#[gpui_kit::test]
+fn the_setup_check_and_its_calibration_are_remembered(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let settings = super::start::isolate_settings();
+    fs::write(&settings, "# untouched\n").expect("settings");
+    use_settings(cx, &f);
+    to_latency_step(cx, &f);
+    press(cx, f.window, &["space"]);
+    run_calibration(cx, &f, true);
+    let remembered = tw::remembered::read(&remembered_store()).expect("remembered");
+    assert_eq!(remembered.setup.len(), 1, "{remembered:?}");
+    let known = &remembered.setup[0];
+    assert_eq!(
+        (
+            known.setup.input.as_str(),
+            known.setup.channel,
+            known.setup.output.as_str()
+        ),
+        (DEVICE, 1, "MacBook Speakers")
+    );
+    assert!(known.room_tone.file.starts_with("rooms/"), "{known:?}");
+    let folder = settings.parent().expect("settings folder");
+    assert!(folder.join(&known.room_tone.file).is_file());
+    assert_eq!(
+        remembered.latency,
+        [tw::remembered::RememberedLatency {
+            input: DEVICE.to_owned(),
+            output: "MacBook Speakers".to_owned(),
+            buffer_frames: 512,
+            latency_offset_ms: -30,
+            date: crate::calibrate::today(),
+        }]
+    );
+    assert_eq!(
+        fs::read_to_string(&settings).expect("settings"),
+        "# untouched\n"
+    );
+}

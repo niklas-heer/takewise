@@ -182,6 +182,7 @@ impl RecordingWindow {
         };
         tw::set_calibration(&self.dir, offset, &info)
             .map_err(|err| format!("{placed}, but it could not be saved: {err}"))?;
+        self.remember_latency(offset, &info);
         self.reload();
         self.check_inputs();
         Ok(format!(
@@ -193,8 +194,12 @@ impl RecordingWindow {
     /// The latency step's content.
     pub(super) fn latency_body(&self, setup: &Setup) -> Vec<AnyElement> {
         let mut body = Vec::new();
-        if let Some(why) = calibration_needed(&self.project.config, &self.current_route()) {
+        let route = self.current_route();
+        if let Some(why) = calibration_needed(&self.project.config, &route) {
             body.push(line(format!("Latency: {why}."), colors::WARN));
+        }
+        if let Some(note) = self.remembered_note(&route) {
+            body.push(line(note, colors::DIM));
         }
         if self.calibrating.is_some() {
             body.push(line(
