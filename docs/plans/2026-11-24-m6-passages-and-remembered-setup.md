@@ -16,7 +16,7 @@ Read against the code of 0.1.3:
 - **Long lines.** A line can be a paragraph: the prompter scrolls a line longer than three rows, the checks compare the whole text, and `whisper-cli` has 120 s per take. The cost: one wrong word means re-reading the whole paragraph, and the sentences inside it are not tied to their shots.
 - **Many lines.** 13 minutes is 80 to 120 lines. The ledger, the status and the export scale linearly.
 - **The line list** scrolls on its own but does not follow the selection (`window/lines.rs`).
-- **The export** of 13 minutes needs a mix buffer of about 290 MiB (48 kHz `f64`) and up to five loudness passes. That is acceptable, but it needs to be measured once.
+- **The export** of 13 minutes holds the whole narration in memory (48 kHz `f64`) and makes up to five loudness passes. Measured on a 13-minute synthetic film with a release build of the core export: `raw` takes 1.25 s with a peak of 1.07 GB of memory, `clean` about 18 s with 1.77 GB. A debug build of the CLI measured 30 to 128 s and 1.65 to 1.78 GB for a `clean` export. That is acceptable on this Mac.
 
 So the system works for long films, except for flow and the line list. This milestone lets sentence lines be recorded as one continuous passage, and still be picked up line by line.
 
@@ -193,7 +193,7 @@ When the current line changes (arrows, a passage take moving to its next line, a
 - Shift+Enter chooses across the passage.
 - The line list follows the selection.
 
-**Real use.** Record a 60 to 90 s passage on the RØDECaster, including one spoken-through cue. Listen to it with Shift+P, replace one line with a single-line take, and export in `clean`. Measure the export time and peak memory on a 13-minute film.
+**Real use.** Record a 60 to 90 s passage on the RØDECaster, including one spoken-through cue. Listen to it with Shift+P, replace one line with a single-line take, and export in `clean`. The export time and peak memory on a 13-minute film are measured (see "Does the current system hold up for 13 minutes?").
 
 ## Release
 
