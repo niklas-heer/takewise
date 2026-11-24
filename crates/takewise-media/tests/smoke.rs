@@ -204,10 +204,13 @@ fn play_silence_through(wav: &std::path::Path, name: &str) -> Outcome {
     ensure(take.output_device_uid().is_none(), || {
         "a new take does not follow the system output".to_owned()
     })?;
+    let expected = takewise_media::output_uid(name).map_err(|e| e.to_string())?;
     take.set_output_device(name).map_err(|e| e.to_string())?;
     let uid = take.output_device_uid();
     println!("    take output {name:?}: {uid:?}");
-    ensure(uid.is_some(), || format!("the take is not set to {name:?}"))?;
+    ensure(uid.as_deref() == Some(expected.as_str()), || {
+        format!("the take is set to {uid:?}, not {name:?} ({expected})")
+    })?;
     let loading = Instant::now();
     while !take.is_ready() {
         ensure(loading.elapsed() < Duration::from_secs(10), || {
@@ -219,7 +222,13 @@ fn play_silence_through(wav: &std::path::Path, name: &str) -> Outcome {
     take.play_at(0.0, host_time_now_s() + 0.1)
         .map_err(|e| e.to_string())?;
     pump_run_loop(0.6);
+    let played_s = take.current_s();
     take.stop();
+    println!("    played to {played_s:.3} s");
+    // Started 0.1 s in: about 0.5 s played through that output.
+    ensure((0.3..0.55).contains(&played_s), || {
+        format!("the take played to {played_s:.3} s, not about 0.5 s")
+    })?;
     ensure(take.output_device_uid() == uid, || {
         "the take's output changed while it played".to_owned()
     })

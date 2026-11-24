@@ -795,6 +795,25 @@ mod tests {
         assert_eq!(cx.windows().len(), 1, "no second start window");
     }
 
+    // See the recording window's tests: gpui-pre 0.3.12's test window
+    // panics in minimize() and zoom(), so these pass only when the action
+    // reaches the start window's own.
+    #[gpui_kit::test]
+    #[should_panic(expected = "not implemented")]
+    fn minimize_reaches_the_start_window(cx: &mut TestAppContext) {
+        open_start(cx, Vec::new());
+        let window = cx.windows()[0];
+        cx.dispatch_action(window, super::super::Minimize);
+    }
+
+    #[gpui_kit::test]
+    #[should_panic(expected = "not implemented")]
+    fn zoom_reaches_the_start_window(cx: &mut TestAppContext) {
+        open_start(cx, Vec::new());
+        let window = cx.windows()[0];
+        cx.dispatch_action(window, super::super::Zoom);
+    }
+
     #[gpui_kit::test]
     fn command_w_closes_the_start_window(cx: &mut TestAppContext) {
         open_start(cx, Vec::new());

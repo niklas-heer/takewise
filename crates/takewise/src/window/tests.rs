@@ -3605,14 +3605,16 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
     );
 }
 
-// GPUI's test window panics in minimize() and zoom() ("not implemented"),
-// so these pass only when the action reaches the window's own minimize
-// or zoom; an action handled where the window cannot be reached would not.
+// The test window of gpui-pre 0.3.12 (the GPUI gpui-kit 0.10.0 pins)
+// implements minimize() and zoom() as `unimplemented!()`, which panics
+// with "not implemented": these pass only when the action reaches the
+// window's own minimize or zoom, which the app-wide handlers of 0.2.1's
+// first cut never did. A GPUI whose test window records the calls instead
+// fails them, to be rewritten against what it records.
 #[gpui_kit::test]
 #[should_panic(expected = "not implemented")]
 fn window_minimize_reaches_the_window(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
-    cx.update(super::menu_actions);
     press(cx, f.window, &["cmd-m"]);
 }
 
@@ -3620,14 +3622,32 @@ fn window_minimize_reaches_the_window(cx: &mut TestAppContext) {
 #[should_panic(expected = "not implemented")]
 fn window_zoom_reaches_the_window(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
-    cx.update(super::menu_actions);
     cx.dispatch_action(f.window, super::Zoom);
 }
 
 #[gpui_kit::test]
-fn command_w_closes_the_window_and_command_q_quits(cx: &mut TestAppContext) {
+fn command_w_closes_the_window_and_command_q_is_quit(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
-    cx.update(super::menu_actions);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keys = |action: &dyn gpui_kit::Action| -> Vec<String> {
+            keymap
+                .borrow()
+                .bindings_for_action(action)
+                .map(|binding| {
+                    let stroke = &binding.keystrokes()[0];
+                    let cmd = if stroke.modifiers().platform {
+                        "cmd-"
+                    } else {
+                        ""
+                    };
+                    format!("{cmd}{}", stroke.key())
+                })
+                .collect()
+        };
+        assert_eq!(keys(&super::Quit), ["cmd-q"], "⌘Q quits, ⌘W does not");
+        assert_eq!(keys(&super::CloseWindow), ["cmd-w"]);
+    });
     press(cx, f.window, &["-"]);
     press(cx, f.window, &["cmd-w"]);
     assert_eq!(cx.windows().len(), 0, "closed");
@@ -3635,7 +3655,7 @@ fn command_w_closes_the_window_and_command_q_quits(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn command_w_keeps_a_window_with_audio_only_in_memory(cx: &mut TestAppContext) {
+fn command_w_and_command_q_keep_a_window_with_audio_only_in_memory(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     cx.update(super::menu_actions);
     // A file where line a's takes belong: its take cannot be saved.
@@ -3643,9 +3663,15 @@ fn command_w_keeps_a_window_with_audio_only_in_memory(cx: &mut TestAppContext) {
     fs::write(f.dir.join("takes/a"), b"").expect("blocker");
     record_take(cx, &f);
     assert_eq!(recorded(&f.dir).len(), 0);
-    press(cx, f.window, &["cmd-w"]);
-    assert_eq!(cx.windows().len(), 1, "it stays");
-    assert!(message(cx, &f.view).starts_with("Not closing: 1 take is only in memory"));
+    for key in ["cmd-w", "cmd-q"] {
+        f.view.update(cx, |view, _| view.message = None);
+        press(cx, f.window, &[key]);
+        assert_eq!(cx.windows().len(), 1, "{key}: it stays");
+        assert!(
+            message(cx, &f.view).starts_with("Not closing: 1 take is only in memory"),
+            "{key}"
+        );
+    }
 }
 
 #[gpui_kit::test]

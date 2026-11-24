@@ -326,6 +326,11 @@ impl TakePlayer {
         self.av.pause();
     }
 
+    /// Take time now, in seconds.
+    pub fn current_s(&self) -> f64 {
+        self.av.current_s()
+    }
+
     /// Take level in dB; AVPlayer cannot amplify, so gains above 0 dB play
     /// at 0 dB. Takes effect at once, also while the take plays.
     pub fn set_gain_db(&self, db: f64) {
