@@ -333,14 +333,16 @@ fn named_for(folder: &Path, project_dir: &Path) -> bool {
     else {
         return false;
     };
-    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
-    // `20261124T101530Z`, as `create` writes the time.
+    let digits = |text: &[u8]| !text.is_empty() && text.iter().all(u8::is_ascii_digit);
+    // `20261124T101530Z`, as `create` writes the time; compared as bytes,
+    // since another folder's name may have any characters there.
+    let rest = rest.as_bytes();
     let (Some(stamp), Some(more)) = (rest.get(..16), rest.get(16..)) else {
         return false;
     };
     let stamped =
-        digits(&stamp[..8]) && &stamp[8..9] == "T" && digits(&stamp[9..15]) && &stamp[15..] == "Z";
-    stamped && (more.is_empty() || more.strip_prefix('-').is_some_and(digits))
+        digits(&stamp[..8]) && stamp[8] == b'T' && digits(&stamp[9..15]) && stamp[15] == b'Z';
+    stamped && (more.is_empty() || more.strip_prefix(b"-").is_some_and(digits))
 }
 
 /// `name` as part of a file name, in at most `max` bytes: itself, or,
@@ -439,7 +441,7 @@ pub fn rescued_for(root: &Path, project_dir: &Path) -> Vec<Found> {
                 .filter_map(|path| serde_json::from_slice(&fs::read(path).ok()?).ok())
                 .collect();
             let mine = if copies.is_empty() {
-                named_for(&folder, project_dir)
+                named_for(&folder, &project) || named_for(&folder, project_dir)
             } else {
                 copies.iter().any(&ours)
             };
@@ -924,6 +926,36 @@ text = "Two."
         let folders: Vec<&Path> = found.iter().map(|found| found.folder.as_path()).collect();
         assert_eq!(folders, [folder.as_path(), theirs.as_path()]);
         assert_eq!(found[1].without_json, ["002-take-a.wav"]);
+    }
+
+    #[test]
+    fn audio_without_json_is_found_by_any_spelling_of_the_project_and_odd_names_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = project(&tmp);
+        let root = tmp.path().join("rescue");
+        let mut rescue = Rescue::create(&root, &dir, at()).unwrap();
+        fail_json_writes(true);
+        let failed = rescue.add_take("a", &take_input(&dir, "a"), &[1, 2, 3]);
+        fail_json_writes(false);
+        assert!(failed.is_err());
+        let folder = rescue.finish().unwrap();
+        // Folders of other names that begin like this project's, with
+        // characters of more than one byte where the time would be.
+        for name in [
+            "film.takewise-1234567é1234567.takewise-20261124T101530Z",
+            "film.takewise-abcdefgü1234567",
+            "film.takewise-20261124ü123456",
+        ] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        // A spelling of the project's path whose last part is not its
+        // name, as `.` is from inside it.
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        for spelling in [dir.clone(), dir.join("sub").join("..")] {
+            let found = rescued_for(&root, &spelling);
+            assert_eq!(found.len(), 1, "{spelling:?}: {found:?}");
+            assert_eq!(found[0].folder, folder);
+        }
     }
 
     #[test]
