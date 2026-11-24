@@ -231,7 +231,8 @@ impl RecordingWindow {
     }
 
     /// Changes `level` by `delta` dB (a key), clamped to its range, and
-    /// moves its slider.
+    /// moves its slider. The monitor's level, hidden while monitoring
+    /// cannot run, is left alone then, and the window says why.
     pub(super) fn step_level(
         &mut self,
         level: Level,
@@ -239,6 +240,14 @@ impl RecordingWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.notify();
+        if !self.shown_levels().contains(&level) {
+            let reason = self.media.monitor_unavailable().unwrap_or_default();
+            self.message = Some(format!(
+                "The , and . keys set the monitor level, which waits for monitoring ({reason})."
+            ));
+            return;
+        }
         let (min, max) = level.range();
         let db = (self.volumes.get(level) + delta).clamp(min, max);
         self.set_level(level, db);

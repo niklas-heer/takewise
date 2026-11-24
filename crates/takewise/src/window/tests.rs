@@ -2932,6 +2932,15 @@ fn volume_keys_match_characters(cx: &mut TestAppContext) {
     assert_eq!(volumes(&f, cx).0, -11.0);
     press(cx, f.window, &["=", "shift-="]);
     assert_eq!(volumes(&f, cx).0, -11.0, "only a typed + raises it");
+    // The monitor level is hidden while monitoring cannot run: the keys
+    // say so and change nothing.
+    press(cx, f.window, &[","]);
+    assert_eq!(volumes(&f, cx).1, -6.0);
+    assert_eq!(
+        message(cx, &f.view),
+        "The , and . keys set the monitor level, which waits for monitoring (not available yet: monitoring needs a test on your setup)."
+    );
+    f.media.0.borrow_mut().monitor_unavailable = None;
     press(cx, f.window, &[",", ",", "."]);
     assert_eq!(volumes(&f, cx), (-11.0, -7.0));
     press(cx, f.window, &["."; 20]);
@@ -2991,6 +3000,7 @@ fn drag_slider(cx: &mut TestAppContext, f: &Fixture, level: Level, db: f32) {
 #[gpui_kit::test]
 fn keys_move_the_level_sliders(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.0.borrow_mut().monitor_unavailable = None;
     assert_eq!(slider_db(cx, &f, Level::Film), -12.0);
     assert_eq!(slider_db(cx, &f, Level::Voice), 0.0);
     press(cx, f.window, &["-", "-", ","]);

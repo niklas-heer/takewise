@@ -231,7 +231,7 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 | K | Clear the clipping light |
 | I | Install the speech model, while it is missing |
 
-H and the monitor volume keys (`,` and `.`) belong to monitoring, which isn't available yet.
+H and the monitor volume keys (`,` and `.`) belong to monitoring, which isn't available yet; pressed now, they say so.
 
 The menu bar has **About Takewise**, **Open Project…** (⌘O), **Install Command Line Tool…**, **Quit** (⌘Q), **Minimize** (⌘M) and **Zoom**, and a **Help** menu that opens this README, these keys, the release notes of your version and a new issue.
 
