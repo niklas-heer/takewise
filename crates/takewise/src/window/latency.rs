@@ -12,7 +12,7 @@ use takewise_core::{self as tw, CalibrationInfo, Route};
 
 use takewise_media::DeviceLookup;
 
-use super::output::Seen;
+use super::output::{Lookup, Seen};
 use super::setup::{Setup, calibration_needed, line};
 use super::{RecordingWindow, colors};
 use crate::calibrate::{self, Measurement, Run};
@@ -74,8 +74,13 @@ impl RecordingWindow {
         }
         // The beeps play where takes do, never on the system output in
         // place of a missing one.
-        self.sync_output(true)
+        // The beeps start at once: only on a confirmed route.
+        let ready = self
+            .sync_output()
             .map_err(|problem| problem.for_playback())?;
+        if ready == super::output::Ready::Pending {
+            return Err("the output could not be checked just now; press Space again".to_owned());
+        }
         let route = self.current_route();
         let device = route.input.clone().ok_or("No input device chosen.")?;
         let output = route.output.clone().unwrap_or_else(|| "unknown".to_owned());
@@ -160,8 +165,8 @@ impl RecordingWindow {
     /// are set to, or the system's default output.
     fn output_identity(&self) -> OutputIdentity {
         match (&self.film_output, &self.applied_device) {
-            (Some(_), Some((uid, object))) => OutputIdentity::Device(uid.clone(), *object),
-            (Some(_), None) => OutputIdentity::Unknown,
+            (Some(_), Some((uid, Some(object)))) => OutputIdentity::Device(uid.clone(), *object),
+            (Some(_), _) => OutputIdentity::Unknown,
             (None, _) => match self.media.default_output_object() {
                 DeviceLookup::Present(object) => OutputIdentity::System(object),
                 DeviceLookup::Absent | DeviceLookup::Unknown => OutputIdentity::Unknown,
@@ -181,10 +186,10 @@ impl RecordingWindow {
             return;
         };
         let seen = match calibrating.output.clone() {
-            OutputIdentity::Device(uid, object) => self.see(&uid, object),
+            OutputIdentity::Device(uid, object) => self.see(&uid, object, Lookup::Calibration),
             OutputIdentity::System(object) => {
                 let lookup = self.media.default_output_object();
-                self.seen_lookup(lookup, object)
+                self.seen_lookup(lookup, object, Lookup::Calibration)
             }
             // Not known when it began: nothing to compare.
             OutputIdentity::Unknown => return,

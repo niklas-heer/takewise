@@ -79,6 +79,10 @@ pub fn calibration_matches(config: &ProjectConfig, route: &Route) -> bool {
     config.calibration.is_some() && !takewise_core::effective_latency_offset(config, route).1
 }
 
+/// How long a start may wait for its output to be confirmed before it gives
+/// up (the window usually gives up first, after its lookup grace).
+const WAIT_LIMIT_S: f64 = 1.0;
+
 /// Whether a playback or a take's film may start, as the window says from
 /// its output before each tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -158,8 +162,10 @@ pub struct Recorder {
     /// again.
     uncut: Vec<Uncut>,
     /// Whether a playback or a take's film may start at this tick, as the
-    /// window says before each tick from its output.
+    /// window says before each tick from its output, and since when it has
+    /// been told to wait.
     start_hold: StartHold,
+    waiting_since: Option<f64>,
 }
 
 /// A stopped passage that is not published yet.
@@ -433,6 +439,7 @@ impl Recorder {
             unsaved_passages: Vec::new(),
             uncut: Vec::new(),
             start_hold: StartHold::Go,
+            waiting_since: None,
         }
     }
 
@@ -1404,6 +1411,14 @@ impl Recorder {
             if playback.started.is_none() || now < playback.starts_host_s)
     }
 
+    /// Reads whether a take's film has started moving, so that what
+    /// follows in this tick knows it.
+    pub fn track_film(&mut self, media: &dyn Media) {
+        if let Phase::Recording(take) = &mut self.phase {
+            take.clock.track(media);
+        }
+    }
+
     /// A take recording whose film was not seen running yet: not
     /// scheduled, its start to come, or a player that has not moved.
     pub fn film_waiting(&self) -> bool {
@@ -1466,9 +1481,31 @@ impl Recorder {
         }
     }
 
+    /// The window's word for this tick; told to wait for longer than
+    /// [`WAIT_LIMIT_S`], it gives up and says why.
+    fn bounded_hold(&mut self, now: f64) -> StartHold {
+        let hold = mem::take(&mut self.start_hold);
+        if hold != StartHold::Wait {
+            self.waiting_since = None;
+            return hold;
+        }
+        let since = *self.waiting_since.get_or_insert(now);
+        if now - since <= WAIT_LIMIT_S {
+            return StartHold::Wait;
+        }
+        self.waiting_since = None;
+        StartHold::Stop(match self.phase {
+            Phase::Playing(_) => {
+                "The playback stopped: the output could not be checked.".to_owned()
+            }
+            _ => "the output could not be checked, so the film did not start; start the take again"
+                .to_owned(),
+        })
+    }
+
     /// The part of [`Recorder::tick`] that depends on what runs.
     fn tick_phase(&mut self, media: &mut dyn Media, dir: &Path, now: f64) -> Update {
-        let hold = mem::take(&mut self.start_hold);
+        let hold = self.bounded_hold(now);
         match &mut self.phase {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
@@ -1484,7 +1521,17 @@ impl Recorder {
                         media.film_pause();
                         Some(why)
                     }
-                    StartHold::Wait if !take.clock.started() => None,
+                    StartHold::Wait if !take.clock.ran() => {
+                        // Not confirmed: a start already scheduled is
+                        // called off, to be scheduled afresh (its count-in
+                        // with it) once the output is confirmed.
+                        if take.clock.started() {
+                            media.film_pause();
+                            take.clock = FilmClock::new();
+                            take.line_start_host_s = None;
+                        }
+                        None
+                    }
                     _ => start_film(take, media, &progress, now),
                 };
                 let mut message = begin_on_disk(take, dir, &progress);
@@ -1531,6 +1578,15 @@ impl Recorder {
                     }
                 }
                 None if hold == StartHold::Wait => Update::default(),
+                Some(_) if hold == StartHold::Wait && now < playback.starts_host_s => {
+                    // Scheduled, not started, and not confirmed: called off,
+                    // both players, to be scheduled again.
+                    media.stop_take();
+                    media.film_pause();
+                    playback.started = None;
+                    playback.starts_host_s = f64::INFINITY;
+                    Update::default()
+                }
                 None if media.take_ready() && media.film_ready() => {
                     match start_both(media, playback, now) {
                         Ok(tb) => {

@@ -70,8 +70,10 @@ struct Fake {
     objects_unreadable: bool,
     lookups_fail: bool,
     lookups: usize,
-    /// How many times the output devices were listed (by name).
+    /// How many times the output devices were listed (by name), and
+    /// whether listing them fails (finds nothing).
     listings: usize,
+    listing_fails: bool,
     /// Whether an opened take is still loading.
     take_loading: bool,
     /// Where the film plays (`None`: the system default).
@@ -160,6 +162,7 @@ impl FakeMedia {
             lookups_fail: false,
             lookups: 0,
             listings: 0,
+            listing_fails: false,
             take_loading: false,
             film_output: None,
             take: None,
@@ -392,6 +395,9 @@ impl Media for FakeMedia {
     fn output_connected(&self, device: &str) -> bool {
         self.0.borrow_mut().listings += 1;
         let fake = self.0.borrow();
+        if fake.listing_fails {
+            return false;
+        }
         fake.outputs.iter().any(|output| output.name == device)
             || fake.hidden_outputs.iter().any(|name| name == device)
     }
@@ -1700,13 +1706,225 @@ fn a_failed_lookup_is_not_a_drop(cx: &mut TestAppContext) {
     f.media.set_now(300.7);
     frame(cx, f.window);
     f.media.0.borrow_mut().lookups_fail = true;
-    for at in [300.8, 301.0, 301.4] {
+    for at in [300.8, 300.9, 301.0, 301.1, 301.2, 301.3, 301.4] {
         f.media.set_now(at);
         frame(cx, f.window);
     }
     f.media.set_now(301.5);
     press(cx, f.window, &["space"]);
     assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+}
+
+#[gpui_kit::test]
+fn nothing_starts_on_an_unconfirmed_route(cx: &mut TestAppContext) {
+    // Set to the headphones, but their object cannot be read: P waits.
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(
+        f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+        "waiting"
+    );
+    assert_eq!(f.media.0.borrow().take_plays.len(), 0, "not scheduled");
+    // Confirmed: it starts.
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(200.1);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().take_plays.len(),
+        1,
+        "scheduled once confirmed"
+    );
+    press(cx, f.window, &["p"]);
+
+    // Never confirmed: it gives up after the grace, and says so.
+    f.view
+        .update(cx, |view, _| view.choose_output("Test Phones"));
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    f.media.set_now(300.0);
+    press(cx, f.window, &["p"]);
+    for n in 1..=7 {
+        f.media.set_now(300.0 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().take_plays.len(), 1);
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("External Headphones could not be checked"),
+        "{said}"
+    );
+
+    // A take likewise: its film waits, then the take stops keeping audio.
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    let plays = f.media.0.borrow().plays.len();
+    begin(cx, &f, 100.0);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(f.media.0.borrow().plays.len(), plays, "the film waits");
+    for n in 2..=8 {
+        f.media.set_now(100.0 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("could not be checked, so the film did not start"),
+        "{said}"
+    );
+    assert_eq!(recorded(&f.dir).len(), 2, "the audio is kept");
+}
+
+#[gpui_kit::test]
+fn a_scheduled_start_is_called_off_while_unconfirmed_and_scheduled_again(cx: &mut TestAppContext) {
+    // A playback scheduled for 200.3; a read fails at 200.1.
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().take_plays.len(), 1);
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.set_now(200.1);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.recorder.playback_waiting(200.5)),
+        "called off"
+    );
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(200.2);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().take_plays.len(), 2, "scheduled again");
+    press(cx, f.window, &["p"]);
+
+    // A take's film scheduled for 300.4: called off, the take goes on,
+    // and the film is scheduled afresh once confirmed.
+    begin(cx, &f, 300.0);
+    let plays = f.media.0.borrow().plays.len();
+    let pauses = f.media.0.borrow().pauses.len();
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.set_now(300.2);
+    frame(cx, f.window);
+    assert!(f.media.0.borrow().pauses.len() > pauses, "paused");
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(300.3);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(
+        f.media.0.borrow().plays.len(),
+        plays + 1,
+        "scheduled afresh"
+    );
+    let (film_s, host_s) = last_play(&f);
+    assert!(
+        close(film_s, 6.0) && close(host_s, 300.6),
+        "{film_s} {host_s}"
+    );
+    f.media.set_now(300.8);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2, "kept, placed by the new start");
+}
+
+#[gpui_kit::test]
+fn a_film_that_moved_at_the_start_gets_the_warning_not_a_stop(cx: &mut TestAppContext) {
+    // Scheduled for 100.4; no frame until 100.5, when the phones are gone:
+    // the film is read moving first, so the take goes on and warns.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    f.media.set_now(100.6);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+}
+
+#[gpui_kit::test]
+fn a_healthy_route_is_not_judged_by_a_listing(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().listing_fails = true;
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    // A device change and the poll: the route is checked by its object.
+    plug(&f, "Other Speakers");
+    for at in [200.1, 202.5, 205.0] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn failed_reads_far_apart_are_not_a_drop(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    let sets = f.media.0.borrow().output_sets.len();
+    for at in [200.5, 201.2] {
+        // One failed read on a device change, then fine again.
+        f.media.0.borrow_mut().lookups_fail = true;
+        f.media.0.borrow_mut().generation += 1;
+        f.media.set_now(at);
+        frame(cx, f.window);
+        f.media.0.borrow_mut().lookups_fail = false;
+        f.media.set_now(at + 0.05);
+        frame(cx, f.window);
+    }
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(f.media.0.borrow().output_sets.len(), sets);
+}
+
+#[gpui_kit::test]
+fn a_start_does_not_wait_for_ever(cx: &mut TestAppContext) {
+    // Whatever keeps telling it to wait, a take's film gives up.
+    let f = on_test_phones(cx);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    f.media.send(100.05, 2400);
+    settle(cx, &f);
+    for n in 1..=14 {
+        f.media.set_now(100.0 + 0.1 * f64::from(n));
+        f.view.update(cx, |view, _| {
+            view.recorder.hold_start(super::recorder::StartHold::Wait);
+            let update = view.recorder.tick(&mut *view.media, &view.dir);
+            view.show(update);
+        });
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert!(message(cx, &f.view).contains("the output could not be checked"));
+}
+
+#[gpui_kit::test]
+fn a_change_of_system_output_in_the_pre_roll_is_named_once(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0); // line a: the film starts at 102.4
+    f.media.0.borrow_mut().default_output = "External Headphones".to_owned();
+    let listings = f.media.0.borrow().listings;
+    for n in 1..=10 {
+        f.media.set_now(100.1 + 0.2 * f64::from(n));
+        frame(cx, f.window);
+    }
+    assert!(
+        f.media.0.borrow().listings <= listings + 1,
+        "its name read once"
+    );
+    f.media.set_now(102.6);
+    frame(cx, f.window);
+    f.media.set_now(102.7);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("changed from MacBook Speakers to External Headphones"));
 }
 
 #[gpui_kit::test]

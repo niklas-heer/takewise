@@ -628,7 +628,8 @@ pub struct RecordingWindow {
     route_due: bool,
     devices_watched: u64,
     /// The device the players are set to: its UID and CoreAudio object.
-    applied_device: Option<(String, u32)>,
+    /// (Its object is `None` until it was read: the route unconfirmed.)
+    applied_device: Option<(String, Option<u32>)>,
     /// When a playback or a take last polled its output, and the route a
     /// take started on, which it watches.
     output_checked_at: f64,
@@ -638,8 +639,8 @@ pub struct RecordingWindow {
     /// The last take's warning about its output ("Take N of line: …"),
     /// carried into a retake (R) right after it; any other action drops it.
     take_warning: Option<String>,
-    /// Since when device lookups have been failing, while they do.
-    lookup_failed_since: Option<f64>,
+    /// The failing streaks of device lookups, by kind.
+    failing: output::Failures,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -736,7 +737,7 @@ impl RecordingWindow {
             take_route: None,
             ticked_at: None,
             take_warning: None,
-            lookup_failed_since: None,
+            failing: output::Failures::default(),
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1986,17 +1987,21 @@ fn window_actions(
     cx: &mut Context<RecordingWindow>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     root.on_action(cx.listener(|view, _: &InstallModel, _, cx| {
+        view.other_action();
         view.install_model();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &InstallCommand, _, cx| {
+        view.other_action();
         view.message = Some(crate::cli_install::install());
         cx.notify();
     }))
-    .on_action(cx.listener(|_, _: &start::OpenProject, window, cx| {
+    .on_action(cx.listener(|view, _: &start::OpenProject, window, cx| {
+        view.other_action();
         RecordingWindow::choose_folder(window, cx);
     }))
     .on_action(cx.listener(|view, _: &CloseWindow, window, cx| {
+        view.other_action();
         cx.notify();
         if view.may_close() {
             window.remove_window();
