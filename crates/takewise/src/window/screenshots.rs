@@ -619,7 +619,10 @@ impl Media for DemoMedia {
     fn default_output(&self) -> Option<String> {
         Some(SPEAKERS.to_owned())
     }
-    fn set_output(&mut self, device: &str) -> Result<(), String> {
+    fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
+        let Some(device) = device else {
+            return Ok(());
+        };
         if self.outputs().iter().any(|output| output.name == device) {
             Ok(())
         } else {

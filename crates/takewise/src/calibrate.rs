@@ -493,7 +493,7 @@ pub fn measure(
     let output = output.or(project.config.output.device.as_deref());
     let output = match output {
         Some(name) => {
-            media.set_output(name)?;
+            media.set_output(Some(name))?;
             name.to_owned()
         }
         None => default_output().map_or_else(|_| "unknown".to_owned(), |d| d.name),

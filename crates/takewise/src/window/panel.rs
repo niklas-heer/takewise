@@ -204,14 +204,22 @@ impl RecordingWindow {
         let Some(note) = self.change_route(None, Some(name)) else {
             return;
         };
-        let said = match self.media.set_output(name) {
+        let said = match self.media.set_output(Some(name)) {
             Ok(()) => {
                 self.film_output = Some(name.to_owned());
                 self.check_inputs();
                 format!("The film and your takes play through {name}.")
             }
             Err(err) => {
-                format!("Saved {name} as the output, but cannot play there: {err}")
+                // A playback goes on where it was only if nothing changed;
+                // the narrator asked to hear it elsewhere, so it stops.
+                let stopped = if self.recorder.is_playing() {
+                    self.recorder.stop_playback(&mut *self.media);
+                    " Playback stopped."
+                } else {
+                    ""
+                };
+                format!("Saved {name} as the output, but cannot play there: {err}.{stopped}")
             }
         };
         self.message = Some(format!("{said}{note}"));
@@ -223,7 +231,7 @@ impl RecordingWindow {
         let Some(name) = self.project.config.output.device.clone() else {
             return;
         };
-        if let Err(err) = self.media.set_output(&name) {
+        if let Err(err) = self.media.set_output(Some(&name)) {
             self.film_output = None;
             let fallback = self
                 .media

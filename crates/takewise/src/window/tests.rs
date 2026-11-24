@@ -50,6 +50,9 @@ struct Fake {
     film_output: Option<String>,
     /// The take open for playback, if one is.
     take: Option<OpenTake>,
+    /// Why `set_output` fails while a take is open, when it does: it then
+    /// changes nothing, as the real media.
+    take_output_error: Option<String>,
     film_gain_db: Option<f64>,
     /// The device and channel of the last capture started.
     capture_input: Option<(String, u16)>,
@@ -120,6 +123,7 @@ impl FakeMedia {
             ],
             film_output: None,
             take: None,
+            take_output_error: None,
             film_gain_db: None,
             capture_input: None,
             channel_meter: None,
@@ -305,14 +309,21 @@ impl Media for FakeMedia {
     fn default_output(&self) -> Option<String> {
         Some("MacBook Speakers".to_owned())
     }
-    fn set_output(&mut self, device: &str) -> Result<(), String> {
+    fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
         let mut fake = self.0.borrow_mut();
-        if !fake.outputs.iter().any(|output| output.name == device) {
+        if let Some(device) = device
+            && !fake.outputs.iter().any(|output| output.name == device)
+        {
             return Err(format!("no output device named {device:?}"));
         }
-        fake.film_output = Some(device.to_owned());
+        if fake.take.is_some()
+            && let Some(err) = fake.take_output_error.clone()
+        {
+            return Err(err);
+        }
+        fake.film_output = device.map(str::to_owned);
         if let Some(take) = &mut fake.take {
-            take.output = Some(device.to_owned());
+            take.output = device.map(str::to_owned);
         }
         Ok(())
     }
@@ -851,6 +862,47 @@ fn play_in_context_locks_the_take_to_the_film(cx: &mut TestAppContext) {
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
     press(cx, f.window, &["p"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn an_output_the_take_cannot_use_changes_nothing_and_stops_playback(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.view
+        .update(cx, |view, _| view.choose_output("Test Phones"));
+    press(cx, f.window, &["down", "down", "down"]); // d
+    record_take(cx, &f);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+
+    f.media.0.borrow_mut().take_output_error = Some("the take refused".to_owned());
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("cannot play there: the take refused. Playback stopped."),
+        "{said}"
+    );
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    let fake = f.media.0.borrow();
+    assert_eq!(
+        fake.film_output.as_deref(),
+        Some("Test Phones"),
+        "the film stays"
+    );
+    assert_eq!(
+        fake.take.as_ref().and_then(|take| take.output.as_deref()),
+        Some("Test Phones"),
+        "and the take with it"
+    );
+    drop(fake);
+    assert_eq!(
+        f.view
+            .read_with(cx, |view, _| view.film_output.clone())
+            .as_deref(),
+        Some("Test Phones")
+    );
 }
 
 #[gpui_kit::test]

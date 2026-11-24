@@ -137,6 +137,13 @@ pub(crate) fn find_output(name_wanted: &str) -> Result<cpal::Device> {
     Err(Error::NoOutputDevice(name_wanted.to_owned()))
 }
 
+/// The CoreAudio UID of the output device with exactly this name: what
+/// [`crate::FilmPlayer::set_output_uid`] and
+/// [`crate::TakePlayer::set_output_uid`] take.
+pub fn output_uid(name: &str) -> Result<String> {
+    uid(&find_output(name)?)
+}
+
 /// The device's CoreAudio UID.
 pub(crate) fn uid(device: &cpal::Device) -> Result<String> {
     Ok(device.id()?.id().to_owned())

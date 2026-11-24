@@ -66,9 +66,10 @@ pub trait Media {
     /// The name of the system's default output device.
     fn default_output(&self) -> Option<String>;
     /// Plays the film and the takes through the output device with this
-    /// name: the film and an open take at once, and every film and take
-    /// opened later.
-    fn set_output(&mut self, device: &str) -> Result<(), String>;
+    /// name (`None`: the system's default output): the film and an open
+    /// take at once, and every film and take opened later. All or nothing:
+    /// when it fails, both keep the output they had.
+    fn set_output(&mut self, device: Option<&str>) -> Result<(), String>;
     /// Starts metering every channel of `device` (replacing any meter).
     fn start_channel_meter(&mut self, device: &str) -> Result<(), String>;
     fn stop_channel_meter(&mut self);
@@ -238,15 +239,18 @@ impl Media for RealMedia {
         takewise_media::default_output().ok().map(|d| d.name)
     }
 
-    fn set_output(&mut self, device: &str) -> Result<(), String> {
-        self.film
-            .set_output_device(device)
+    fn set_output(&mut self, device: Option<&str>) -> Result<(), String> {
+        // One lookup for both players: once the device is found, setting
+        // its UID cannot fail, so the film and the take never part.
+        let uid = device
+            .map(takewise_media::output_uid)
+            .transpose()
             .map_err(|err| err.to_string())?;
-        self.output = Some(device.to_owned());
+        self.film.set_output_uid(uid.as_deref());
         if let Some(take) = &self.take {
-            take.set_output_device(device)
-                .map_err(|err| err.to_string())?;
+            take.set_output_uid(uid.as_deref());
         }
+        self.output = device.map(str::to_owned);
         Ok(())
     }
 

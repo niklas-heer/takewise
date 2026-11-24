@@ -135,14 +135,17 @@ impl Av {
     /// Plays through the output device with this name instead of the
     /// system's default output.
     fn set_output_device(&self, name: &str) -> Result<()> {
-        let uid = crate::devices::uid(&crate::devices::find_output(name)?)?;
-        // SAFETY: a main-thread AVPlayer setter (macOS only) with a CoreAudio
-        // device UID.
-        unsafe {
-            self.player
-                .setAudioOutputDeviceUniqueID(Some(&NSString::from_str(&uid)));
-        };
+        self.set_output_uid(Some(&crate::devices::output_uid(name)?));
         Ok(())
+    }
+
+    /// Plays through the output device with this CoreAudio UID, or with
+    /// `None` through the system's default output.
+    fn set_output_uid(&self, uid: Option<&str>) {
+        let uid = uid.map(NSString::from_str);
+        // SAFETY: a main-thread AVPlayer setter (macOS only) with a CoreAudio
+        // device UID, or nil for the default output.
+        unsafe { self.player.setAudioOutputDeviceUniqueID(uid.as_deref()) };
     }
 
     /// The UID of the output device set with `set_output_device`; `None`
@@ -253,6 +256,12 @@ impl FilmPlayer {
         self.av.set_output_device(name)
     }
 
+    /// Plays through the output device with this UID (see
+    /// [`crate::output_uid`]), or with `None` the system's default output.
+    pub fn set_output_uid(&self, uid: Option<&str>) {
+        self.av.set_output_uid(uid);
+    }
+
     /// The UID of the output device the film plays through; `None` while it
     /// follows the system's default output.
     pub fn output_device_uid(&self) -> Option<String> {
@@ -327,6 +336,13 @@ impl TakePlayer {
     /// system's default output, also while the take plays.
     pub fn set_output_device(&self, name: &str) -> Result<()> {
         self.av.set_output_device(name)
+    }
+
+    /// Plays through the output device with this UID (see
+    /// [`crate::output_uid`]), or with `None` the system's default output,
+    /// also while the take plays.
+    pub fn set_output_uid(&self, uid: Option<&str>) {
+        self.av.set_output_uid(uid);
     }
 
     /// The UID of the output device the take plays through; `None` while it
