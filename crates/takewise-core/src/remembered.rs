@@ -139,6 +139,24 @@ pub fn read(path: &Path) -> Result<Remembered> {
 /// lock, reads it, lets `change` edit it with the folder it lives in, and
 /// writes it back atomically when it changed.
 fn update<T>(path: &Path, change: impl FnOnce(&mut Remembered, &Path) -> Result<T>) -> Result<T> {
+    update_then(path, change, |_, _| {})
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITES_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`update`], then `then` with what is now on disk and its folder, still
+/// under the lock: for what may only happen once the file is committed,
+/// such as removing the files it no longer refers to. When the file cannot
+/// be written, `then` does not run, and everything the file on disk refers
+/// to is still there.
+fn update_then<T>(
+    path: &Path,
+    change: impl FnOnce(&mut Remembered, &Path) -> Result<T>,
+    then: impl FnOnce(&Remembered, &Path),
+) -> Result<T> {
     #[cfg(test)]
     assert!(
         path.starts_with(std::env::temp_dir())
@@ -165,8 +183,14 @@ fn update<T>(path: &Path, change: impl FnOnce(&mut Remembered, &Path) -> Result<
             path: path.to_path_buf(),
             message: err.to_string(),
         })?;
+        #[cfg(test)]
+        if WRITES_FAIL.get() {
+            let failed = std::io::Error::other("the store could not be written (test)");
+            return Err(io(path)(failed));
+        }
         write_atomic(path, &text)?;
     }
+    then(&remembered, dir);
     Ok(out)
 }
 
@@ -278,7 +302,9 @@ pub fn latency_note(config: &ProjectConfig, route: &Route) -> Option<String> {
 /// Remembers a setup check's result, saved in the project `dir` with the
 /// room tone `tone`, for its exact input, channel and output, with a copy
 /// of the room tone in `rooms/`. Results and room tones from days before
-/// `today` (the local day) are pruned.
+/// `today` (the local day) are pruned: the room tones only after
+/// `remembered.json` is committed without them, so a failed write leaves
+/// every room tone the file on disk still names.
 pub fn remember_setup(
     path: &Path,
     dir: &Path,
@@ -287,22 +313,25 @@ pub fn remember_setup(
     today: jiff::civil::Date,
 ) -> Result<()> {
     let today = today.to_string();
-    update(path, |remembered, home| {
-        let rooms = home.join(ROOMS_DIR);
-        let copy = copy_room_tone(&dir.join(&tone.file), tone, &rooms, ROOMS_DIR)?;
-        remembered.setup.retain(|known| {
-            known.setup.date == today && !known.on(&info.input, info.channel, &info.output)
-        });
-        remembered.setup.push(RememberedSetup {
-            setup: SetupInfo {
-                from: None,
-                ..info.clone()
-            },
-            room_tone: copy,
-        });
-        prune_rooms(&rooms, &remembered.setup);
-        Ok(())
-    })
+    update_then(
+        path,
+        |remembered, home| {
+            let rooms = home.join(ROOMS_DIR);
+            let copy = copy_room_tone(&dir.join(&tone.file), tone, &rooms, ROOMS_DIR)?;
+            remembered.setup.retain(|known| {
+                known.setup.date == today && !known.on(&info.input, info.channel, &info.output)
+            });
+            remembered.setup.push(RememberedSetup {
+                setup: SetupInfo {
+                    from: None,
+                    ..info.clone()
+                },
+                room_tone: copy,
+            });
+            Ok(())
+        },
+        |remembered, home| prune_rooms(&home.join(ROOMS_DIR), &remembered.setup),
+    )
 }
 
 /// Removes every file in `rooms` that no remembered setup refers to: the
@@ -827,6 +856,53 @@ mod tests {
         assert_eq!(remembered.setup.len(), 1);
         assert_eq!(remembered.setup[0].setup.room_floor_dbfs, Some(-62.0));
         assert_eq!(fs::read_dir(&rooms).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_failed_store_write_keeps_the_room_tone_it_still_names() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = project(&tmp, "p.takewise");
+        setup_check(&home, &dir, "2026-11-24T09:00:00Z", -60.0);
+        let before = fs::read(&home.remembered).unwrap();
+        let rooms = home.remembered.with_file_name(ROOMS_DIR);
+        let old = rooms.join("20261124T090000Z.wav");
+        assert!(old.is_file());
+
+        // The check runs again; its room tone is copied, then the store
+        // cannot be written.
+        let at: jiff::Timestamp = "2026-11-24T10:00:00Z".parse().unwrap();
+        let input = RoomInput {
+            input: DUO,
+            channel: 1,
+            output: XM5,
+            floor_dbfs: -62.0,
+            gated: false,
+        };
+        let tone = save_room_tone(&dir, &[5, -5, 4], 48_000, at, &input).unwrap();
+        let info = read_config(&dir).unwrap().setup.unwrap();
+        WRITES_FAIL.set(true);
+        let failed = remember_setup(&home.remembered, &dir, &info, &tone, day("2026-11-24"));
+        WRITES_FAIL.set(false);
+        assert!(failed.is_err());
+        assert!(rooms.join("20261124T100000Z.wav").is_file(), "copied");
+
+        // The store still names the earlier room tone, and still has it.
+        assert_eq!(fs::read(&home.remembered).unwrap(), before);
+        assert!(old.is_file(), "the room tone the store names was removed");
+        let fresh = project(&tmp, "fresh.takewise");
+        let config = read_config(&fresh).unwrap();
+        let today = day("2026-11-24");
+        let adopted = adopt_setup(&home.remembered, &fresh, &config, &route(512), today);
+        assert!(adopted.unwrap().is_some(), "still adoptable");
+        let tones = room_tones(&fresh).unwrap();
+        let (samples, _) = read_take_wav(&fresh.join(&tones[0].file)).unwrap();
+        assert_eq!(samples, [3, -3, 2]);
+
+        // Once the store is written, the replaced room tone goes.
+        remember_setup(&home.remembered, &dir, &info, &tone, today).unwrap();
+        assert!(!old.exists());
+        assert_eq!(fs::read_dir(&rooms).unwrap().count(), 2, "WAV and sidecar");
     }
 
     #[test]
