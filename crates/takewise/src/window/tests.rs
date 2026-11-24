@@ -3942,3 +3942,51 @@ fn the_setup_check_and_its_calibration_are_remembered(cx: &mut TestAppContext) {
         "# untouched\n"
     );
 }
+
+#[gpui_kit::test]
+fn the_line_list_scrolls_to_keep_the_current_line_in_view(cx: &mut TestAppContext) {
+    let script = (0..60).fold(String::new(), |script, i| {
+        let start = f64::from(i) * 0.3;
+        format!(
+            "{script}[[line]]\nid = \"l{i:02}\"\nstart = {start:.1}\nend = {:.1}\ntext = \"Line {i}.\"\n\n",
+            start + 0.2
+        )
+    });
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        fs::write(dir.join("script.toml"), &script).expect("script");
+    });
+    let in_view = |cx: &mut TestAppContext, idx: usize| {
+        frame(cx, f.window);
+        f.view.read_with(cx, |view, _| {
+            let list = view.lines_scroll.bounds();
+            let row = view.lines_scroll.bounds_for_item(idx).expect("the row");
+            let offset = view.lines_scroll.offset().y;
+            row.top() + offset >= list.top() && row.bottom() + offset <= list.bottom()
+        })
+    };
+    assert!(in_view(cx, 0));
+    assert!(!in_view(cx, 45), "the list is longer than its space");
+
+    press(cx, f.window, &["down"; 45]);
+    assert_eq!(f.view.read_with(cx, |view, _| view.line), 45);
+    assert!(in_view(cx, 45), "scrolled down to the current line");
+    assert!(!in_view(cx, 0));
+    // Just enough: the line became the last one in view.
+    assert!(!in_view(cx, 46));
+
+    press(cx, f.window, &["up"; 45]);
+    assert!(in_view(cx, 0), "and back up");
+
+    // A reload that moves the current line (an agent removed lines above
+    // it) follows it too.
+    press(cx, f.window, &["down"; 59]);
+    assert!(in_view(cx, 59));
+    let kept: String = script
+        .split("[[line]]")
+        .skip(51)
+        .fold(String::new(), |all, line| all + "[[line]]" + line);
+    fs::write(f.dir.join("script.toml"), kept).expect("script");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(f.view.read_with(cx, |view, _| view.line), 9);
+    assert!(in_view(cx, 9));
+}

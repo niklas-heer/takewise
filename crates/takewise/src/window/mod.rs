@@ -39,8 +39,8 @@ use gpui_kit::base::slider::SliderEvent;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Global,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use std::sync::Arc;
 
@@ -450,6 +450,10 @@ pub struct RecordingWindow {
     /// the last frame (with the text it laid out).
     scroll: prompter::Scroll,
     text_layout: Option<(String, gpui_kit::TextLayout)>,
+    /// The line list's scroll position, and the current line it was last
+    /// scrolled to show.
+    lines_scroll: ScrollHandle,
+    lines_shown: Option<usize>,
     /// The setup check while it is open (C).
     setup: Option<setup::Setup>,
     /// Why the setup check should run (none ran, or the devices changed),
@@ -560,6 +564,8 @@ impl RecordingWindow {
             defaults_path: None,
             scroll: prompter::Scroll::default(),
             text_layout: None,
+            lines_scroll: ScrollHandle::new(),
+            lines_shown: None,
             setup: None,
             setup_offer: None,
             model: None,
@@ -984,8 +990,14 @@ impl RecordingWindow {
         self.scroll.at(now)
     }
 
-    /// The lines and the current line's takes.
-    fn side_column(&self) -> gpui_kit::AnyElement {
+    /// The lines and the current line's takes. The line list scrolls just
+    /// enough to show the current line whenever that changed: with the
+    /// arrows, with a passage take moving on, or with a reload.
+    fn side_column(&mut self) -> gpui_kit::AnyElement {
+        if self.lines_shown != Some(self.line) {
+            self.lines_shown = Some(self.line);
+            self.lines_scroll.scroll_to_item(self.line);
+        }
         div()
             .w(px(300.))
             .h_full()
@@ -996,6 +1008,7 @@ impl RecordingWindow {
                 &self.state,
                 self.line,
                 self.recorder.recording_line(),
+                &self.lines_scroll,
             ))
             .child(takes::takes(
                 self.line_state(),
@@ -1424,6 +1437,7 @@ impl Render for RecordingWindow {
         };
         let offer = self.render_setup_offer();
         let model_view = self.render_model_banner(cx);
+        let side_column = self.side_column();
 
         let root = div()
             .id("recording-window")
@@ -1471,7 +1485,7 @@ impl Render for RecordingWindow {
                     )
                     .children(panel_view)
                     .children(setup_view)
-                    .child(self.side_column()),
+                    .child(side_column),
             )
             .children(model_view)
             .children(offer)

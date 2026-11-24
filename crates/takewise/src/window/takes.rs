@@ -1,7 +1,7 @@
 //! The takes of the current line with their effective verdicts and the
 //! reason for each ("checking…" while a check runs): a hollow star for the
 //! proposed take once its check passed or asks for listening, a filled one
-//! for the chosen take.
+//! for the chosen take. A take cut from a passage says which piece it is.
 
 use gpui_kit::{
     AnyElement, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -44,6 +44,13 @@ pub fn star(line: &LineState, take: &TakeState, checking: bool) -> &'static str 
     } else {
         ""
     }
+}
+
+/// What marks a take cut from a passage: "passage 2/3" for the second of
+/// its three pieces. A take recorded on its own has no mark.
+pub fn passage_mark(take: &TakeState) -> Option<String> {
+    let piece = take.passage.as_ref()?;
+    Some(format!("passage {}/{}", piece.index + 1, piece.count))
 }
 
 /// `checking`: the line's takes whose check is running or queued;
@@ -103,11 +110,20 @@ pub fn takes(
                         .child(
                             div()
                                 .flex()
+                                .items_baseline()
                                 .gap(px(10.))
                                 .child(format!("{}", take.take))
                                 .child(div().text_color(rgb(color)).child(text))
                                 .when(clipped.contains(&take.take), |el| {
                                     el.child(div().text_color(rgb(colors::RECORD)).child("clipped"))
+                                })
+                                .when_some(passage_mark(take), |el, mark| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(colors::FAINT))
+                                            .child(mark),
+                                    )
                                 }),
                         )
                         .child(div().text_color(rgb(colors::ACCENT)).child(star)),
@@ -173,6 +189,21 @@ mod tests {
             assert_eq!(star(&l, &l.takes[0], false), expected, "{verdict:?}");
             assert_eq!(star(&l, &l.takes[0], true), "", "checking {verdict:?}");
         }
+    }
+
+    #[test]
+    fn a_take_cut_from_a_passage_says_which_piece_it_is() {
+        let mut piece = take(1, Some(Verdict::Keep));
+        assert_eq!(passage_mark(&piece), None, "recorded on its own");
+        piece.passage = Some(takewise_core::PassagePiece {
+            id: "0a1b".to_owned(),
+            index: 1,
+            count: 3,
+            from_sample: 48_000,
+            to_sample: 96_000,
+            preroll_floor_dbfs: -70.0,
+        });
+        assert_eq!(passage_mark(&piece).as_deref(), Some("passage 2/3"));
     }
 
     #[test]
