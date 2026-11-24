@@ -211,6 +211,11 @@ fn play_silence_through(wav: &std::path::Path, name: &str) -> Outcome {
     ensure(uid.as_deref() == Some(expected.as_str()), || {
         format!("the take is set to {uid:?}, not {name:?} ({expected})")
     })?;
+    let object = takewise_media::output_object(&expected);
+    println!("    its CoreAudio object: {object:?}");
+    ensure(object.is_some(), || {
+        format!("no CoreAudio object for {name:?} ({expected})")
+    })?;
     let loading = Instant::now();
     while !take.is_ready() {
         ensure(loading.elapsed() < Duration::from_secs(10), || {
