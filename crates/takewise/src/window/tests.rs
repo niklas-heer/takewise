@@ -3335,11 +3335,16 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
     cx.update(super::menu_actions);
     let names: Vec<_> = super::menus().into_iter().map(|menu| menu.name).collect();
     assert_eq!(names, ["Takewise", "File", "Window", "Help"]);
-    cx.update(|cx| {
+    act(cx, f.window, |window, cx| {
         for menu in super::menus() {
             for item in menu.items {
                 if let gpui_kit::MenuItem::Action { name, action, .. } = item {
-                    assert!(cx.is_action_available(&*action), "{name} does nothing");
+                    // Handled by the window or by the app.
+                    let here = window.is_action_available(&*action, cx);
+                    assert!(
+                        here || cx.is_action_available(&*action),
+                        "{name} does nothing"
+                    );
                 }
             }
         }
@@ -3367,10 +3372,49 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
         cx.opened_url().as_deref(),
         Some("https://github.com/niklas-heer/takewise/issues/new")
     );
-    // Window › Minimize and Zoom act on the window in front.
-    cx.dispatch_action(f.window, super::Minimize);
+}
+
+// GPUI's test window panics in minimize() and zoom() ("not implemented"),
+// so these pass only when the action reaches the window's own minimize
+// or zoom; an action handled where the window cannot be reached would not.
+#[gpui_kit::test]
+#[should_panic(expected = "not implemented")]
+fn window_minimize_reaches_the_window(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    cx.update(super::menu_actions);
+    press(cx, f.window, &["cmd-m"]);
+}
+
+#[gpui_kit::test]
+#[should_panic(expected = "not implemented")]
+fn window_zoom_reaches_the_window(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    cx.update(super::menu_actions);
     cx.dispatch_action(f.window, super::Zoom);
-    assert_eq!(cx.windows().len(), 1);
+}
+
+#[gpui_kit::test]
+fn command_w_closes_the_window_and_command_q_quits(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    cx.update(super::menu_actions);
+    press(cx, f.window, &["-"]);
+    press(cx, f.window, &["cmd-w"]);
+    assert_eq!(cx.windows().len(), 0, "closed");
+    assert_eq!(config(&f.dir).record.film_gain_db, -13.0, "shut down first");
+}
+
+#[gpui_kit::test]
+fn command_w_keeps_a_window_with_audio_only_in_memory(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    cx.update(super::menu_actions);
+    // A file where line a's takes belong: its take cannot be saved.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/a"), b"").expect("blocker");
+    record_take(cx, &f);
+    assert_eq!(recorded(&f.dir).len(), 0);
+    press(cx, f.window, &["cmd-w"]);
+    assert_eq!(cx.windows().len(), 1, "it stays");
+    assert!(message(cx, &f.view).starts_with("Not closing: 1 take is only in memory"));
 }
 
 #[gpui_kit::test]

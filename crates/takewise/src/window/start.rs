@@ -20,7 +20,10 @@ use gpui_kit::{
 };
 use takewise_core as tw;
 
-use super::{InstallCommand, colors, focus_open, open_recording, prepare, tell_open};
+use super::{
+    CloseWindow, InstallCommand, Minimize, Zoom, colors, focus_open, open_recording, prepare,
+    tell_open,
+};
 
 gpui_kit::actions!(takewise_start, [OpenProject]);
 
@@ -532,6 +535,9 @@ impl Render for StartWindow {
             .on_action(cx.listener(|_, _: &OpenProject, window, cx| {
                 Self::choose_folder(window, cx);
             }))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|_: &Minimize, window, _| window.minimize_window())
+            .on_action(|_: &Zoom, window, _| window.zoom_window())
             .on_action(cx.listener(|view, _: &InstallCommand, _, cx| {
                 view.message = Some(crate::cli_install::install());
                 cx.notify();
@@ -787,6 +793,15 @@ mod tests {
         cx.dispatch_action(window, OpenProject);
         assert!(cx.did_prompt_for_paths());
         assert_eq!(cx.windows().len(), 1, "no second start window");
+    }
+
+    #[gpui_kit::test]
+    fn command_w_closes_the_start_window(cx: &mut TestAppContext) {
+        open_start(cx, Vec::new());
+        cx.update(super::super::bind_keys);
+        let window = cx.windows()[0];
+        cx.dispatch_action(window, CloseWindow);
+        assert_eq!(cx.windows().len(), 0);
     }
 
     #[gpui_kit::test]

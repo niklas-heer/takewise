@@ -106,6 +106,7 @@ gpui_kit::actions!(
         ShowAll,
         Minimize,
         Zoom,
+        CloseWindow,
         OpenHelp,
         OpenKeys,
         OpenReleaseNotes,
@@ -186,9 +187,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("c", ToggleSetup, Some(SETUP)),
         KeyBinding::new("a", TogglePanel, Some(SETUP)),
         KeyBinding::new("escape", CancelEdit, Some(EDITING)),
-        // ⌘Q first: the menu shows a command's first binding.
         KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-w", Quit, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
@@ -371,6 +371,8 @@ fn menus() -> Vec<Menu> {
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
+            MenuItem::separator(),
+            MenuItem::action("Close Window", CloseWindow),
         ]),
         Menu::new("Help").items([
             MenuItem::action("Takewise Help", OpenHelp),
@@ -415,16 +417,6 @@ fn menu_actions(cx: &mut App) {
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
-    cx.on_action(|_: &Minimize, cx: &mut App| {
-        if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_, window, _| window.minimize_window());
-        }
-    });
-    cx.on_action(|_: &Zoom, cx: &mut App| {
-        if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_, window, _| window.zoom_window());
-        }
-    });
     cx.on_action(|_: &OpenHelp, cx: &mut App| cx.open_url(HELP_URL));
     cx.on_action(|_: &OpenKeys, cx: &mut App| cx.open_url(KEYS_URL));
     cx.on_action(|_: &OpenReleaseNotes, cx: &mut App| cx.open_url(RELEASE_NOTES_URL));
@@ -462,7 +454,7 @@ fn focus_open(dir: &Path, cx: &mut App) -> bool {
     })
 }
 
-/// Quitting (⌘Q, ⌘W, the menu): whether a recording window still holds
+/// Quitting (⌘Q, the menu): whether a recording window still holds
 /// audio only in memory, so the app must not quit. Each window first stops
 /// its take and tries once more to save; one that still holds audio says
 /// why it stays open and comes to the front.
@@ -749,11 +741,7 @@ impl RecordingWindow {
         window.on_window_should_close(cx, move |_, cx| {
             this.update(cx, |view, cx| {
                 cx.notify();
-                if view.keeps_unsaved_audio() {
-                    return false;
-                }
-                view.shutdown();
-                true
+                view.may_close()
             })
             .unwrap_or(true)
         });
@@ -761,6 +749,17 @@ impl RecordingWindow {
             view.shutdown();
             async {}
         })
+    }
+
+    /// Whether the window may close now (its close button, ⌘W): not while
+    /// audio is only in memory (see `keeps_unsaved_audio`); else it shuts
+    /// down and may.
+    fn may_close(&mut self) -> bool {
+        if self.keeps_unsaved_audio() {
+            return false;
+        }
+        self.shutdown();
+        true
     }
 
     /// Adopts takes left by a recording that ended without a commit (a
@@ -1903,6 +1902,33 @@ fn audio_actions(
     }))
 }
 
+/// The menu bar's commands the window handles itself: installing, Open
+/// Project…, and closing, minimizing or zooming this window.
+fn window_actions(
+    root: gpui_kit::Stateful<gpui_kit::Div>,
+    cx: &mut Context<RecordingWindow>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    root.on_action(cx.listener(|view, _: &InstallModel, _, cx| {
+        view.install_model();
+        cx.notify();
+    }))
+    .on_action(cx.listener(|view, _: &InstallCommand, _, cx| {
+        view.message = Some(crate::cli_install::install());
+        cx.notify();
+    }))
+    .on_action(cx.listener(|_, _: &start::OpenProject, window, cx| {
+        RecordingWindow::choose_folder(window, cx);
+    }))
+    .on_action(cx.listener(|view, _: &CloseWindow, window, cx| {
+        cx.notify();
+        if view.may_close() {
+            window.remove_window();
+        }
+    }))
+    .on_action(|_: &Minimize, window, _| window.minimize_window())
+    .on_action(|_: &Zoom, window, _| window.zoom_window())
+}
+
 /// The keys for lines and takes: record, choose and play (with Shift the
 /// whole passage), mark, edit and the arrows.
 fn take_actions(
@@ -1977,18 +2003,7 @@ impl Render for RecordingWindow {
             .id("recording-window")
             .key_context(key_context)
             .track_focus(&self.focus);
-        take_actions(audio_actions(root, cx), cx)
-            .on_action(cx.listener(|view, _: &InstallModel, _, cx| {
-                view.install_model();
-                cx.notify();
-            }))
-            .on_action(cx.listener(|view, _: &InstallCommand, _, cx| {
-                view.message = Some(crate::cli_install::install());
-                cx.notify();
-            }))
-            .on_action(cx.listener(|_, _: &start::OpenProject, window, cx| {
-                Self::choose_folder(window, cx);
-            }))
+        window_actions(take_actions(audio_actions(root, cx), cx), cx)
             .size_full()
             .flex()
             .flex_col()
