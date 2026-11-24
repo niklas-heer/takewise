@@ -214,6 +214,14 @@ pub fn remember_latency(path: &Path, offset_ms: i32, info: &CalibrationInfo) -> 
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once in [`sync_latency`] on this thread, when it has read the
+    /// measurement for the route and has not yet decided for the project.
+    static BEFORE_LATENCY_DECISION: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// What [`sync_latency`] did to the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LatencySync {
@@ -242,7 +250,16 @@ pub enum LatencySync {
 /// `config` is the project as the caller read it, which may be a while
 /// ago (the window's copy). Whether the project's calibration gives way is
 /// decided again from the file, under the project lock that writes the
-/// copy: a measurement stored in the project since is never replaced.
+/// copy: a measurement stored in the project since is never replaced, and
+/// a project that has been set to other devices or another channel since
+/// (`[input] device`, `channel`, `[output] device`) gets nothing, because
+/// `route` is then no longer the one it records on.
+///
+/// The store's lock is held until the project has decided, so the
+/// measurement copied is the newest remembered at that moment: one read
+/// earlier cannot be written after a newer one has reached the project.
+/// The project lock is taken inside the store's, as in [`adopt_setup`];
+/// nothing takes them the other way round.
 pub fn sync_latency(
     path: &Path,
     dir: &Path,
@@ -254,7 +271,9 @@ pub fn sync_latency(
         .as_ref()
         .filter(|cal| !cal.is_remembered())
         .and_then(|cal| RememberedLatency::of(config.input.latency_offset_ms, cal));
-    let found = update(path, |remembered, _| {
+    let selected = Route::of(config);
+    let mut synced = Ok(LatencySync::Unchanged);
+    let stored = update(path, |remembered, _| {
         if let Some(own) = own {
             match remembered.latency.iter_mut().find(|k| k.same_route(&own)) {
                 Some(known) if known.date < own.date => *known = own,
@@ -262,21 +281,38 @@ pub fn sync_latency(
                 None => remembered.latency.push(own),
             }
         }
-        Ok(remembered.latency.iter().find(|k| k.fits(route)).cloned())
-    })?;
-    let Some(remembered) = found else {
-        return Ok(LatencySync::Unchanged);
-    };
-    let applied = set_calibration_when(dir, |on_disk| {
-        let fits = on_disk.calibration.is_some() && calibration_stale(on_disk, route).is_none();
-        (!fits || superseded(on_disk, &remembered))
-            .then(|| (remembered.latency_offset_ms, remembered.calibration()))
-    })?;
-    Ok(if applied {
-        LatencySync::Applied(remembered)
-    } else {
-        LatencySync::Unchanged
-    })
+        let Some(found) = remembered.latency.iter().find(|k| k.fits(route)).cloned() else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if let Some(pause) = BEFORE_LATENCY_DECISION.take() {
+            pause();
+        }
+        // A project that cannot be written does not keep its own
+        // measurement from being remembered.
+        synced = set_calibration_when(dir, |on_disk| {
+            if Route::of(on_disk) != selected {
+                return None;
+            }
+            let fits = on_disk.calibration.is_some() && calibration_stale(on_disk, route).is_none();
+            (!fits || superseded(on_disk, &found))
+                .then(|| (found.latency_offset_ms, found.calibration()))
+        })
+        .map(|applied| {
+            if applied {
+                LatencySync::Applied(found)
+            } else {
+                LatencySync::Unchanged
+            }
+        });
+        Ok(())
+    });
+    // What was copied into the project counts, whatever became of the
+    // store afterwards.
+    match synced {
+        Ok(LatencySync::Unchanged) => stored.map(|()| LatencySync::Unchanged),
+        synced => synced,
+    }
 }
 
 /// Whether the project's calibration is a copy that `remembered`, the
@@ -391,7 +427,10 @@ fn prune_rooms(rooms: &Path, kept: &[RememberedSetup]) {
 /// today's check. Whether the project still lacks one is decided again
 /// from the file, under the project lock that writes `[setup]`, before
 /// the room tone is copied in: a check that ran in the project since is
-/// never replaced.
+/// never replaced, and a project that has been set to other devices or
+/// another channel since (`[input] device`, `channel`, `[output] device`)
+/// adopts nothing, because `route` is then no longer the one it records
+/// on.
 pub fn adopt_setup(
     path: &Path,
     dir: &Path,
@@ -414,6 +453,7 @@ pub fn adopt_setup(
     if has_own(config) || !path.is_file() {
         return Ok(None);
     }
+    let selected = Route::of(config);
     // The project lock is taken inside the store's: nothing takes them
     // the other way round.
     update(path, |remembered, home| {
@@ -430,7 +470,7 @@ pub fn adopt_setup(
         };
         let wav = home.join(&known.room_tone.file);
         let written = set_setup_when(dir, |on_disk| {
-            if has_own(on_disk) {
+            if has_own(on_disk) || Route::of(on_disk) != selected {
                 return Ok(None);
             }
             import_room_tone(dir, &wav, &known.room_tone)?;
@@ -452,6 +492,7 @@ mod tests {
 
     const DUO: &str = "RODECaster Duo Main Stereo";
     const XM5: &str = "WH-1000XM5";
+    const WIRED: &str = "External Headphones";
 
     struct Home {
         _tmp: tempfile::TempDir,
@@ -739,6 +780,91 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_view_of_the_route_does_not_replace_a_measurement_on_the_new_one() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        // Remembered for the Bluetooth headphones.
+        remember_latency(&home.remembered, -29, &measured("2026-11-23")).unwrap();
+        let dir = project(&tmp, "open.takewise");
+        // The window read the project while they were its output.
+        let stale = read_config(&dir).unwrap();
+        assert_eq!(stale.output.device.as_deref(), Some(XM5));
+        // Then the project was switched to wired headphones, and its
+        // latency measured on them.
+        crate::edit::set_route(&dir, None, Some(WIRED)).unwrap();
+        let wired = CalibrationInfo {
+            output: WIRED.to_owned(),
+            ..measured("2026-11-24")
+        };
+        set_calibration(&dir, -8, &wired).unwrap();
+
+        // The window syncs for the route it still believes in: the
+        // project is on another one by now, and keeps what it has.
+        assert_eq!(
+            sync_latency(&home.remembered, &dir, &stale, &route(512)).unwrap(),
+            LatencySync::Unchanged
+        );
+        let config = read_config(&dir).unwrap();
+        assert_eq!(config.input.latency_offset_ms, -8);
+        assert_eq!(config.calibration, Some(wired));
+
+        // The same for a project that only chose another input channel,
+        // and has no calibration to lose.
+        let other = project(&tmp, "channel.takewise");
+        let stale = read_config(&other).unwrap();
+        crate::edit::set_route(&other, Some((DUO, 2)), None).unwrap();
+        assert_eq!(
+            sync_latency(&home.remembered, &other, &stale, &route(512)).unwrap(),
+            LatencySync::Unchanged
+        );
+        assert_eq!(read_config(&other).unwrap().calibration, None);
+        // Read again, the project gets the measurement for its route.
+        let fresh = read_config(&other).unwrap();
+        let live = Route {
+            channel: 2,
+            ..route(512)
+        };
+        let synced = sync_latency(&home.remembered, &other, &fresh, &live).unwrap();
+        assert!(matches!(synced, LatencySync::Applied(_)), "{synced:?}");
+    }
+
+    #[test]
+    fn a_measurement_read_earlier_does_not_land_after_a_newer_one() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        remember_latency(&home.remembered, -29, &measured("2026-11-24")).unwrap();
+        let dir = project(&tmp, "open.takewise");
+        let config = read_config(&dir).unwrap();
+
+        // While this sync has read the store and not yet decided for the
+        // project, the latency is measured again elsewhere (the same day,
+        // the headphones reconnected) and another window syncs the
+        // project.
+        let (path, same_dir) = (home.remembered.clone(), dir.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        BEFORE_LATENCY_DECISION.set(Some(Box::new(move || {
+            let other = std::thread::spawn(move || {
+                remember_latency(&path, -34, &measured("2026-11-24")).unwrap();
+                let config = read_config(&same_dir).unwrap();
+                sync_latency(&path, &same_dir, &config, &route(512)).unwrap()
+            });
+            // Time enough to do all of it, were the store not locked.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            tx.send(other).unwrap();
+        })));
+        let first = sync_latency(&home.remembered, &dir, &config, &route(512)).unwrap();
+        assert!(matches!(first, LatencySync::Applied(ref l) if l.latency_offset_ms == -29));
+        let second = rx.recv().unwrap().join().unwrap();
+        assert!(matches!(second, LatencySync::Applied(ref l) if l.latency_offset_ms == -34));
+
+        // The newer measurement is the one remembered, and the one the
+        // project ends up with: the older was not written after it.
+        let remembered = read(&home.remembered).unwrap();
+        assert_eq!(remembered.latency[0].latency_offset_ms, -34);
+        assert_eq!(read_config(&dir).unwrap().input.latency_offset_ms, -34);
+    }
+
+    #[test]
     fn an_existing_project_calibration_becomes_remembered() {
         let home = home();
         let tmp = tempfile::tempdir().unwrap();
@@ -927,6 +1053,36 @@ mod tests {
         let tones = room_tones(&dir).unwrap();
         assert_eq!(tones.len(), 1, "{tones:?}");
         assert!((tones[0].floor_dbfs - -60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_stale_view_of_the_route_does_not_adopt_a_setup_check_for_it() {
+        let home = home();
+        let tmp = tempfile::tempdir().unwrap();
+        let checked = project(&tmp, "checked.takewise");
+        setup_check(&home, &checked, "2026-11-24T09:00:00Z", -70.0);
+        let dir = project(&tmp, "open.takewise");
+        // The window read the project on the devices of that check.
+        let stale = read_config(&dir).unwrap();
+        // Then the project was switched to wired headphones.
+        crate::edit::set_route(&dir, None, Some(WIRED)).unwrap();
+
+        // The window adopts for the route it still believes in: the
+        // project is on another one by now, so nothing is written and no
+        // room tone is copied in.
+        let today = day("2026-11-24");
+        assert_eq!(
+            adopt_setup(&home.remembered, &dir, &stale, &route(512), today).unwrap(),
+            None
+        );
+        assert_eq!(read_config(&dir).unwrap().setup, None);
+        assert_eq!(room_tones(&dir).unwrap(), []);
+
+        // Read again on the devices it is set to, it adopts as before.
+        crate::edit::set_route(&dir, None, Some(XM5)).unwrap();
+        let fresh = read_config(&dir).unwrap();
+        let adopted = adopt_setup(&home.remembered, &dir, &fresh, &route(512), today);
+        assert!(adopted.unwrap().is_some());
     }
 
     #[test]
