@@ -260,7 +260,7 @@ impl RecordingWindow {
         }
         self.volumes.set(level, db);
         match level {
-            Level::Film => self.media.film_set_gain_db(db),
+            Level::Film => self.apply_film_level(),
             Level::Voice => self.media.take_set_gain_db(db),
             // Applied by the monitor once monitoring can run.
             Level::Monitor => {}
@@ -269,6 +269,15 @@ impl RecordingWindow {
             .set_playback_levels(self.volumes.film, self.volumes.voice);
         self.volumes.write_into(&mut self.project.config);
         self.unsaved.note(level, self.media.host_now_s());
+    }
+
+    /// Plays the film at its level, unless the latency measurement's beep
+    /// film is in its place: the beeps play at 0 dB whatever the slider
+    /// says, and the film gets its level back when the measurement ends.
+    fn apply_film_level(&mut self) {
+        if self.calibrating.is_none() {
+            self.media.film_set_gain_db(self.volumes.film);
+        }
     }
 
     /// Writes the levels changed here to `project.toml` once they rested a
@@ -329,7 +338,7 @@ impl RecordingWindow {
         }
         self.volumes.write_into(&mut self.project.config);
         if (self.volumes.film - before.film).abs() > f64::EPSILON {
-            self.media.film_set_gain_db(self.volumes.film);
+            self.apply_film_level();
         }
         if (self.volumes.voice - before.voice).abs() > f64::EPSILON {
             self.media.take_set_gain_db(self.volumes.voice);

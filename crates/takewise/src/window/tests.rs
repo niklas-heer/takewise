@@ -3891,6 +3891,23 @@ fn setup_check_calibrates_the_latency(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_film_level_leaves_the_beeps_alone(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    to_latency_step(cx, &f);
+    press(cx, f.window, &["space"]);
+    some_calibration(cx, &f, 10);
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(0.0), "beeps at 0 dB");
+    drag_slider(cx, &f, Level::Film, -30.0);
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(0.0), "still");
+    f.view
+        .read_with(cx, |view, _| assert_eq!(view.volumes.film, -30.0));
+    // Ended: the film is back, at the level set meanwhile.
+    press(cx, f.window, &["escape"]);
+    assert!(!f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(-30.0));
+}
+
+#[gpui_kit::test]
 fn a_calibration_without_beeps_stores_nothing(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     to_latency_step(cx, &f);
