@@ -516,6 +516,11 @@ fn status_says_when_the_project_has_rescued_audio() {
         passage: None,
     };
     let wav = rescue.add_take("hook", &input, &vec![0; 4800]).unwrap();
+    // A second take whose audio was written, and its JSON file was not.
+    takewise_core::rescue::fail_json_writes(true);
+    let without_json = rescue.add_take("hook", &input, &vec![0; 2400]);
+    takewise_core::rescue::fail_json_writes(false);
+    assert!(without_json.is_err());
     let folder = rescue.finish().unwrap();
     let (code, status) = json(
         takewise()
@@ -538,6 +543,17 @@ fn status_says_when_the_project_has_rescued_audio() {
         "{message}"
     );
     assert!(message.contains(&folder.display().to_string()), "{message}");
+    // One folder holds several recordings: it goes only once all are back.
+    assert!(
+        message.contains("delete the folder once every recording in it is back in the project"),
+        "{message}"
+    );
+    // The audio without a JSON file is not passed over.
+    assert!(
+        message
+            .contains("the folder also holds 1 WAV file without its JSON file (002-take-hook.wav)"),
+        "{message}"
+    );
     assert!(wav.is_file());
     // A notice, not a problem: `--strict` does not count it, and other
     // projects do not see it.

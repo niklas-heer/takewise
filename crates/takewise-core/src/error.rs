@@ -44,6 +44,11 @@ pub enum Error {
     PassageUnplaced(PathBuf),
     #[error("no Takewise project at {} (missing project.toml)", .0.display())]
     NotAProject(PathBuf),
+    #[error(
+        "the audio is in {}, but the JSON file that says where it belongs could not be written: {source}",
+        wav.display()
+    )]
+    RescueJson { wav: PathBuf, source: Box<Error> },
     #[error("{0}")]
     MissingFfmpeg(String),
     #[error("ffmpeg failed: {0}")]
@@ -68,6 +73,7 @@ impl Error {
             Error::UnknownPassage(_) => "unknown-passage",
             Error::PassageNotSplit { .. } => "passage-not-split",
             Error::PassageUnplaced(_) => "passage-unplaced",
+            Error::RescueJson { .. } => "rescue-json",
             Error::MissingFfmpeg(_) => "missing-tool",
             Error::Ffmpeg(_) => "ffmpeg-failed",
             Error::ExportSetting(_) => "bad-export-setting",
