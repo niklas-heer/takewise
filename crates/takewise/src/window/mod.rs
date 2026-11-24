@@ -1934,48 +1934,60 @@ fn audio_actions(
     cx: &mut Context<RecordingWindow>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     root.on_action(cx.listener(|view, _: &TogglePanel, _, cx| {
+        view.other_action();
         view.panel.open = !view.panel.open;
         view.panel.picker = None;
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &ToggleMonitor, _, cx| {
+        view.other_action();
         view.toggle_monitor();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &ToggleSetup, _, cx| {
+        view.other_action();
         view.toggle_setup();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &MeasureLatency, _, cx| {
+        view.other_action();
         view.measure_latency();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &SetupListen, _, cx| {
+        view.other_action();
         view.setup_listen();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &SetupNext, _, cx| {
+        view.other_action();
         view.setup_next();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &CloseSetup, _, cx| {
+        view.other_action();
         view.close_setup();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &ClearClip, _, cx| {
+        view.other_action();
         view.peak_meter.clear();
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &FilmQuieter, window, cx| {
+        view.other_action();
         view.step_level(levels::Level::Film, -levels::STEP_DB, window, cx);
     }))
     .on_action(cx.listener(|view, _: &FilmLouder, window, cx| {
+        view.other_action();
         view.step_level(levels::Level::Film, levels::STEP_DB, window, cx);
     }))
     .on_action(cx.listener(|view, _: &MonitorQuieter, window, cx| {
+        view.other_action();
         view.step_level(levels::Level::Monitor, -levels::STEP_DB, window, cx);
     }))
     .on_action(cx.listener(|view, _: &MonitorLouder, window, cx| {
+        view.other_action();
         view.step_level(levels::Level::Monitor, levels::STEP_DB, window, cx);
     }))
 }

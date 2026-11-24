@@ -2135,16 +2135,18 @@ fn warned_take(cx: &mut TestAppContext, f: &Fixture, at: f64) {
 fn a_take_warning_is_carried_only_into_a_retake(cx: &mut TestAppContext) {
     let lost = "Test Phones was disconnected during the take";
     // Any other action first: not carried.
-    let f = on_test_phones(cx);
-    warned_take(cx, &f, 100.0);
-    f.media.set_now(200.0);
-    press(cx, f.window, &["p", "p"]);
-    press(cx, f.window, &["r"]);
-    assert!(
-        !message(cx, &f.view).contains(lost),
-        "{}",
-        message(cx, &f.view)
-    );
+    for other in [&["p", "p"][..], &["a"], &["-"], &["k"], &["c", "escape"]] {
+        let f = on_test_phones(cx);
+        warned_take(cx, &f, 100.0);
+        f.media.set_now(200.0);
+        press(cx, f.window, other);
+        press(cx, f.window, &["r"]);
+        assert!(
+            !message(cx, &f.view).contains(lost),
+            "{other:?}: {}",
+            message(cx, &f.view)
+        );
+    }
 
     // R refused, the output gone again: the warning and the refusal.
     let f = on_test_phones(cx);

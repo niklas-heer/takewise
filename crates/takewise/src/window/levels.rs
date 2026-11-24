@@ -266,6 +266,7 @@ impl RecordingWindow {
     /// playing back change at once, also during a take; `project.toml` is
     /// written shortly after, between takes.
     pub(super) fn set_level(&mut self, level: Level, db: f64) {
+        self.other_action();
         let (min, max) = level.range();
         let db = db.clamp(min, max);
         if (db - self.volumes.get(level)).abs() <= f64::EPSILON {

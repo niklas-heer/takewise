@@ -159,6 +159,7 @@ impl RecordingWindow {
         input: Option<(&str, u16)>,
         output: OutputChoice<'_>,
     ) -> Option<&'static str> {
+        self.other_action();
         if !self.pickers_enabled() {
             self.message = Some(format!("{BETWEEN_TAKES} Stop the take first."));
             return None;
