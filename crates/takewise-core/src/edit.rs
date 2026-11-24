@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use sha2::{Digest as _, Sha256};
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::error::{Error, Result, io};
 use crate::fsutil::{lock, write_atomic};
@@ -367,11 +367,15 @@ pub fn set_volumes(dir: &Path, volumes: Volumes) -> Result<()> {
         ];
         for (key, db) in record {
             if let Some(db) = db {
-                set_value(table(doc, "record")?, key, Some(Value::from(db)));
+                set_value(table_like(doc, "record")?, key, Some(Value::from(db)));
             }
         }
         if let Some(db) = volumes.monitor_db {
-            set_value(table(doc, "monitor")?, "volume_db", Some(Value::from(db)));
+            set_value(
+                table_like(doc, "monitor")?,
+                "volume_db",
+                Some(Value::from(db)),
+            );
         }
         Ok(())
     })
@@ -421,9 +425,18 @@ fn table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, Stri
         .ok_or_else(|| format!("{name} is not a table"))
 }
 
+/// The table `name` as a table or an inline table (`record = { … }`),
+/// a table created when missing.
+fn table_like<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut dyn TableLike, String> {
+    doc.entry(name)
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()
+        .ok_or_else(|| format!("{name} is not a table"))
+}
+
 /// Replaces, inserts or removes `key`, keeping the old value's surrounding
 /// whitespace and trailing comment.
-fn set_value(table: &mut Table, key: &str, new: Option<Value>) {
+fn set_value(table: &mut dyn TableLike, key: &str, new: Option<Value>) {
     let Some(mut new) = new else {
         table.remove(key);
         return;
@@ -786,6 +799,37 @@ text = "Third."
         assert!((config.record.voice_gain_db + 4.0).abs() < f64::EPSILON);
         assert!((config.monitor.volume_db - 3.0).abs() < f64::EPSILON);
         assert!(!config.monitor.enabled, "enabled keeps its default");
+    }
+
+    #[test]
+    fn set_volumes_writes_into_an_inline_table() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        // Every [record] key on one line, as `record = { … }` at the top.
+        let config = crate::project::read_config(&dir).unwrap();
+        let record = &config.record;
+        let start = text.find("[record]").unwrap();
+        let end = text[start..].find("\n\n").map_or(text.len(), |n| start + n);
+        let inline = format!(
+            "record = {{ preroll_s = {:?}, tail_s = {:?}, film_gain_db = -12.0, passage_gap_s = {:?} }}\n",
+            record.preroll_s, record.tail_s, record.passage_gap_s
+        );
+        let text = format!("{inline}{}{}", &text[..start], &text[end..]);
+        fs::write(&path, &text).unwrap();
+        let volumes = Volumes {
+            film_gain_db: Some(-20.0),
+            voice_gain_db: Some(-3.0),
+            monitor_db: Some(-9.0),
+        };
+        set_volumes(&dir, volumes).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert!((config.record.film_gain_db + 20.0).abs() < f64::EPSILON);
+        assert!((config.record.voice_gain_db + 3.0).abs() < f64::EPSILON);
+        assert!((config.monitor.volume_db + 9.0).abs() < f64::EPSILON);
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("record = {"), "{written}");
+        assert!(!written.contains("[record]"), "{written}");
     }
 
     #[test]
