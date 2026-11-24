@@ -126,6 +126,8 @@ pub struct Recorder {
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
     unsaved_retry_at: f64,
+    /// Why saving a take or passage failed last, while any waits.
+    save_error: Option<String>,
     /// Which line the last passage take rests on (from 0, and its id),
     /// until the next take starts: the line it was reading when the
     /// narrator stopped it, or its first line when it ran to its end, so
@@ -322,6 +324,7 @@ impl Recorder {
             tap_broken: false,
             unsaved: Vec::new(),
             unsaved_retry_at: 0.0,
+            save_error: None,
             read_last: None,
             unsaved_passages: Vec::new(),
             uncut: Vec::new(),
@@ -349,6 +352,38 @@ impl Recorder {
     /// saved or cut into their takes.
     pub fn has_unsaved(&self) -> bool {
         !self.unsaved.is_empty() || !self.unsaved_passages.is_empty() || !self.uncut.is_empty()
+    }
+
+    /// How many stopped takes and passages have audio only in memory: not
+    /// saved, and not complete on disk either, where a repair would find
+    /// it after the window closed. Closing now would lose them.
+    pub fn in_memory_only(&self) -> (usize, usize) {
+        let on_disk = |complete: bool, files: Option<(&Path, &Path)>| {
+            complete && files.is_some_and(|(wav, meta)| wav.is_file() && meta.is_file())
+        };
+        let takes = self
+            .unsaved
+            .iter()
+            .filter(|unsaved| {
+                let files = unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
+                !on_disk(unsaved.complete, files)
+            })
+            .count();
+        let passages = self
+            .unsaved_passages
+            .iter()
+            .filter(|stopped| {
+                let unsaved = &stopped.unsaved;
+                let files = unsaved.partial.as_ref().map(|p| (&*p.wav, &*p.meta));
+                !on_disk(unsaved.complete, files)
+            })
+            .count();
+        (takes, passages)
+    }
+
+    /// Why saving failed last, while a take or passage waits to be saved.
+    pub fn save_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
     }
 
     pub fn is_recording(&self) -> bool {
@@ -817,6 +852,7 @@ impl Recorder {
                     "The take of {} could not be saved ({err}); it is kept in memory and saving is retried.",
                     unsaved.line
                 );
+                self.save_error = Some(err);
                 self.unsaved.push(unsaved);
                 Update {
                     message: Some(message),
@@ -869,6 +905,7 @@ impl Recorder {
                     "The passage could not be saved ({err}); it is kept in memory and saving is retried."
                 );
                 let message = join(stopped.notes.clone(), Some(message)).unwrap_or_default();
+                self.save_error = Some(err);
                 self.unsaved_passages.push(stopped);
                 message
             }
@@ -971,7 +1008,10 @@ impl Recorder {
                     stopped.notes = join(Some(note), stopped.notes.take());
                     self.uncut.push(stopped.published(id));
                 }
-                Err(_) => self.unsaved_passages.push(stopped),
+                Err(err) => {
+                    self.save_error = Some(err);
+                    self.unsaved_passages.push(stopped);
+                }
             }
         }
         for uncut in self.uncut.iter_mut().filter(|uncut| uncut.worker.is_none()) {
@@ -993,10 +1033,16 @@ impl Recorder {
                     update.committed = Some(committed);
                 }
                 Ok(saved) => update.message = join(update.message.take(), saved.note),
-                Err(_) => left.push(unsaved),
+                Err(err) => {
+                    self.save_error = Some(err);
+                    left.push(unsaved);
+                }
             }
         }
         self.unsaved = left;
+        if self.unsaved.is_empty() && self.unsaved_passages.is_empty() {
+            self.save_error = None;
+        }
         update
     }
 

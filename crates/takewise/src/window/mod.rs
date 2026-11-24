@@ -300,7 +300,11 @@ fn set_up_app(cx: &mut App) {
     gpui_kit::init(cx);
     bind_keys(cx);
     start::bind_keys(cx);
-    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.on_action(|_: &Quit, cx: &mut App| {
+        if !holds_unsaved_audio(cx) {
+            cx.quit();
+        }
+    });
     cx.set_menus([Menu::new("Takewise").items([
         MenuItem::action("Open Project…", start::OpenProject),
         MenuItem::action("Install Command Line Tool…", InstallCommand),
@@ -352,6 +356,34 @@ fn focus_open(dir: &Path, cx: &mut App) -> bool {
             .update(cx, |_, window, _| window.activate_window())
             .is_ok()
     })
+}
+
+/// Quitting (⌘Q, ⌘W, the menu): whether a recording window still holds
+/// audio only in memory, so the app must not quit. Each window first stops
+/// its take and tries once more to save; one that still holds audio says
+/// why it stays open and comes to the front.
+fn holds_unsaved_audio(cx: &mut App) -> bool {
+    let windows: Vec<_> = cx
+        .try_global::<OpenProjects>()
+        .map(|open| {
+            open.0
+                .iter()
+                .filter_map(|(_, view, window)| Some((view.upgrade()?, *window)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut holds = false;
+    for (view, window) in windows {
+        let keeps = view.update(cx, |view, cx| {
+            cx.notify();
+            view.keeps_unsaved_audio()
+        });
+        if keeps {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+        holds |= keeps;
+    }
+    holds
 }
 
 /// Shows `message` in the recording window open on `dir`, if there is one.
@@ -508,11 +540,19 @@ impl RecordingWindow {
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        // Closing the window or quitting mid-take still keeps the take.
+        // Closing the window or quitting mid-take still keeps the take; the
+        // window stays open while audio exists only in memory.
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
-            let _ = this.update(cx, |view, _| view.shutdown());
-            true
+            this.update(cx, |view, cx| {
+                cx.notify();
+                if view.keeps_unsaved_audio() {
+                    return false;
+                }
+                view.shutdown();
+                true
+            })
+            .unwrap_or(true)
         });
         let on_quit = cx.on_app_quit(|view, _| {
             view.shutdown();
@@ -619,6 +659,30 @@ impl RecordingWindow {
                 self.message = Some(format!("Could not look for interrupted takes: {err}"));
             }
         }
+    }
+
+    /// Before the window closes or the app quits: stops a take in progress
+    /// and tries once more to save what waits. Returns whether audio is
+    /// still only in memory, which closing would lose; the window then
+    /// stays open, says why, and keeps retrying.
+    fn keeps_unsaved_audio(&mut self) -> bool {
+        if self.recorder.is_recording() {
+            self.finish_take();
+        }
+        if self.recorder.has_unsaved() {
+            let update = self.recorder.save_unsaved_now(&self.dir);
+            self.show(update);
+        }
+        let (takes, passages) = self.recorder.in_memory_only();
+        if takes + passages == 0 {
+            return false;
+        }
+        self.message = Some(not_closing_note(
+            takes,
+            passages,
+            self.recorder.save_error(),
+        ));
+        true
     }
 
     /// Ends whatever runs: commits a take in progress (if it has audio),
@@ -1390,6 +1454,29 @@ impl RecordingWindow {
                 .into_any_element(),
         )
     }
+}
+
+/// Why the window does not close: `takes` and `passages` exist only in
+/// memory, and saving them failed with `error`.
+fn not_closing_note(takes: usize, passages: usize, error: Option<&str>) -> String {
+    let count = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let what = [
+        count(takes, "take", "takes"),
+        count(passages, "passage", "passages"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" and ");
+    let is = if takes + passages == 1 { "is" } else { "are" };
+    let why = error.map(|err| format!(" ({err})")).unwrap_or_default();
+    format!(
+        "Not closing: {what} {is} only in memory, not saved yet{why}. Takewise keeps trying to save every 2 s; free disk space or fix the problem, then close the window again."
+    )
 }
 
 /// The audio keys: the panel (A), monitoring (H), the clipping light (K),

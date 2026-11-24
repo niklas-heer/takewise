@@ -771,6 +771,32 @@ fn a_passage_that_cannot_be_begun_on_disk_is_written_when_it_stops(cx: &mut Test
 }
 
 #[gpui_kit::test]
+fn the_window_stays_open_while_a_passage_is_only_in_memory(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    // A file where the passages' directory belongs: the passage can be
+    // neither begun nor published.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/.passages"), b"").expect("blocker");
+    read_from_a(cx, &f, "shift-space", 7.5);
+    f.media.set_now(host(7.5));
+    press(cx, f.window, &["space"]);
+    assert!(!recording(cx, &f));
+
+    assert!(!VisualTestContext::from_window(f.window, cx).simulate_close());
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.starts_with("Not closing: 1 passage is only in memory"),
+        "{shown}"
+    );
+
+    fs::remove_file(f.dir.join("takes/.passages")).expect("unblock");
+    f.media.set_now(host(20.0));
+    cut(cx, &f);
+    assert_eq!(recorded_takes(&f.dir), takes_of(&["a", "b"]));
+    assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
+}
+
+#[gpui_kit::test]
 fn closing_mid_passage_keeps_it_and_cuts_its_takes(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     read_from_a(cx, &f, "shift-space", 7.5);

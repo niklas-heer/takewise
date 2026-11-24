@@ -920,6 +920,60 @@ fn an_unsaved_take_is_kept_and_saved_later(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_window_stays_open_while_a_take_is_only_in_memory(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // A file where the line's take directory belongs: the take can be
+    // neither begun nor saved on disk.
+    fs::create_dir_all(f.dir.join("takes")).expect("takes");
+    fs::write(f.dir.join("takes/a"), b"").expect("blocker");
+    record_take(cx, &f);
+    assert_eq!(recorded(&f.dir).len(), 0);
+
+    // Quitting and closing the window are both refused, and the window
+    // says why and what to do.
+    assert!(cx.update(super::holds_unsaved_audio));
+    assert!(!VisualTestContext::from_window(f.window, cx).simulate_close());
+    let shown = message(cx, &f.view);
+    assert!(
+        shown.starts_with("Not closing: 1 take is only in memory, not saved yet ("),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("keeps trying to save every 2 s; free disk space or fix the problem"),
+        "{shown}"
+    );
+
+    // Saving goes on being retried; once it worked, the window closes.
+    fs::remove_file(f.dir.join("takes/a")).expect("unblock");
+    f.media.set_now(110.0);
+    frame(cx, f.window);
+    assert_eq!(recorded(&f.dir).len(), 1);
+    assert!(!cx.update(super::holds_unsaved_audio));
+    assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
+}
+
+#[gpui_kit::test]
+fn a_take_complete_on_disk_does_not_hold_the_window(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    begin(cx, &f, 100.0); // streamed into its partial files
+    super::recorder::commits_fail(true);
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.has_unsaved()));
+    // Its audio and metadata are complete on disk, so the next start
+    // adopts it: closing loses nothing.
+    assert!(VisualTestContext::from_window(f.window, cx).simulate_close());
+    super::recorder::commits_fail(false);
+    // Once the process is gone, its lock with it, a repair adopts it.
+    f.view.update(cx, |view, _| {
+        view.recorder = super::recorder::Recorder::new();
+    });
+    let report = tw::repair(&f.dir).expect("repair");
+    assert_eq!(report.adopted.len(), 1, "{report:?}");
+    assert_eq!(recorded(&f.dir)[0].2.samples, 2400);
+}
+
+#[gpui_kit::test]
 fn opening_the_window_adopts_a_crashed_take(cx: &mut TestAppContext) {
     let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
         let snapshot = Project::open(dir)
