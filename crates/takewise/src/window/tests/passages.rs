@@ -501,6 +501,22 @@ fn shift_space_on_a_passages_last_line_records_that_line(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn shift_p_waits_for_a_missing_output(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    record_passage(cx, &f);
+    tw::set_route(&f.dir, None, Some("Gone Phones")).expect("output");
+    f.view.update(cx, |view, _| view.reload());
+    f.media.set_now(200.0);
+    press(cx, f.window, &["shift-p"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        message(cx, &f.view),
+        "Gone Phones is not connected: connect it or pick another output (A)."
+    );
+    assert_eq!(f.media.0.borrow().opened_takes.len(), 0, "no take opened");
+}
+
+#[gpui_kit::test]
 fn shift_p_plays_the_whole_passage_locked_to_the_film(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     f.view

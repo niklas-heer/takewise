@@ -110,6 +110,7 @@ impl RecordingWindow {
             return;
         }
         let started = self.selected_piece().and_then(|piece| {
+            self.sync_output()?;
             self.recorder
                 .start_passage_playback(&mut *self.media, &self.project, &piece)
         });

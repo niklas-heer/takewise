@@ -881,7 +881,9 @@ fn an_output_the_take_cannot_use_changes_nothing_and_stops_playback(cx: &mut Tes
         .update(cx, |view, _| view.choose_output("External Headphones"));
     let said = message(cx, &f.view);
     assert!(
-        said.contains("cannot play there: the take refused. Playback stopped."),
+        said.contains(
+            "Saved External Headphones as the output. Cannot play through External Headphones: the take refused. Playback stopped."
+        ),
         "{said}"
     );
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
@@ -951,16 +953,135 @@ fn takes_play_through_the_films_output(cx: &mut TestAppContext) {
         .borrow_mut()
         .outputs
         .retain(|o| o.name != "External Headphones");
+    let opened = f.media.0.borrow().opened_takes.len();
     f.media.set_now(300.0);
     press(cx, f.window, &["p"]);
     frame(cx, f.window);
     let said = message(cx, &f.view);
-    assert!(
-        said.contains("Cannot play through External Headphones"),
-        "{said}"
+    assert_eq!(
+        said,
+        "External Headphones is not connected: connect it or pick another output (A)."
     );
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
-    assert_eq!(take_output(&f), None, "no take is open");
+    assert_eq!(
+        f.media.0.borrow().opened_takes.len(),
+        opened,
+        "no take opened"
+    );
+}
+
+/// Commits a take of `line` from outside the window, as an agent's
+/// `takewise` could.
+fn commit_outside(dir: &Path, line: &str) {
+    let snapshot = Project::open(dir)
+        .expect("project")
+        .snapshot(line)
+        .expect("snapshot");
+    let input = RecordedInput {
+        sample_rate: 48_000,
+        device: DEVICE.to_owned(),
+        channel: 1,
+        line_offset_s: -2.0,
+        snapshot,
+        dropouts: None,
+        film_shift_ms: None,
+        passage: None,
+    };
+    let partial = tw::begin_take(dir, line, &input).expect("begin");
+    tw::write_take_wav(&partial.wav, &[0; 480], 48_000).expect("wav");
+    tw::commit_take(dir, partial).expect("commit");
+}
+
+const PHONES: &str = "WH-1000XM5";
+
+#[gpui_kit::test]
+fn a_missing_output_refuses_playback_until_it_is_connected(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some(PHONES)).expect("output");
+        commit_outside(dir, "d");
+    });
+    let missing = format!("{PHONES} is not connected: connect it or pick another output (A).");
+    assert_eq!(message(cx, &f.view), missing, "said when the window opens");
+    f.view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.output_note().map(|n| n.starts_with(PHONES)),
+            Some(true)
+        );
+    });
+
+    // P and Space play nothing on the system output (Shift+P goes the
+    // same way, see the passage tests).
+    press(cx, f.window, &["down", "down", "down"]); // d
+    for key in ["p", "space"] {
+        f.view.update(cx, |view, _| view.message = None);
+        press(cx, f.window, &[key]);
+        assert_eq!(message(cx, &f.view), missing, "{key}");
+        f.view.read_with(cx, |view, _| {
+            assert!(!view.recorder.is_playing() && !view.recorder.is_recording());
+        });
+    }
+    assert_eq!(f.media.0.borrow().opened_takes.len(), 0, "no take opened");
+    assert_eq!(f.media.0.borrow().film_output, None);
+
+    // Plugged in later: the next device check moves the film there, and P
+    // plays through it.
+    f.media.0.borrow_mut().outputs.push(output(
+        PHONES,
+        Transport::Bluetooth,
+        OutputSource::Headphones,
+    ));
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    assert_eq!(f.media.0.borrow().film_output.as_deref(), Some(PHONES));
+    assert_eq!(
+        message(cx, &f.view),
+        format!("{PHONES} is connected: the film and your takes play there.")
+    );
+    assert_eq!(f.view.read_with(cx, |view, _| view.output_note()), None);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        f.media
+            .0
+            .borrow()
+            .take
+            .as_ref()
+            .and_then(|t| t.output.clone()),
+        Some(PHONES.to_owned())
+    );
+
+    // Gone while it plays: the playback stops at the next check.
+    f.media.0.borrow_mut().outputs.retain(|o| o.name != PHONES);
+    f.media.set_now(203.0);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(
+        message(cx, &f.view).starts_with(&format!("{PHONES} was disconnected")),
+        "{}",
+        message(cx, &f.view)
+    );
+}
+
+#[gpui_kit::test]
+fn an_output_changed_on_disk_is_applied(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    assert_eq!(f.media.0.borrow().film_output, None, "the system output");
+    tw::set_route(&f.dir, None, Some("External Headphones")).expect("output");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(
+        f.media.0.borrow().film_output.as_deref(),
+        Some("External Headphones")
+    );
+    // Back to none: the system output again.
+    let path = f.dir.join("project.toml");
+    let text = fs::read_to_string(&path).expect("project.toml");
+    let text = text.replace("device = \"External Headphones\"\n", "");
+    fs::write(&path, text).expect("project.toml");
+    f.view.update(cx, |view, _| view.reload());
+    assert_eq!(config(&f.dir).output.device, None);
+    assert_eq!(f.media.0.borrow().film_output, None);
 }
 
 #[gpui_kit::test]
@@ -2760,11 +2881,11 @@ fn configured_output_is_used_on_open(cx: &mut TestAppContext) {
     let missing = open_with(cx, &[(DEVICE, 48_000)], |dir| {
         tw::set_route(dir, None, Some("Gone Phones")).expect("route");
     });
-    let text = message(cx, &missing.view);
-    assert!(
-        text.contains("Gone Phones is not connected") && text.contains("MacBook Speakers"),
-        "{text}"
+    assert_eq!(
+        message(cx, &missing.view),
+        "Gone Phones is not connected: connect it or pick another output (A)."
     );
+    assert_eq!(missing.media.0.borrow().film_output, None);
 }
 
 #[gpui_kit::test]
@@ -3154,14 +3275,15 @@ fn offset_applies_only_on_the_calibrated_route(cx: &mut TestAppContext) {
         .expect("an offer");
     assert!(offer.contains("does not match these devices"), "{offer}");
 
-    // Calibrated on the chosen output, which is gone: the film falls back
-    // to the speakers, so the offset is not applied.
+    // Calibrated on the chosen output, which is gone: no take is recorded
+    // on the speakers instead, and the offset does not apply to them.
     let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
         tw::set_route(dir, None, Some("Gone Phones")).expect("route");
         calibrate_on(dir, "Gone Phones");
     });
-    let offset = line_offset_of_a_take(cx, &f);
-    assert!(close(offset, -2.4), "{offset}");
+    press(cx, f.window, &["space"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert!(message(cx, &f.view).starts_with("Gone Phones is not connected"));
     assert!(
         f.view
             .read_with(cx, |view, _| view.panel.calibration.clone())

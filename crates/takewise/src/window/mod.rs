@@ -601,6 +601,8 @@ pub struct RecordingWindow {
     /// The output the film was last set to play through; `None` is the
     /// system default (none chosen, or the chosen one could not be used).
     film_output: Option<String>,
+    /// When a playback last checked that its output is still there.
+    output_checked_at: f64,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -688,6 +690,7 @@ impl RecordingWindow {
             models_dir,
             offers_model: false,
             film_output: None,
+            output_checked_at: 0.0,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -698,8 +701,8 @@ impl RecordingWindow {
         view.after_reload(None);
         view.queue_checks(&loaded_unchecked);
         view.recover();
-        view.check_inputs();
         view.apply_output();
+        view.check_inputs();
         view.park();
         view
     }
@@ -973,6 +976,9 @@ impl RecordingWindow {
                 self.state = loaded.state;
                 self.refresh_checks();
                 self.sync_volumes();
+                if !self.recorder.is_recording() {
+                    self.follow_output();
+                }
                 self.after_reload(current.as_deref());
                 self.queue_checks(&loaded.unchecked);
             }
@@ -1124,12 +1130,46 @@ impl RecordingWindow {
             .or_else(|| check_input(configured.as_deref(), &inputs).err());
         self.note_issue(panel::input_issue(configured.as_deref(), &inputs));
         self.inputs = inputs;
+        self.follow_output();
         self.use_remembered();
         let route = self.current_route();
         self.panel.calibration = panel::calibration_note(&self.project.config, &route);
         self.panel.remembered = self.remembered_note(&route);
         self.update_setup_offer();
         self.inputs_checked_at = Some(self.media.host_now_s());
+    }
+
+    /// Moves the film and the takes to the configured output once it can
+    /// be used, and says so when it was missing until now.
+    fn follow_output(&mut self) {
+        let missing = self.output_note().is_some();
+        if self.sync_output().is_ok()
+            && missing
+            && let Some(name) = &self.film_output
+        {
+            self.message = Some(format!(
+                "{name} is connected: the film and your takes play there."
+            ));
+        }
+    }
+
+    /// While a playback runs: stops it, saying why, when the output it
+    /// plays through is gone, rather than letting it go on elsewhere.
+    fn watch_output(&mut self, now: f64) {
+        if !self.recorder.is_playing() || now < self.output_checked_at + INPUT_CHECK_S {
+            return;
+        }
+        self.output_checked_at = now;
+        let Some(name) = self.film_output.clone() else {
+            return;
+        };
+        if !self.media.outputs().iter().any(|o| o.name == name) {
+            self.recorder.stop_playback(&mut *self.media);
+            self.film_output = None;
+            self.message = Some(format!(
+                "{name} was disconnected, so the playback stopped. Connect it or pick another output (A)."
+            ));
+        }
     }
 
     /// Rests the film where the current line's take would start.
@@ -1155,6 +1195,10 @@ impl RecordingWindow {
     fn begin_take(&mut self, whole_passage: bool) {
         self.check_inputs();
         if self.blocked().is_some() {
+            return;
+        }
+        if let Err(err) = self.sync_output() {
+            self.message = Some(err);
             return;
         }
         self.message = None;
@@ -1215,8 +1259,9 @@ impl RecordingWindow {
         if self.model.as_mut().is_some_and(model::ModelPrompt::poll) {
             self.model_installed();
         }
-        let busy = self.recorder.is_recording() || self.recorder.is_playing();
         let now = self.media.host_now_s();
+        self.watch_output(now);
+        let busy = self.recorder.is_recording() || self.recorder.is_playing();
         if !busy
             && self
                 .inputs_checked_at
@@ -1392,6 +1437,11 @@ impl RecordingWindow {
             cx.notify();
             return;
         };
+        if let Err(err) = self.sync_output() {
+            self.message = Some(err);
+            cx.notify();
+            return;
+        }
         self.message = None;
         if let Err(err) =
             self.recorder
