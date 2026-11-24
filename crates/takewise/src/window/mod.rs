@@ -710,7 +710,7 @@ impl RecordingWindow {
                     self.close_refused = None;
                     return false;
                 }
-                Err(failed) => Some(failed.error),
+                Err(failed) => Some(failed),
             }
         } else {
             None
@@ -719,8 +719,8 @@ impl RecordingWindow {
             takes,
             passages,
             self.recorder.save_error(),
-            match &rescue_failed {
-                Some(err) => RescueOffer::Failed(err),
+            match rescue_failed.as_deref() {
+                Some(failed) => RescueOffer::Failed(failed),
                 None => self
                     .rescue_root
                     .as_deref()
@@ -1586,8 +1586,9 @@ enum RescueOffer<'a> {
     None,
     /// Closing again writes one into this folder.
     Into(&'a Path),
-    /// Writing one failed, with this error.
-    Failed(&'a str),
+    /// Writing one failed; some audio may have been written without its
+    /// JSON file.
+    Failed(&'a recorder::RescueFailed),
 }
 
 /// Why the window does not close: `takes` and `passages` exist only in
@@ -1610,9 +1611,23 @@ fn not_closing_note(
             "Not closing: {what} {is} only in memory, not saved yet{why}. {retrying} If it cannot be fixed, close again now: Takewise then writes a rescue copy to {} and closes.",
             folder.display()
         ),
-        RescueOffer::Failed(err) => format!(
-            "Not closing: {what} {is} only in memory, not saved yet{why}, and the rescue copy could not be written either ({err}). {retrying}"
-        ),
+        RescueOffer::Failed(failed) => {
+            let kept = failed
+                .audio_only
+                .as_ref()
+                .map(|kept| {
+                    format!(
+                        " The audio of {} is in {} as WAV files without their JSON file; keep them.",
+                        counted(kept.takes, kept.passages),
+                        kept.folder.display()
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "Not closing: {what} {is} only in memory, not saved yet{why}, and the rescue copy could not be written either ({}).{kept} {retrying}",
+                failed.error
+            )
+        }
     }
 }
 
@@ -1837,5 +1852,30 @@ impl Render for RecordingWindow {
                     .text_color(rgb(colors::DIM))
                     .child(self.key_hints()),
             )
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use std::path::PathBuf;
+
+    use super::recorder::{AudioOnly, RescueFailed};
+    use super::{RescueOffer, not_closing_note};
+
+    #[test]
+    fn a_refusal_says_where_audio_without_its_json_file_is() {
+        let mut failed = RescueFailed::new(&"disk full");
+        failed.audio_only = Some(AudioOnly {
+            folder: PathBuf::from("/rescue/film.takewise-20261124T101530Z"),
+            takes: 1,
+            passages: 0,
+            error: "disk full".to_owned(),
+        });
+        let note = not_closing_note(2, 0, Some("disk gone"), RescueOffer::Failed(&failed));
+        assert!(
+            note.contains("could not be written either (disk full)")
+                && note.contains("/rescue/film.takewise-20261124T101530Z as WAV files"),
+            "{note}"
+        );
     }
 }
