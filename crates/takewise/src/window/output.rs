@@ -240,6 +240,7 @@ impl RecordingWindow {
             DeviceLookup::Unknown => {
                 let now = self.media.host_now_s();
                 if self.failing.applied.failed(now) {
+                    self.route_due = true;
                     Err(OutputProblem::Unconfirmed(name))
                 } else {
                     Ok(Ready::Pending)
@@ -460,6 +461,9 @@ impl RecordingWindow {
                     && *applied == uid
                 {
                     *unread = Some(object);
+                    if self.output_missing == self.film_output {
+                        self.output_missing = None;
+                    }
                 }
                 Seen::Same
             }

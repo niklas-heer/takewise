@@ -1873,51 +1873,107 @@ fn partial_meta(dir: &Path, line: &str) -> Option<PathBuf> {
 
 #[gpui_kit::test]
 fn a_playing_route_that_cannot_be_read_is_retried_each_tick(cx: &mut TestAppContext) {
-    // One device change, then reads that fail: retried every tick (not
-    // left to the two-second poll), and stopped once the grace is over.
+    // A playback that is playing (scheduled for 200.3, read at 200.5),
+    // then one device change and reads that fail: read again every tick,
+    // well before the two-second poll (next due at 202.0).
     let f = on_test_phones(cx);
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     frame(cx, f.window);
+    f.media.set_now(200.5);
+    frame(cx, f.window);
+    let playing_now = |cx: &mut TestAppContext, at: f64| {
+        f.view.read_with(cx, |view, _| {
+            view.recorder.is_playing() && !view.recorder.playback_waiting(at)
+        })
+    };
+    assert!(playing_now(cx, 200.5), "started, not waiting");
+    let counts = |f: &Fixture| {
+        let fake = f.media.0.borrow();
+        (
+            fake.take_plays.len(),
+            fake.pauses.len(),
+            fake.output_sets.len(),
+        )
+    };
+    let before = counts(&f);
+
+    // (a) A read succeeds within the grace: it plays on, untouched.
     f.media.0.borrow_mut().lookups_fail = true;
     f.media.0.borrow_mut().generation += 1;
     let mut lookups = f.media.0.borrow().lookups;
-    for n in 1..=4 {
-        f.media.set_now(200.0 + 0.1 * f64::from(n));
+    for at in [200.6, 200.7, 200.8] {
+        f.media.set_now(at);
         frame(cx, f.window);
-        assert!(
-            f.media.0.borrow().lookups > lookups,
-            "read again at tick {n}"
-        );
+        assert!(f.media.0.borrow().lookups > lookups, "read again at {at}");
         lookups = f.media.0.borrow().lookups;
-        assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+        assert!(playing_now(cx, at), "still playing at {at}");
     }
-    for n in 5..=7 {
-        f.media.set_now(200.0 + 0.1 * f64::from(n));
+    f.media.0.borrow_mut().lookups_fail = false;
+    f.media.set_now(200.9);
+    frame(cx, f.window);
+    assert!(playing_now(cx, 200.9));
+    assert_eq!(
+        counts(&f),
+        before,
+        "no pause, no new schedule, no new output"
+    );
+
+    // (b) Reads that keep failing: it stops once the grace is over.
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.0.borrow_mut().generation += 1;
+    for n in 0..=4 {
+        let at = 201.0 + 0.1 * f64::from(n);
+        f.media.set_now(at);
         frame(cx, f.window);
+        assert!(f.media.0.borrow().lookups > lookups, "read again at {at}");
+        lookups = f.media.0.borrow().lookups;
+        assert!(playing_now(cx, at), "within the grace at {at}");
     }
+    f.media.set_now(201.5);
+    frame(cx, f.window);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
     assert_eq!(
         message(cx, &f.view),
         "The playback stopped. Test Phones could not be checked; try again."
     );
+}
 
-    // A read that succeeds in time: it plays on.
-    f.media.0.borrow_mut().lookups_fail = false;
-    f.media.set_now(300.0);
-    press(cx, f.window, &["p"]);
-    frame(cx, f.window);
-    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+#[gpui_kit::test]
+fn a_take_confirms_its_device_and_clears_the_missing_note(cx: &mut TestAppContext) {
+    // The headphones are set while their object cannot be read; a take
+    // confirms them before its film starts, and the panel's note goes.
+    let f = on_test_phones(cx);
     f.media.0.borrow_mut().lookups_fail = true;
-    f.media.0.borrow_mut().generation += 1;
-    f.media.set_now(300.1);
-    frame(cx, f.window);
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    f.view.update(cx, |view, _| {
+        view.output_missing = Some("External Headphones".to_owned());
+    });
+    begin(cx, &f, 100.0);
     f.media.0.borrow_mut().lookups_fail = false;
-    for n in 2..=8 {
-        f.media.set_now(300.0 + 0.1 * f64::from(n));
+    f.media.set_now(100.2);
+    frame(cx, f.window);
+    f.view.read_with(cx, |view, _| {
+        assert!(
+            matches!(view.applied_device, Some((_, Some(_)))),
+            "confirmed"
+        );
+        assert_eq!(view.output_note(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn an_unread_route_that_fails_past_the_grace_is_set_again(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    for n in 1..=7 {
+        f.media.set_now(100.0 + 0.1 * f64::from(n));
         frame(cx, f.window);
     }
-    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(f.view.read_with(cx, |view, _| view.route_due), "due again");
 }
 
 #[gpui_kit::test]
