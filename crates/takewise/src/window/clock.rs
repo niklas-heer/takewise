@@ -117,10 +117,27 @@ impl FilmClock {
         let Some(start) = self.start_host_s else {
             return;
         };
-        let now = media.host_now_s();
-        if now < start + READ_BACK_AFTER_S {
+        if media.host_now_s() < start + READ_BACK_AFTER_S {
             return;
         }
+        self.read(media);
+    }
+
+    /// Asks the player whether the film moves, from its start on and
+    /// without waiting [`READ_BACK_AFTER_S`]: before a start is called off
+    /// or a take stopped, a film that already moved counts as played. A
+    /// player that does not move yet changes nothing.
+    pub fn probe(&mut self, media: &dyn Media) {
+        if self
+            .start_host_s
+            .is_some_and(|start| media.host_now_s() >= start)
+        {
+            self.read(media);
+        }
+    }
+
+    fn read(&mut self, media: &dyn Media) {
+        let now = media.host_now_s();
         let actual = media.film_timebase();
         if !self.read_back && actual.rate <= 0.0 {
             return;

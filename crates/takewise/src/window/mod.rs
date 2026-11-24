@@ -641,6 +641,9 @@ pub struct RecordingWindow {
     take_warning: Option<String>,
     /// The failing streaks of device lookups, by kind.
     failing: output::Failures,
+    /// The last thing said about the route (a refusal, a stop, "is
+    /// connected"), which a later route status may replace.
+    route_status: Option<String>,
     /// The latency calibration while the setup check runs it, and how its
     /// beep film is made.
     calibrating: Option<latency::Calibrating>,
@@ -738,6 +741,7 @@ impl RecordingWindow {
             ticked_at: None,
             take_warning: None,
             failing: output::Failures::default(),
+            route_status: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
             remembered_path: None,
@@ -1245,7 +1249,7 @@ impl RecordingWindow {
             return;
         }
         if let Err(problem) = self.route_for_start() {
-            self.message = Some(problem.for_recording());
+            self.say_route(problem.for_recording());
             return;
         }
         self.message = None;
@@ -1269,7 +1273,8 @@ impl RecordingWindow {
 
     fn finish_take(&mut self) {
         // Whatever stops it (Space, R, closing), its route is checked
-        // before its result is made.
+        // before its result is made: first whether its film moved at all.
+        self.recorder.track_film(&*self.media);
         self.check_take_route(true);
         let update = self.recorder.finish_take(&mut *self.media, &self.dir);
         self.show(update);
@@ -1512,7 +1517,7 @@ impl RecordingWindow {
             return;
         };
         if let Err(problem) = self.route_for_start() {
-            self.message = Some(problem.for_playback());
+            self.say_route(problem.for_playback());
             cx.notify();
             return;
         }
@@ -2019,8 +2024,14 @@ fn window_actions(
             window.remove_window();
         }
     }))
-    .on_action(|_: &Minimize, window, _| window.minimize_window())
-    .on_action(|_: &Zoom, window, _| window.zoom_window())
+    .on_action(cx.listener(|view, _: &Minimize, window, _| {
+        view.other_action();
+        window.minimize_window();
+    }))
+    .on_action(cx.listener(|view, _: &Zoom, window, _| {
+        view.other_action();
+        window.zoom_window();
+    }))
 }
 
 /// The keys for lines and takes: record, choose and play (with Shift the

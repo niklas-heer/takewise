@@ -352,6 +352,8 @@ struct Take {
     /// take (it went away, or the system output changed): said with the
     /// take's result.
     route_lost: Option<String>,
+    /// The first sample's film time as the partial take's sidecar has it.
+    sidecar_first_film_s: Option<f64>,
 }
 
 /// What a passage take has beyond a line take: its lines, the one being
@@ -940,6 +942,7 @@ impl Recorder {
             film_ended_host_s: None,
             passage,
             route_lost: None,
+            sidecar_first_film_s: None,
         }));
         Ok(())
     }
@@ -1411,11 +1414,11 @@ impl Recorder {
             if playback.started.is_none() || now < playback.starts_host_s)
     }
 
-    /// Reads whether a take's film has started moving, so that what
-    /// follows in this tick knows it.
+    /// Asks the player whether a take's film has started moving (at once,
+    /// not after a delay), so that what follows in this tick knows it.
     pub fn track_film(&mut self, media: &dyn Media) {
         if let Phase::Recording(take) = &mut self.phase {
-            take.clock.track(media);
+            take.clock.probe(media);
         }
     }
 
@@ -1515,9 +1518,8 @@ impl Recorder {
                 // seen running is called off then, whatever the time, the
                 // film paused at once. One not confirmed waits.
                 let failure = match hold {
-                    StartHold::Stop(why)
-                        if !take.clock.ran() && progress.first_host_s.is_some() =>
-                    {
+                    // Also before any input buffer came: what came is kept.
+                    StartHold::Stop(why) if !take.clock.ran() => {
                         media.film_pause();
                         Some(why)
                     }
@@ -1825,12 +1827,20 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
     if take.passage.is_some() {
         return begin_passage_on_disk(take, dir, progress);
     }
-    if take.partial.is_some() || take.begin_error.is_some() || !take.clock.started() {
+    if take.begin_error.is_some() || !take.clock.started() {
         return None;
     }
-    // Placed by the schedule for now; rewritten with the film's timebase as
-    // read back when the take is committed.
+    // Placed by the schedule for now, and written again whenever that
+    // moves the first sample (a start scheduled afresh, the film read back
+    // late), so a take a crash interrupts is recovered where it was
+    // recorded; rewritten once more when the take is committed.
     let first = first_sample_film_s(take, progress.first_host_s?).unwrap_or(take.line_start);
+    if take
+        .sidecar_first_film_s
+        .is_some_and(|written| (written - first).abs() <= SIDECAR_TOLERANCE_S)
+    {
+        return None;
+    }
     let input = RecordedInput {
         sample_rate: RECORD_RATE,
         device: take.device.clone(),
@@ -1841,10 +1851,18 @@ fn begin_on_disk(take: &mut Take, dir: &Path, progress: &Progress) -> Option<Str
         film_shift_ms: None,
         passage: None,
     };
+    if let Some(partial) = &take.partial {
+        // Left as it was when this fails: written once more on commit.
+        if update_take_meta(partial, &input).is_ok() {
+            take.sidecar_first_film_s = Some(first);
+        }
+        return None;
+    }
     match begin_take(dir, &take.line, &input) {
         Ok(partial) => {
             take.writer.open(partial.wav.clone());
             take.partial = Some(partial);
+            take.sidecar_first_film_s = Some(first);
             None
         }
         Err(err) => {

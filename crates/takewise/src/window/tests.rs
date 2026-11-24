@@ -74,6 +74,8 @@ struct Fake {
     /// whether listing them fails (finds nothing).
     listings: usize,
     listing_fails: bool,
+    /// Whether the default output's name and UID cannot be read.
+    default_name_fails: bool,
     /// Whether an opened take is still loading.
     take_loading: bool,
     /// Where the film plays (`None`: the system default).
@@ -163,6 +165,7 @@ impl FakeMedia {
             lookups: 0,
             listings: 0,
             listing_fails: false,
+            default_name_fails: false,
             take_loading: false,
             film_output: None,
             take: None,
@@ -389,6 +392,9 @@ impl Media for FakeMedia {
     }
     fn default_output_uid(&self) -> Option<(String, String)> {
         self.0.borrow_mut().listings += 1;
+        if self.0.borrow().default_name_fails {
+            return None;
+        }
         let name = self.0.borrow().default_output.clone();
         Some((name.clone(), format!("uid:{name}")))
     }
@@ -1829,9 +1835,146 @@ fn a_scheduled_start_is_called_off_while_unconfirmed_and_scheduled_again(cx: &mu
         close(film_s, 6.0) && close(host_s, 300.6),
         "{film_s} {host_s}"
     );
+    // Its first sample (heard at host 300.0) lies 0.6 s before film 6.0,
+    // which is 2.6 s before d's start: so says the partial sidecar a crash
+    // would be recovered from, and the committed take.
+    let partial = partial_meta(&f.dir, "d").expect("the take is on disk");
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&partial).expect("sidecar")).expect("json");
+    let offset = sidecar["line_offset_s"].as_f64().expect("line_offset_s");
+    assert!(close(offset, -2.6), "recovered at {offset}");
     f.media.set_now(300.8);
     press(cx, f.window, &["space"]);
-    assert_eq!(recorded(&f.dir).len(), 2, "kept, placed by the new start");
+    let takes = recorded(&f.dir);
+    assert_eq!(takes.len(), 2, "kept, placed by the new start");
+    let offset = takes[1].2.line_offset_s;
+    assert!(close(offset, -2.6), "committed at {offset}");
+}
+
+/// The partial sidecar of `line`'s take while it records.
+fn partial_meta(dir: &Path, line: &str) -> Option<PathBuf> {
+    fs::read_dir(dir.join("takes").join(line))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".json.partial"))
+}
+
+#[gpui_kit::test]
+fn a_reconnect_does_not_hide_a_take_warning(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.6);
+    frame(cx, f.window);
+    f.media.set_now(100.7);
+    press(cx, f.window, &["space"]);
+    let lost = "Test Phones was disconnected during the take";
+    assert!(message(cx, &f.view).contains(lost));
+    // Back: the output is set again, and the warning stays.
+    plug(&f, "Test Phones");
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().film_output.as_deref(),
+        Some("Test Phones")
+    );
+    assert!(
+        message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
+}
+
+#[gpui_kit::test]
+fn a_film_that_moved_within_its_first_moments_counts_as_played(cx: &mut TestAppContext) {
+    // Started at 100.4, read at 100.42: before the usual read-back delay,
+    // but the player is asked at once, so the take warns and goes on.
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    unplug(&f, "Test Phones");
+    f.media.set_now(100.42);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    // A stop right then, before any tick saw the loss, warns as well.
+    let f2 = on_test_phones(cx);
+    begin(cx, &f2, 100.0);
+    unplug_quietly(&f2, "Test Phones");
+    f2.media.set_now(100.42);
+    f2.view.update(cx, |view, _| view.finish_take());
+    assert!(message(cx, &f2.view).contains("Test Phones was disconnected during the take"));
+    f.media.set_now(100.6);
+    press(cx, f.window, &["space"]);
+    assert!(message(cx, &f.view).contains("Test Phones was disconnected during the take"));
+}
+
+#[gpui_kit::test]
+fn a_system_output_unnamed_at_the_start_is_still_watched(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.0.borrow_mut().default_name_fails = true;
+    begin(cx, &f, 100.0); // line a: the film runs from 102.4
+    f.media.0.borrow_mut().default_name_fails = false;
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().default_output = "External Headphones".to_owned();
+    f.media.set_now(103.2);
+    frame(cx, f.window);
+    f.media.set_now(103.4);
+    press(cx, f.window, &["space"]);
+    // Named once it could be read (the first check), and watched all along.
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("The system output changed from MacBook Speakers to External Headphones"),
+        "{said}"
+    );
+
+    // Never named: watched by its object all the same.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    f.media.0.borrow_mut().default_name_fails = true;
+    begin(cx, &f, 100.0);
+    f.media.set_now(103.0);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().default_output = "External Headphones".to_owned();
+    f.media.set_now(103.2);
+    frame(cx, f.window);
+    f.media.set_now(103.4);
+    press(cx, f.window, &["space"]);
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("The system output changed during the take"),
+        "{said}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_route_stop_needs_no_input_buffer(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    unplug_quietly(&f, "Test Phones");
+    f.media.set_now(100.1);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert!(message(cx, &f.view).contains("Test Phones is not connected"));
+}
+
+#[gpui_kit::test]
+fn a_confirmed_device_that_cannot_be_read_is_not_called_disconnected(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0); // d's film scheduled for 100.4
+    f.media.0.borrow_mut().lookups_fail = true;
+    for n in 2..=9 {
+        f.media.set_now(100.0 + 0.1 * f64::from(n));
+        frame(cx, f.window);
+    }
+    // Waiting for it to be checked, it gave up: not "not connected".
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert!(said.contains("could not be checked"), "{said}");
+    assert!(!said.contains("not connected"), "{said}");
 }
 
 #[gpui_kit::test]
@@ -2147,6 +2290,18 @@ fn a_take_warning_is_carried_only_into_a_retake(cx: &mut TestAppContext) {
             message(cx, &f.view)
         );
     }
+
+    // A menu command first (File › Open Project…): not carried either.
+    let f = on_test_phones(cx);
+    warned_take(cx, &f, 100.0);
+    cx.dispatch_action(f.window, super::start::OpenProject);
+    cx.simulate_path_prompt_response(|_| None);
+    press(cx, f.window, &["r"]);
+    assert!(
+        !message(cx, &f.view).contains(lost),
+        "{}",
+        message(cx, &f.view)
+    );
 
     // R refused, the output gone again: the warning and the refusal.
     let f = on_test_phones(cx);

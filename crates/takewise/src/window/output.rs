@@ -102,6 +102,9 @@ pub(super) enum Seen {
     Dropped(Option<u32>),
     /// The read failed, within [`LOOKUP_GRACE_S`]: not known yet.
     Unsure,
+    /// Reads kept failing for [`LOOKUP_GRACE_S`]: treated as gone, but
+    /// said as not checked, since nothing says it went.
+    Unreadable,
 }
 
 /// Whether the route may be used now.
@@ -190,7 +193,7 @@ impl RecordingWindow {
             DeviceLookup::Unknown => {
                 let now = self.media.host_now_s();
                 if self.failing(kind).failed(now) {
-                    Seen::Dropped(None)
+                    Seen::Unreadable
                 } else {
                     Seen::Unsure
                 }
@@ -214,6 +217,10 @@ impl RecordingWindow {
             return match self.see(&uid, object, Lookup::Applied) {
                 Seen::Same => Ok(Ready::Yes),
                 Seen::Unsure => Ok(Ready::Pending),
+                Seen::Unreadable => {
+                    self.route_due = true;
+                    Err(OutputProblem::Unconfirmed(name))
+                }
                 Seen::Dropped(_) => {
                     self.route_due = true;
                     Err(OutputProblem::Missing(name))
@@ -322,7 +329,7 @@ impl RecordingWindow {
     /// and says so when its device is missing.
     pub(super) fn apply_output(&mut self) {
         if let Err(problem) = self.sync_output() {
-            self.message = Some(problem.for_playback());
+            self.say_route(problem.for_playback());
         }
     }
 
@@ -337,14 +344,11 @@ impl RecordingWindow {
             Ok(Ready::Yes) => {
                 let back = was_missing.filter(|name| self.film_output.as_ref() == Some(name));
                 if let Some(name) = back {
-                    // Only in place of nothing, or of what was said about
-                    // this output.
-                    let quiet = self
-                        .message
-                        .as_ref()
-                        .is_none_or(|said| said.contains(&name));
+                    // Only in place of nothing, or of an earlier route
+                    // status: never over a take's result or warning.
+                    let quiet = self.message.is_none() || self.message == self.route_status;
                     if quiet {
-                        self.message = Some(format!(
+                        self.say_route(format!(
                             "{name} is connected: the film and your takes play there."
                         ));
                     }
@@ -354,8 +358,7 @@ impl RecordingWindow {
             Err(problem) => {
                 if self.recorder.is_playing() {
                     self.recorder.stop_playback(&mut *self.media);
-                    self.message =
-                        Some(format!("The playback stopped. {}", problem.for_playback()));
+                    self.say_route(format!("The playback stopped. {}", problem.for_playback()));
                 }
             }
         }
@@ -410,17 +413,20 @@ impl RecordingWindow {
                 DeviceLookup::Present(object) => Some(object),
                 DeviceLookup::Absent | DeviceLookup::Unknown => None,
             };
-            // Its name and UID are read once, here.
-            self.media
-                .default_output_uid()
-                .map(|(name, uid)| TakeRoute {
-                    name,
-                    uid: Some(uid),
-                    object,
-                    system: true,
-                    tried: None,
-                    pending: None,
-                })
+            // Its name and UID are read once, here; a take is never left
+            // unwatched for want of them: its object is the baseline, under
+            // a plain label until the name can be read.
+            let named = self.media.default_output_uid();
+            Some(TakeRoute {
+                name: named
+                    .as_ref()
+                    .map_or_else(|| SYSTEM_OUTPUT.to_owned(), |(name, _)| name.clone()),
+                uid: named.map(|(_, uid)| uid),
+                object,
+                system: true,
+                tried: None,
+                pending: None,
+            })
         };
     }
 
@@ -432,7 +438,7 @@ impl RecordingWindow {
         let Some(uid) = self.take_route.as_ref().and_then(|route| route.uid.clone()) else {
             let now = self.media.host_now_s();
             return if self.failing.take.failed(now) {
-                Seen::Dropped(None)
+                Seen::Unreadable
             } else {
                 Seen::Unsure
             };
@@ -457,7 +463,7 @@ impl RecordingWindow {
             DeviceLookup::Unknown => {
                 let now = self.media.host_now_s();
                 if self.failing.take.failed(now) {
-                    Seen::Dropped(None)
+                    Seen::Unreadable
                 } else {
                     Seen::Unsure
                 }
@@ -476,7 +482,7 @@ impl RecordingWindow {
             return;
         };
         if route.system {
-            self.check_system_route(&route);
+            self.check_system_route(&route, event);
             return;
         }
         let (Some(uid), Some(object)) = (route.uid.clone(), route.object) else {
@@ -487,6 +493,7 @@ impl RecordingWindow {
         };
         let back = match self.see(&uid, object, Lookup::Take) {
             Seen::Same | Seen::Unsure => return,
+            Seen::Unreadable => None,
             Seen::Dropped(back) => back,
         };
         let note = format!(
@@ -526,7 +533,7 @@ impl RecordingWindow {
     /// every tick (one property read). Its name is read once per new object
     /// and kept with it, so a change during the pre-roll is noted, without a
     /// listing each frame, once the film was seen running.
-    fn check_system_route(&mut self, route: &TakeRoute) {
+    fn check_system_route(&mut self, route: &TakeRoute, event: bool) {
         let lookup = self.media.default_output_object();
         let Some(object) = route.object else {
             // Not read when the take started: from the first read on.
@@ -536,7 +543,15 @@ impl RecordingWindow {
             return;
         };
         let now = match self.seen_lookup(lookup, object, Lookup::System) {
-            Seen::Same | Seen::Unsure => return,
+            Seen::Same => {
+                // Its name, not read at the start: on a change or the poll.
+                if event && route.uid.is_none() {
+                    self.name_system_route();
+                }
+                return;
+            }
+            Seen::Unsure => return,
+            Seen::Unreadable => None,
             Seen::Dropped(now) => now,
         };
         let pending = match &route.pending {
@@ -549,16 +564,29 @@ impl RecordingWindow {
                 named
             }
         };
-        let other = pending.filter(|(_, uid)| route.uid.as_ref() != Some(uid));
-        let note = match &other {
-            Some((name, _)) => format!(
+        let other = pending
+            .clone()
+            .filter(|(_, uid)| route.uid.as_ref() != Some(uid));
+        let known = route.uid.is_some();
+        let note = match (&other, now) {
+            (Some((name, _)), _) if known => format!(
                 "The system output changed from {} to {name} during the take: listen before you choose it.",
                 route.name
             ),
-            None => format!(
+            (Some((name, _)), _) => format!(
+                "The system output changed to {name} during the take: listen before you choose it."
+            ),
+            // Another device whose name could not be read, or the same one
+            // back as a new object.
+            (None, Some(_)) if pending.is_none() || !known => {
+                "The system output changed during the take: listen before you choose it.".to_owned()
+            }
+            _ if known => format!(
                 "The system output ({}) dropped out during the take: listen before you choose it.",
                 route.name
             ),
+            _ => "The system output dropped out during the take: listen before you choose it."
+                .to_owned(),
         };
         if self.recorder.note_route(note)
             && let Some(route) = &mut self.take_route
@@ -611,20 +639,38 @@ impl RecordingWindow {
             (Some(uid), Some(object)) => self.see(uid, object, Lookup::Take),
             _ => self.confirm_take_device(),
         };
-        let unconfirmed = route.object.is_none();
         match seen {
             Seen::Same => StartHold::Go,
             Seen::Unsure => StartHold::Wait,
             Seen::Dropped(Some(_)) => {
                 StartHold::Stop(format!("{} dropped out; start the take again.", route.name))
             }
-            Seen::Dropped(None) if unconfirmed && self.failing.take.since.is_some() => {
+            // Reads failed: not checked, which is not the same as gone.
+            Seen::Unreadable => {
                 StartHold::Stop(OutputProblem::Unconfirmed(route.name).for_recording())
             }
             Seen::Dropped(None) => {
                 StartHold::Stop(OutputProblem::Missing(route.name).for_recording())
             }
         }
+    }
+
+    /// A take on the system output whose name could not be read when it
+    /// started: read it now (a listing), keeping the object as it was.
+    fn name_system_route(&mut self) {
+        if let Some((name, uid)) = self.media.default_output_uid()
+            && let Some(route) = &mut self.take_route
+        {
+            route.name = name;
+            route.uid = Some(uid);
+        }
+    }
+
+    /// Says something about the route (a refusal, a stop, its output being
+    /// back): a later route status may replace it, but never a take's result.
+    pub(super) fn say_route(&mut self, text: String) {
+        self.route_status = Some(text.clone());
+        self.message = Some(text);
     }
 
     /// What the panel says under the output when the configured one is not
@@ -661,6 +707,9 @@ pub struct TakeRoute {
 
 /// A device's name and UID.
 type Named = (String, String);
+
+/// What the system output is called while its name cannot be read.
+const SYSTEM_OUTPUT: &str = "the system output";
 
 #[cfg(test)]
 mod tests {

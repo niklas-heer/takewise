@@ -194,7 +194,7 @@ impl RecordingWindow {
             // Not known when it began: nothing to compare.
             OutputIdentity::Unknown => return,
         };
-        if !matches!(seen, Seen::Dropped(_)) {
+        if !matches!(seen, Seen::Dropped(_) | Seen::Unreadable) {
             return;
         }
         self.end_calibration();
