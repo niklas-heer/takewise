@@ -3931,8 +3931,34 @@ fn l_measures_the_latency_again_on_the_same_route(cx: &mut TestAppContext) {
             .expect("[calibration]");
         assert!(!cal.is_remembered(), "{cal:?}");
         assert_eq!(cal.output, "WH-1000XM5");
+        // The headphones can reconnect after this measurement too: the
+        // panel keeps saying that L measures again.
+        let note = f
+            .view
+            .read_with(cx, |view, _| view.panel.remembered.clone());
+        assert_eq!(
+            note.as_deref(),
+            Some(super::remembered::BLUETOOTH_HINT),
+            "round {round}"
+        );
     }
     assert_eq!(recorded(&f.dir), [], "no take was recorded");
+    // On a wired output, a measurement of the project's own needs no note.
+    f.view
+        .update(cx, |view, _| view.choose_output("MacBook Speakers"));
+    frame(cx, f.window);
+    press(cx, f.window, &["l"]);
+    press(cx, f.window, &["space"]);
+    run_calibration(cx, &f, true);
+    let config = Project::open(&f.dir).expect("project").config;
+    assert_eq!(
+        config.calibration.expect("[calibration]").output,
+        "MacBook Speakers"
+    );
+    let note = f
+        .view
+        .read_with(cx, |view, _| view.panel.remembered.clone());
+    assert_eq!(note, None);
 }
 
 #[gpui_kit::test]

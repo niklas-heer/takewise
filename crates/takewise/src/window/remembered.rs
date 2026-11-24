@@ -11,11 +11,12 @@ use std::path::PathBuf;
 
 use takewise_core::remembered::{self, LatencySync};
 use takewise_core::room::RoomTone;
-use takewise_core::{CalibrationInfo, Route, SetupInfo};
+use takewise_core::{CalibrationInfo, Route, SetupInfo, calibration_stale};
 
 use super::RecordingWindow;
 
-/// What the panel adds for a remembered latency on a Bluetooth output.
+/// What the panel adds for a latency in use on a Bluetooth output,
+/// whether it was copied from an earlier measurement or measured here.
 pub const BLUETOOTH_HINT: &str = "Bluetooth delay can change after reconnecting; press L to measure it again (15 s) if takes sound late.";
 
 impl RecordingWindow {
@@ -82,19 +83,22 @@ impl RecordingWindow {
         }
     }
 
-    /// What the panel says when the latency in use was copied from an
-    /// earlier measurement on these devices; with a Bluetooth output, also
-    /// that it may need measuring again.
+    /// What the panel says about the latency in use on `route`: that it
+    /// was copied from an earlier measurement on these devices, when it
+    /// was, and with a Bluetooth output that it may need measuring again.
+    /// The headphones can reconnect after a measurement made here as
+    /// well, so that hint does not depend on where the latency came from.
     pub(super) fn remembered_note(&self, route: &Route) -> Option<String> {
-        let note = remembered::latency_note(&self.project.config, route)?;
-        let mut chars = note.chars();
-        let first = chars.next().map(|c| c.to_uppercase().to_string());
-        let mut text = format!("{}{}.", first.unwrap_or_default(), chars.as_str());
-        if self.bluetooth_output() {
-            text.push(' ');
-            text.push_str(BLUETOOTH_HINT);
-        }
-        Some(text)
+        let config = &self.project.config;
+        let copied = remembered::latency_note(config, route).map(|note| {
+            let mut chars = note.chars();
+            let first = chars.next().map(|c| c.to_uppercase().to_string());
+            format!("{}{}.", first.unwrap_or_default(), chars.as_str())
+        });
+        let in_use = config.calibration.is_some() && calibration_stale(config, route).is_none();
+        let hint = (in_use && self.bluetooth_output()).then(|| BLUETOOTH_HINT.to_owned());
+        let notes: Vec<String> = copied.into_iter().chain(hint).collect();
+        (!notes.is_empty()).then(|| notes.join(" "))
     }
 
     /// Whether the setup check offers its latency step although the

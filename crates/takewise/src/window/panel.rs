@@ -107,7 +107,8 @@ pub struct Panel {
     /// Why the latency calibration is stale, if it is.
     pub calibration: Option<String>,
     /// That the latency in use was copied from an earlier measurement, if
-    /// it was (see `remembered.rs`).
+    /// it was, and that a Bluetooth output may need measuring again (see
+    /// `remembered.rs`).
     pub remembered: Option<String>,
     pub film_slider: Entity<SliderState>,
     pub monitor_slider: Entity<SliderState>,
