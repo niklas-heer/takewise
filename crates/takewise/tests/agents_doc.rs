@@ -5,7 +5,10 @@
 //! The guide's conventions, which this test relies on:
 //! - each line of a `sh` block is one command (blank lines and `#` comments
 //!   are skipped); `takewise record` is the narrator's part, so the test
-//!   records one take per line in its place;
+//!   records in its place: all lines as one passage (take 1 of each line),
+//!   then one more take per line;
+//! - the passage id the guide shows ([`GUIDE_PASSAGE`]) stands for the id
+//!   of the passage the test recorded;
 //! - a block preceded by `<!-- file: <path> -->` is written to that path;
 //! - a `json` block preceded by `<!-- output of: <command> -->` is the
 //!   output of that command (any command printing JSON, such as `cat` of
@@ -25,9 +28,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
-use takewise_core::{Project, RecordedInput, begin_take, commit_take, write_take_wav};
+use takewise_core::passage::{Latency, split};
+use takewise_core::{
+    PassageInput, PassageLine, Project, RecordedInput, begin_passage, begin_take, commit_take,
+    publish_passage, write_take_wav,
+};
 
 const RATE: u32 = 48_000;
+
+/// The passage id in the guide's commands and examples.
+const GUIDE_PASSAGE: &str = "0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10";
 
 enum Item {
     /// One command line of a `sh` block, with its line in the guide.
@@ -107,9 +117,61 @@ fn tool_dir(tool: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("the guide test needs {tool} (brew install ffmpeg)"))
 }
 
-/// The narrator's part: one take per line, a 440 Hz burst 2 s into it, the
-/// take starting 2 s before the line.
-fn record_takes(dir: &Path) {
+/// Fills `audio` with a 440 Hz tone for one second from sample `from`.
+fn burst(audio: &mut [i32], from: usize) {
+    for (i, sample) in audio.iter_mut().enumerate().skip(from).take(RATE as usize) {
+        let t = i as f64 / f64::from(RATE);
+        *sample = ((t * 440.0 * std::f64::consts::TAU).sin() * 4_000_000.0) as i32;
+    }
+}
+
+/// The narrator reading every line in one go: a passage from 2 s before the
+/// first line to 2 s after the last line's start, each line spoken for a
+/// second from its start. Cut into takes; returns the passage's id.
+#[allow(clippy::cast_sign_loss)]
+fn record_passage(dir: &Path) -> String {
+    let project = Project::open(dir).unwrap();
+    let lines = &project.script.lines;
+    let first_s = lines[0].start - 2.0;
+    let seconds = lines[lines.len() - 1].start + 2.0 - first_s;
+    let sample = |seconds: f64| (seconds * f64::from(RATE)).round().max(0.0) as usize;
+    let mut audio = vec![0i32; sample(seconds)];
+    for line in lines {
+        burst(&mut audio, sample(line.start - first_s));
+    }
+    let input = PassageInput {
+        sample_rate: RATE,
+        device: "Test Mic".to_owned(),
+        channel: 1,
+        latency: Latency {
+            input_s: 0.0,
+            offset_ms: 0.0,
+        },
+        preroll_s: project.config.record.preroll_s,
+        lines: lines
+            .iter()
+            .map(|line| PassageLine {
+                id: line.id.clone(),
+                snapshot: project.snapshot(&line.id).unwrap(),
+            })
+            .collect(),
+        first_sample_film_s: Some(first_s),
+        dropouts: Some(Vec::new()),
+        film_shift_ms: None,
+    };
+    let partial = begin_passage(dir, &input).unwrap();
+    write_take_wav(&partial.wav, &audio, RATE).unwrap();
+    let passage = publish_passage(dir, &partial).unwrap();
+    let takes = split(dir, &passage.id).unwrap().takes;
+    assert_eq!(takes.len(), lines.len(), "one take per line");
+    passage.id
+}
+
+/// The narrator's part: the whole script as one passage, then one take per
+/// line, a 440 Hz burst 2 s into it, the take starting 2 s before the line.
+/// Returns the passage's id.
+fn record_takes(dir: &Path) -> String {
+    let passage = record_passage(dir);
     let project = Project::open(dir).unwrap();
     for line in &project.script.lines {
         let input = RecordedInput {
@@ -124,18 +186,11 @@ fn record_takes(dir: &Path) {
         };
         let partial = begin_take(dir, &line.id, &input).unwrap();
         let mut audio = vec![0i32; 5 * RATE as usize];
-        for (i, sample) in audio
-            .iter_mut()
-            .enumerate()
-            .skip(2 * RATE as usize)
-            .take(RATE as usize)
-        {
-            let t = i as f64 / f64::from(RATE);
-            *sample = ((t * 440.0 * std::f64::consts::TAU).sin() * 4_000_000.0) as i32;
-        }
+        burst(&mut audio, 2 * RATE as usize);
         write_take_wav(&partial.wav, &audio, RATE).unwrap();
         commit_take(dir, partial).unwrap();
     }
+    passage
 }
 
 /// Whether every key `example` shows is in `real`, at the same place.
@@ -235,18 +290,28 @@ fn every_command_in_the_agent_guide_runs() {
     let scratch = scratch();
     let (tmp, work, models, path) = (&scratch.tmp, &scratch.work, &scratch.models, &scratch.path);
     let mut outputs: HashMap<String, Value> = HashMap::new();
+    let mut passage: Option<String> = None;
     for item in &items {
         match item {
             Item::File(path, text) => fs::write(work.join(path), text).unwrap(),
             Item::Command(command, line) if command.starts_with("takewise record ") => {
                 let dir = command.split_whitespace().nth(2).unwrap();
-                record_takes(&work.join(dir));
+                passage = Some(record_takes(&work.join(dir)));
                 assert!(command.split_whitespace().count() == 3, "line {line}");
             }
             Item::Command(command, line) => {
+                // The guide's passage id stands for the recorded passage's.
+                let run = match &passage {
+                    Some(id) => command.replace(GUIDE_PASSAGE, id),
+                    None => command.clone(),
+                };
+                assert!(
+                    passage.is_some() || !command.contains(GUIDE_PASSAGE),
+                    "line {line}: the guide names a passage before one is recorded"
+                );
                 let output = Command::new("/bin/sh")
                     .arg("-c")
-                    .arg(command)
+                    .arg(&run)
                     .current_dir(work)
                     .env_clear()
                     .env("PATH", path)

@@ -2,7 +2,7 @@
 
 Takewise splits narration work between a person and an agent. The narrator reads the lines in the recording window; you, the agent, write the script, read the checks of every take, judge and choose takes when the narrator hands that over, export the narration and, with your own editor tools, place it in the film's edit. Everything goes through the `takewise` command and plain files, so you never need the window.
 
-This guide walks one project through the whole loop. A test (`crates/takewise/tests/agents_doc.rs`) runs its commands in order against a scratch project, recording fixture takes in place of the narrator's `takewise record`, and checks that every JSON example below has the shape of the real output (every key it shows is there), so they stay true.
+This guide walks one project through the whole loop. A test (`crates/takewise/tests/agents_doc.rs`) runs its commands in order against a scratch project, recording fixture takes in place of the narrator's `takewise record` (a passage of both lines, then one more take of each line; the passage id shown below stands for that passage's), and checks that every JSON example below has the shape of the real output (every key it shows is there), so they stay true.
 
 ## Rules
 
@@ -51,6 +51,8 @@ takewise status promo.takewise --json
 
 `status` validates the script (starts in order, slots inside the film) and lists `problems`; fix them before the narrator records. Keep `script_version` for later edits.
 
+Each line's `passage` names the passage it belongs to, by the id of the passage's first line. A passage is a run of consecutive lines that the narrator can read in one go: a line and the next belong together while the next one starts less than `[record] passage_gap_s` (1.0 s in `project.toml`) after the slot of the one before ends. Here `hook` has no `end`, so its slot runs to `close`, and both lines are one passage. To split a passage, leave a pause of a second or more between two lines (set the earlier line's `end`); to join sentences, keep their slots closer than that.
+
 <!-- output of: takewise status promo.takewise --json -->
 ```json
 {
@@ -59,7 +61,7 @@ takewise status promo.takewise --json
     "script_version": "4f1c…",
     "film": { "path": "/…/renders/promo.mp4", "missing": false, "changed": false },
     "lines": [
-      { "id": "hook", "text": "Hello there.", "start": 2.0, "end": 6.0, "takes": [], "chosen": null, "proposed": null }
+      { "id": "hook", "text": "Hello there.", "start": 2.0, "end": 6.0, "passage": "hook", "takes": [], "chosen": null, "proposed": null }
     ],
     "problems": [],
     "notices": []
@@ -73,7 +75,7 @@ takewise status promo.takewise --json
 takewise record promo.takewise
 ```
 
-This opens the recording window in `Takewise.app`; the narrator records one or more takes per line and may choose some. Wait for them. The window checks each take as it is recorded; you can follow along with `status`, which reloads from the files every time.
+This opens the recording window in `Takewise.app`; the narrator records one or more takes per line and may choose some. A passage can be read in one go: it is kept whole in `takes/.passages/<id>.wav` and cut, in the pauses between the lines, into one take per line, so everything below works on its takes as on any other. Wait for them. The window checks each take as it is recorded; you can follow along with `status`, which reloads from the files every time.
 
 ## 4. Read the checks
 
@@ -103,7 +105,7 @@ takewise check promo.takewise --json
       },
       {
         "line": "close",
-        "take": 1,
+        "take": 2,
         "verdict": "retake",
         "reasons": [
           { "code": "missing-words", "message": "missing “see”, “you”, “at”" },
@@ -120,7 +122,7 @@ takewise check promo.takewise --json
 takewise status promo.takewise --json
 ```
 
-In `status`, each take has its `effective` verdict (the check's, or the latest judgment's), the `reason` behind it, its `speech` (start and end in seconds of the take), and whether it was recorded against text the line no longer has. Each line has the `proposed` take (the best ranked: `keep` before `listen` and unchecked before `retake`, then fewer word differences, then less overrun, then your `score`, then newest) and the `chosen` one.
+In `status`, each take has its `effective` verdict (the check's, or the latest judgment's), the `reason` behind it, its `speech` (start and end in seconds of the take), and whether it was recorded against text the line no longer has. A take cut from a passage has a `passage` object: the passage's `id`, which piece it is (`index` of `count`), its sample range in the passage file (`from_sample`, `to_sample`) and the noise floor it is checked with; a take recorded line by line has none. Each line has the `proposed` take (the best ranked: `keep` before `listen` and unchecked before `retake`, then fewer word differences, then less overrun, then your `score`, then newest) and the `chosen` one.
 
 <!-- output of: takewise status promo.takewise --json -->
 ```json
@@ -139,11 +141,19 @@ In `status`, each take has its `effective` verdict (the check's, or the latest j
             "reason": null,
             "speech": [2.0, 3.0],
             "stale_check": false,
-            "recorded_against_old_text": false
+            "recorded_against_old_text": false,
+            "passage": {
+              "id": "0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10",
+              "index": 0,
+              "count": 2,
+              "from_sample": 0,
+              "to_sample": 240000,
+              "preroll_floor_dbfs": -144.0
+            }
           }
         ],
         "chosen": null,
-        "proposed": 1
+        "proposed": 2
       }
     ]
   }
@@ -155,13 +165,35 @@ In `status`, each take has its `effective` verdict (the check's, or the latest j
 Listen to the takes yourself if you can (the WAVs are in `takes/<line>/`), and add a judgment when you disagree with a check or want to rank takes. A judgment overrides the check's verdict for ranking; the `score` (0 to 1) breaks ties between takes with the same verdict.
 
 ```sh
-takewise judge promo.takewise close 1 --verdict listen --reason "words differ: check the ending" --by claude-opus-5-5 --score 0.4 --json
-takewise choose promo.takewise hook 1 --by claude-opus-5-5 --json
-takewise choose promo.takewise close 1 --by claude-opus-5-5 --json
+takewise judge promo.takewise close 2 --verdict listen --reason "words differ: check the ending" --by claude-opus-5-5 --score 0.4 --json
+takewise choose promo.takewise --passage 0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10 --by claude-opus-5-5 --json
+```
+
+`choose --passage` takes a passage's `id` (from a take's `passage.id` in `status`) and chooses that passage's take for every line it has one of, so the lines stay in the flow they were read in. It is all or nothing: when one of the takes' files is missing it chooses none (exit 1, `missing-file`). Lines the passage has no take of (the narrator stopped before them) are listed in `skipped` and keep their choice.
+
+<!-- output of: takewise choose promo.takewise --passage 0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10 --by claude-opus-5-5 --json -->
+```json
+{
+  "ok": true,
+  "data": {
+    "passage": "0d9c5a0e-6a0c-4e52-9d33-3c1f5a2b7e10",
+    "by": "claude-opus-5-5",
+    "chosen": [{ "line": "hook", "take": 1 }, { "line": "close", "take": 1 }],
+    "skipped": []
+  }
+}
+```
+
+A single line can still get another take: here `close` was read again on its own, and that take replaces the passage's.
+
+```sh
+takewise choose promo.takewise close 2 --by claude-opus-5-5 --json
 takewise status promo.takewise --strict --json
 ```
 
 `choose` refuses a take whose file is missing. `status --strict` exits 0 once every line has a chosen take and no problem is left; otherwise 1.
+
+The check of a take cut from a passage reads its timing by its place in the passage. Only the last piece can overrun and only the first can start early; in between, `passage-drift` (`listen`) says a line's words began more than a second from its cue, and `passage-boundary` (`listen`) says no pause was found where two lines were cut apart, so a word may sit in the wrong take: listen to both neighbours, or prefer other takes for those lines.
 
 ## 6. Export
 
