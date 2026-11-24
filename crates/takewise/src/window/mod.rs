@@ -251,7 +251,11 @@ fn report_start(result: Option<&Path>, outcome: Result<(), &str>) {
 
 /// Loads the project in `dir` and checks its film is there.
 fn prepare(dir: &Path) -> Result<(PathBuf, Loaded), String> {
-    let dir = std::path::absolute(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    // The real path, so a project opened through a symlink or `sub/..` is
+    // the same project everywhere, rescue folders' names included.
+    let dir = std::fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .map_err(|err| format!("{}: {err}", dir.display()))?;
     let loaded = load(&dir).map_err(|err| err.to_string())?;
     let film = loaded.project.film_path();
     if !film.is_file() {
@@ -1616,8 +1620,13 @@ fn not_closing_note(
                 .audio_only
                 .as_ref()
                 .map(|kept| {
+                    let files = if kept.takes + kept.passages == 1 {
+                        "a WAV file without its JSON file; keep it"
+                    } else {
+                        "WAV files without their JSON files; keep them"
+                    };
                     format!(
-                        " The audio of {} is in {} as WAV files without their JSON file; keep them.",
+                        " The audio of {} is in {} as {files}.",
                         counted(kept.takes, kept.passages),
                         kept.folder.display()
                     )
@@ -1871,10 +1880,15 @@ mod note_tests {
             passages: 0,
             error: "disk full".to_owned(),
         });
+        let one = not_closing_note(1, 0, None, RescueOffer::Failed(&failed));
+        assert!(
+            one.contains("as a WAV file without its JSON file; keep it."),
+            "{one}"
+        );
         let note = not_closing_note(2, 0, Some("disk gone"), RescueOffer::Failed(&failed));
         assert!(
             note.contains("could not be written either (disk full)")
-                && note.contains("/rescue/film.takewise-20261124T101530Z as WAV files"),
+                && note.contains("/rescue/film.takewise-20261124T101530Z as a WAV file"),
             "{note}"
         );
     }

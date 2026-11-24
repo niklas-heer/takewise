@@ -130,7 +130,9 @@ impl Rescue {
         );
         let new_root = !root.is_dir();
         fs::create_dir_all(root).map_err(io(root))?;
-        let name = folder_prefix(project_dir);
+        // Named after the project's real folder, as `rescued_for` looks for
+        // it, however the path was spelled.
+        let name = folder_prefix(&absolute(project_dir));
         let stamp = at.strftime("%Y%m%dT%H%M%SZ").to_string();
         for n in 1..1000 {
             let folder = match n {
