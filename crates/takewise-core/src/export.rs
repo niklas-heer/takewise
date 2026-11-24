@@ -149,10 +149,15 @@ pub struct ManifestLine {
     pub take_file: String,
     /// Who chose the take, or `proposed`.
     pub chosen_by: String,
-    /// Half-open sample range taken from the take, at the take's rate.
+    /// Half-open sample range taken from the take, at the take's rate;
+    /// always within the take's file. Empty when nothing of the take is
+    /// in the narration: a piece of a passage without speech, at an outer
+    /// edge of the stretch it is joined to, is trimmed away whole (the
+    /// range is then at the take's end, or at its first sample).
     pub source_samples: [u64; 2],
     /// Half-open sample range in the narration file, at its rate
-    /// (`round(n × rate / 48000)` of the range at 48 kHz).
+    /// (`round(n × rate / 48000)` of the range at 48 kHz); empty with
+    /// `source_samples`, where the stretch begins or ends.
     pub dest_samples: [u64; 2],
     /// Detected speech start and end in film seconds, clamped to the film;
     /// a `speech-cropped` warning gives the unclamped values. The start is
@@ -287,8 +292,22 @@ struct Part {
     /// The line's piece of the passage holds no speech; its `speech` is
     /// then the empty range where the speech beside it begins (or ends).
     silent: bool,
+    /// The piece of a passage the take is.
+    piece: Option<PassagePiece>,
+    /// Set on a piece without speech whose words may be missing from the
+    /// export (see [`note_pieces_left_out`]).
+    left_out: Option<LeftOut>,
     /// `clean` only: why noise reduction was skipped for this take.
     nr_skipped: Option<String>,
+}
+
+/// The piece of a passage beside a piece without speech, when the export
+/// does not use it: the line's words are likely in it.
+struct LeftOut {
+    /// It is the piece before the one without speech, not the one after.
+    before: bool,
+    /// Its take's file, or else the passage's.
+    file: String,
 }
 
 /// The last take of a [`Unit`], which the next line's take may continue.
@@ -546,6 +565,8 @@ fn parts(
             old_text: take.old_text,
             cropped_speech,
             silent: take.speech.is_none(),
+            piece: take.piece,
+            left_out: None,
             nr_skipped: None,
         });
     }
@@ -564,16 +585,24 @@ impl Unit {
     /// Writes each line's source range in its own take and its destination
     /// range into its manifest entry; the ranges of joined lines meet at
     /// the cuts of their passage.
+    ///
+    /// The unit keeps the samples `from..to` of its run, and a line's
+    /// share of them is what its own take holds of that range. A piece
+    /// the trimming left nothing of (it holds no speech, at an outer edge
+    /// of its run) gets empty ranges: at its take's end and the unit's
+    /// start when it lies before the unit, at its take's first sample and
+    /// the unit's end when it lies after.
     fn set_line_ranges(&mut self) {
         let (from, to) = (self.src, self.src + (self.dest.1 - self.dest.0));
         for part in &mut self.parts {
-            let begin = part.start.clamp(from, to);
-            let end = (part.start + part.len).clamp(begin, to);
-            part.line.source_samples = [to_u64(begin - part.start), to_u64(end - part.start)];
-            part.line.dest_samples = [
-                to_u64(self.dest.0 + (begin - from)),
-                to_u64(self.dest.0 + (end - from)),
-            ];
+            let (first, last) = (part.start, part.start + part.len);
+            // Within the take's own samples first: the source range can
+            // then neither lie outside its file nor run backwards.
+            let begin = from.clamp(first, last);
+            let end = to.clamp(begin, last);
+            part.line.source_samples = [to_u64(begin - first), to_u64(end - first)];
+            let placed = |sample: usize| to_u64(self.dest.0 + (sample.clamp(from, to) - from));
+            part.line.dest_samples = [placed(begin), placed(end)];
         }
     }
 }
@@ -1077,7 +1106,68 @@ fn gather(
     }
     let tight = split_margins(&mut units, rate);
     refused.extend(overlaps(&units));
+    note_pieces_left_out(&mut units, state);
     (units, tight, refused)
+}
+
+/// Marks each piece without speech whose words the export may lack.
+///
+/// A line that was not spoken in its own piece was read early or late,
+/// into the piece before or after it. Inside a seam run both are exported
+/// with it. At an outer edge of the run, the passage's piece on that side
+/// is not part of the run, and when no line uses its take (its line was
+/// read again on its own, or another take was chosen), words read into it
+/// are in no exported audio. When that piece is exported on its own (its
+/// line was moved, which only cuts it from the run), the words are still
+/// there.
+fn note_pieces_left_out(units: &mut [Unit], state: &State) {
+    let used: Vec<String> = units
+        .iter()
+        .flat_map(|unit| &unit.parts)
+        .map(|part| part.line.take_file.clone())
+        .collect();
+    // The take cut from piece `index` of the passage `id`.
+    let piece_file = |id: &str, index: u32| {
+        let takes = state.lines.iter().flat_map(|line| &line.takes);
+        takes
+            .filter(|take| {
+                let piece = take.passage.as_ref();
+                piece.is_some_and(|piece| piece.id == id && piece.index == index)
+            })
+            .map(|take| take.file.clone())
+            .next()
+    };
+    let left_out = |part: &Part, before: bool| {
+        let piece = part.piece.as_ref().filter(|_| part.silent)?;
+        let index = if before {
+            piece.index.checked_sub(1)?
+        } else {
+            piece
+                .index
+                .checked_add(1)
+                .filter(|&next| next < piece.count)?
+        };
+        let file = piece_file(&piece.id, index);
+        if file.as_ref().is_some_and(|file| used.contains(file)) {
+            return None;
+        }
+        Some(LeftOut {
+            before,
+            file: file.unwrap_or_else(|| crate::passage::passage_file(&piece.id)),
+        })
+    };
+    for unit in units {
+        // A unit has speech, so a part without any is not both its first
+        // and its last.
+        if let Some(first) = unit.parts.first_mut() {
+            first.left_out = left_out(first, true);
+        }
+        if let Some(last) = unit.parts.last_mut()
+            && last.left_out.is_none()
+        {
+            last.left_out = left_out(last, false);
+        }
+    }
 }
 
 /// Writes the manifest and puts both files in place: the old manifest goes
@@ -1423,13 +1513,27 @@ fn warnings(units: &[Unit], film_duration: f64) -> Vec<ExportWarning> {
             });
         }
         if p.silent {
+            let (file, id) = (&p.line.take_file, &p.line.id);
+            let message = match &p.left_out {
+                None => format!(
+                    "{file} holds no speech: {id} was not spoken in its own piece of the passage, perhaps early or late, in the piece of the line before or after; the pieces are exported as one stretch, as they were recorded, so listen to the passage there"
+                ),
+                Some(beside) => {
+                    let (side, when) = if beside.before {
+                        ("before", "early")
+                    } else {
+                        ("after", "late")
+                    };
+                    format!(
+                        "{file} holds no speech, and {id} may be missing from the export: it was not spoken in its own piece of the passage, and the piece {side} it, {neighbour}, is not exported (its line uses another take); if {id} was read {when}, its words are in {neighbour} and not in the narration, so listen to it, then record {id} again or choose that take for its line",
+                        neighbour = beside.file
+                    )
+                }
+            };
             warnings.push(ExportWarning {
                 code: "passage-piece-without-speech",
                 line: Some(p.line.id.clone()),
-                message: format!(
-                    "{} holds no speech: {} was not spoken in its own piece of the passage, perhaps early or late, in the piece of the line before or after; the pieces are exported as one stretch, as they were recorded, so listen to the passage there",
-                    p.line.take_file, p.line.id
-                ),
+                message,
             });
         }
         if let Some(why) = &p.nr_skipped {
@@ -2590,6 +2694,7 @@ text = "Four."
         choose(&dir, &after);
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(report.warnings, []);
         assert_eq!(
             seams(&report),
@@ -2659,6 +2764,7 @@ text = "Four."
         set_line_field(&dir, "b", Field::Start(13.7), None).unwrap();
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(
             seams(&report),
             [("a", None), ("b", None), ("c", Some("d")), ("d", None)]
@@ -2693,6 +2799,7 @@ text = "Four."
         set_line_field(&dir, "d", Field::Start(19.6), None).unwrap();
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(
             seams(&report),
             [("a", Some("b")), ("b", Some("c")), ("c", None), ("d", None)]
@@ -2706,6 +2813,7 @@ text = "Four."
         set_line_field(&dir, "d", Field::Start(19.400_02), None).unwrap();
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(seams(&report)[2..4], [("c", Some("d")), ("d", None)]);
         let (c, d) = (line(&report, "c"), line(&report, "d"));
         assert_eq!(c.dest_samples[1], d.dest_samples[0]);
@@ -2730,6 +2838,7 @@ text = "Four."
         choose(&dir, &after);
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(
             seams(&report),
             [
@@ -2787,6 +2896,7 @@ text = "Four."
         }
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(
             seams(&report),
             [("a", None), ("b", Some("c")), ("c", Some("d")), ("d", None)]
@@ -2834,6 +2944,7 @@ text = "Four."
         crate::passage::choose_passage(&dir, &passage.id, "narrator").unwrap();
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(
             seams(&report),
             [
@@ -2850,8 +2961,11 @@ text = "Four."
             .map(|w| (w.code, w.line.as_deref()))
             .collect();
         assert_eq!(warned, [("passage-piece-without-speech", Some("b"))]);
+        // Both pieces beside b's are exported with it: nothing is missing.
         assert!(
-            report.warnings[0].message.starts_with("takes/b/001.wav"),
+            report.warnings[0]
+                .message
+                .starts_with("takes/b/001.wav holds no speech: b was not spoken"),
             "{report:?}"
         );
 
@@ -2888,12 +3002,28 @@ text = "Four."
         }
         let report = run(&dir, false);
         assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
         assert_eq!(
             seams(&report),
             [("a", None), ("b", Some("c")), ("c", Some("d")), ("d", None)]
         );
         assert_eq!(report.warnings.len(), 1, "{report:?}");
         assert_eq!(report.warnings[0].code, "passage-piece-without-speech");
+        // b's words were read into a's piece, which the export no longer
+        // uses: the warning says they may be missing, and where they are.
+        let message = &report.warnings[0].message;
+        assert_eq!(report.warnings[0].line.as_deref(), Some("b"));
+        assert!(
+            message.starts_with(
+                "takes/b/001.wav holds no speech, and b may be missing from the export"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("the piece before it, takes/a/001.wav, is not exported"),
+            "{message}"
+        );
+        assert!(message.contains("read early"), "{message}");
         // The run begins 150 ms before c's speech, the first there is:
         // nothing of b's piece is left in it.
         let (b, c) = (line(&report, "b"), line(&report, "c"));
@@ -2908,6 +3038,229 @@ text = "Four."
         let report = run(&dir, false);
         assert_eq!(refused_codes(&report), vec!["no-speech"]);
         assert_eq!(report.refused[0].lines, ["b"]);
+    }
+
+    /// Asserts that every line's ranges are valid: its source range lies
+    /// in its take file and its destination range in the narration.
+    fn assert_ranges_in_files(dir: &Path, report: &ExportReport) {
+        let out = u64::try_from(narration(dir).len()).unwrap();
+        for line in &report.lines {
+            let (take, _) = read_take_wav(&dir.join(&line.take_file)).unwrap();
+            let len = u64::try_from(take.len()).unwrap();
+            let [from, to] = line.source_samples;
+            assert!(
+                from <= to && to <= len,
+                "{}: {from}..{to} of {len}",
+                line.id
+            );
+            let [from, to] = line.dest_samples;
+            assert!(
+                from <= to && to <= out,
+                "{}: {from}..{to} of {out}",
+                line.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_piece_trimmed_away_at_the_end_of_its_run_has_an_empty_range() {
+        // b was read early, so its piece holds only the room; the passage
+        // is chosen whole, then c is read again on its own. a and b are
+        // still joined, and their run ends 150 ms after a's speech: all
+        // of b's piece is trimmed away.
+        let (_tmp, dir) = setup(PASSAGE);
+        let (passage, audio) = b_read_early(&dir);
+        crate::passage::choose_passage(&dir, &passage.id, "narrator").unwrap();
+        let alone = take(&dir, "c", Some((2.1, 3.0)));
+        choose(&dir, &alone);
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
+        assert_eq!(
+            seams(&report),
+            [("a", Some("b")), ("b", None), ("c", None), ("d", None)]
+        );
+        assert_ranges_in_files(&dir, &report);
+        let (a, b) = (line(&report, "a"), line(&report, "b"));
+        // The run ends 150 ms after the words read into a's piece.
+        assert_eq!(a.dest_samples, [480_000 - 7_200, 614_400 + 7_200]);
+        // Nothing of b's take is in the export: an empty range at its
+        // first sample, where the run ends.
+        assert_eq!(b.source_samples, [0, 0]);
+        assert_eq!(b.dest_samples, [a.dest_samples[1]; 2]);
+        assert_as_recorded(
+            &narration(&dir),
+            &audio,
+            a.dest_samples[0] + FADE,
+            a.dest_samples[1] - FADE,
+        );
+        let m = manifest(&dir);
+        assert_eq!(m["lines"][1]["source_samples"][1], 0);
+    }
+
+    #[test]
+    fn a_piece_trimmed_away_at_the_start_of_its_run_has_an_empty_range() {
+        // a is read again on its own: b's piece, which holds no speech,
+        // begins the run of b, c and d, and lies before the run's first
+        // speech.
+        let (_tmp, dir) = setup(PASSAGE);
+        b_read_early(&dir);
+        let alone = take(&dir, "a", Some((2.0, 3.0)));
+        choose(&dir, &alone);
+        for id in ["b", "c", "d"] {
+            crate::takes::choose_take(&dir, id, 1, "narrator").unwrap();
+        }
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
+        let (b, c) = (line(&report, "b"), line(&report, "c"));
+        // An empty range at the end of b's take, where the run begins.
+        let (take, _) = read_take_wav(&dir.join(&b.take_file)).unwrap();
+        let len = u64::try_from(take.len()).unwrap();
+        assert_eq!(b.source_samples, [len, len]);
+        assert_eq!(b.dest_samples, [c.dest_samples[0]; 2]);
+        assert!(c.source_samples[0] > 0, "{c:?}");
+    }
+
+    #[test]
+    fn pieces_trimmed_away_at_both_ends_of_a_run_have_empty_ranges() {
+        // Only c is spoken in its own piece of b, c and d: a line take
+        // stands in for a, and the room is all b's and d's pieces hold.
+        let (_tmp, dir) = setup(PASSAGE);
+        let mut audio = noise(16.0);
+        for (from, to) in [(10.0, 12.8), (16.5, 18.6)] {
+            burst(&mut audio, from - PASSAGE_FIRST_S, to - PASSAGE_FIRST_S);
+        }
+        // The cuts are given: a take that ends in a piece without speech
+        // is cut without it, so this one is written piece by piece.
+        let cuts = [0u32, 297_600, 439_200, 578_400, 768_000];
+        let project = Project::open(&dir).unwrap();
+        for (index, id) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            let (from, to) = (cuts[index], cuts[index + 1]);
+            let first_film_s = PASSAGE_FIRST_S + f64::from(from) / f64::from(RATE);
+            let input = RecordedInput {
+                sample_rate: RATE,
+                device: "Test Mic".to_owned(),
+                channel: 1,
+                line_offset_s: first_film_s - project.snapshot(id).unwrap().start,
+                snapshot: project.snapshot(id).unwrap(),
+                dropouts: None,
+                film_shift_ms: None,
+                passage: Some(PassagePiece {
+                    id: "0b0e7d9c-0000-4000-8000-000000000000".to_owned(),
+                    index: u32::try_from(index).unwrap(),
+                    count: 4,
+                    from_sample: u64::from(from),
+                    to_sample: u64::from(to),
+                    preroll_floor_dbfs: -60.0,
+                }),
+            };
+            let partial = begin_take(&dir, id, &input).unwrap();
+            let piece = &audio[to_usize_u(u64::from(from))..to_usize_u(u64::from(to))];
+            write_take_wav(&partial.wav, piece, RATE).unwrap();
+            let taken = commit_take(&dir, partial).unwrap();
+            if id != "a" {
+                choose(&dir, &taken);
+            }
+        }
+        let alone = take(&dir, "a", Some((2.0, 3.0)));
+        choose(&dir, &alone);
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_ranges_in_files(&dir, &report);
+        assert_eq!(
+            seams(&report),
+            [("a", None), ("b", Some("c")), ("c", Some("d")), ("d", None)]
+        );
+        assert_ranges_in_files(&dir, &report);
+        let (b, c, d) = (line(&report, "b"), line(&report, "c"), line(&report, "d"));
+        assert_eq!(b.source_samples, [141_600, 141_600]);
+        assert_eq!(b.dest_samples, [c.dest_samples[0]; 2]);
+        assert_eq!(c.dest_samples, [792_000 - 7_200, 892_800 + 7_200]);
+        assert_eq!(d.source_samples, [0, 0]);
+        assert_eq!(d.dest_samples, [c.dest_samples[1]; 2]);
+    }
+
+    /// [`PASSAGE`] read in one go, but line c late, after the cut before
+    /// d: c's own piece holds only the room.
+    fn c_read_late(dir: &Path) -> crate::passage::Passage {
+        let mut audio = noise(16.0);
+        for (from, to) in [(10.0, 12.8), (13.6, 15.8), (19.3, 20.2), (20.5, 21.5)] {
+            burst(&mut audio, from - PASSAGE_FIRST_S, to - PASSAGE_FIRST_S);
+        }
+        let passage = record_passage(dir, &["a", "b", "c", "d"], &audio);
+        let pieces = passage.pieces().unwrap();
+        let film = |sample: u64| PASSAGE_FIRST_S + sample as f64 / f64::from(RATE);
+        assert!(film(pieces[2].start) > 15.9 && film(pieces[2].end) < 19.2);
+        passage
+    }
+
+    fn piece_warnings(report: &ExportReport) -> Vec<(&str, &str)> {
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "passage-piece-without-speech")
+            .map(|w| (w.line.as_deref().unwrap(), w.message.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_piece_without_speech_names_the_piece_after_it_when_that_is_left_out() {
+        // c was read late, into d's piece; then d is read again on its
+        // own. c's words are in no exported audio.
+        let (_tmp, dir) = setup(PASSAGE);
+        let passage = c_read_late(&dir);
+        crate::passage::choose_passage(&dir, &passage.id, "narrator").unwrap();
+        let alone = take(&dir, "d", Some((2.1, 3.0)));
+        choose(&dir, &alone);
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [("a", Some("b")), ("b", Some("c")), ("c", None), ("d", None)]
+        );
+        assert_ranges_in_files(&dir, &report);
+        let warned = piece_warnings(&report);
+        assert_eq!(warned.len(), 1, "{report:?}");
+        let (line, message) = warned[0];
+        assert_eq!(line, "c");
+        assert!(
+            message.starts_with(
+                "takes/c/001.wav holds no speech, and c may be missing from the export"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("the piece after it, takes/d/001.wav, is not exported"),
+            "{message}"
+        );
+        assert!(message.contains("read late"), "{message}");
+        let m = manifest(&dir);
+        assert_eq!(m["warnings"][0]["message"], message);
+    }
+
+    #[test]
+    fn a_piece_without_speech_is_not_missing_when_the_piece_beside_it_is_only_cut_off() {
+        // a moved after the passage was recorded: it is cut from b, c and
+        // d, but its piece, with b's words read early, is still exported.
+        let (_tmp, dir) = setup(PASSAGE);
+        let (passage, _) = b_read_early(&dir);
+        crate::passage::choose_passage(&dir, &passage.id, "narrator").unwrap();
+        set_line_field(&dir, "a", Field::Start(9.9), None).unwrap();
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [("a", None), ("b", Some("c")), ("c", Some("d")), ("d", None)]
+        );
+        let warned = piece_warnings(&report);
+        assert_eq!(warned.len(), 1, "{report:?}");
+        assert!(
+            warned[0]
+                .1
+                .starts_with("takes/b/001.wav holds no speech: b was not spoken"),
+            "{report:?}"
+        );
     }
 
     #[test]
