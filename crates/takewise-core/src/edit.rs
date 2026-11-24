@@ -328,10 +328,19 @@ pub fn set_route(dir: &Path, input: Option<(&str, u16)>, output: Option<&str>) -
 /// Removes `[output] device` under the lock, keeping the file's comments
 /// and layout: the film and the takes play through the system's default
 /// output, by choice.
+/// `[output]` may be a table or an inline table (`output = { device =
+/// "…" }`); either way the key is removed, and an `output` of another kind
+/// is an error rather than a success that left the device in place.
 pub fn clear_output_device(dir: &Path) -> Result<()> {
     edit_project(dir, |doc| {
-        if let Some(table) = doc.get_mut("output").and_then(Item::as_table_mut) {
-            table.remove("device");
+        match doc.get_mut("output") {
+            None => {}
+            Some(output) => {
+                let table = output
+                    .as_table_like_mut()
+                    .ok_or("output is not a table, so its device cannot be removed")?;
+                table.remove("device");
+            }
         }
         Ok(())
     })
@@ -727,6 +736,31 @@ text = "Third."
         clear_output_device(&dir).unwrap();
         let config = crate::project::read_config(&dir).unwrap();
         assert_eq!(config.output.device, None);
+
+        // Written as an inline table, by hand or by an agent.
+        let path = dir.join("project.toml");
+        let text = fs::read_to_string(&path).unwrap().replace("[output]\n", "");
+        let text = format!("output = {{ device = \"Phones\" }}\n{text}");
+        fs::write(&path, &text).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.output.device.as_deref(), Some("Phones"), "{text}");
+        clear_output_device(&dir).unwrap();
+        let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.output.device, None);
+    }
+
+    #[test]
+    fn clear_output_device_refuses_an_output_that_is_no_table() {
+        let (_tmp, dir) = project();
+        let path = dir.join("project.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("output = \"Phones\"\n{text}")).unwrap();
+        assert!(clear_output_device(&dir).is_err());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("output = \"Phones\"")
+        );
     }
 
     #[test]
