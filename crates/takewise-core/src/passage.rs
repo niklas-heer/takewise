@@ -1092,7 +1092,9 @@ pub(crate) fn repair(dir: &Path, report: &mut RepairReport) -> Result<()> {
 
 /// What `status` reports of the passages: leftover partial files (returned,
 /// relative to the project), publishes a crash interrupted, and published
-/// passages that are not cut into takes yet.
+/// passages that are not cut into takes yet. An interrupted publish is one
+/// notice, `interrupted-passage`, not also a `partial-passage` for its
+/// audio.
 pub(crate) fn notices(
     project: &Project,
     ledger: &Ledger,
@@ -1138,7 +1140,19 @@ pub(crate) fn notices(
         };
         notices.push(Problem::new(None, code, message));
     }
-    for rel in files.partials.iter().filter(|rel| !paired.contains(*rel)) {
+    // The partial audio of a passage whose sidecar is published belongs to
+    // an interrupted publish, which is reported once, below.
+    let publishing = |rel: &PathBuf| {
+        rel.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix('.')?.strip_suffix(".wav.partial"))
+            .is_some_and(|id| files.metas.contains(id))
+    };
+    for rel in files
+        .partials
+        .iter()
+        .filter(|rel| !paired.contains(*rel) && !publishing(rel))
+    {
         notices.push(Problem::new(
             None,
             "partial-passage",
@@ -2144,7 +2158,8 @@ text = "Later."
         // The window still holds the audio: it finishes the publish itself.
         let state = fold(&Project::open(&dir).unwrap(), &read(&dir).unwrap());
         let codes: Vec<&str> = state.notices.iter().map(|n| n.code).collect();
-        assert_eq!(codes, vec!["partial-passage", "interrupted-passage"]);
+        assert_eq!(codes, vec!["interrupted-passage"], "said once");
+        assert_eq!(state.partials.len(), 1, "the audio is still listed");
         assert_eq!(repair(&dir).unwrap().pieces, vec![]);
         assert!(partial.wav.exists());
 
