@@ -163,7 +163,7 @@ impl RecordingWindow {
         if let Err(err) = self.media.film_open(&self.project.film_path()) {
             self.message = Some(format!("Could not reopen the film: {err}"));
         }
-        self.media.film_set_gain_db(self.film_gain_db);
+        self.media.film_set_gain_db(self.volumes.film);
         self.media.film_set_muted(false);
         self.recorder.rewarm();
         self.park();

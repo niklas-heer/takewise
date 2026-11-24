@@ -6,13 +6,15 @@
 //! those short writes, never while recording. The microphone is never
 //! monitored: capture feeds the take and the meters only (monitoring waits
 //! behind the `Media` seam for its hardware spike). The audio panel (A)
-//! picks devices between takes and sets the film and monitor volume. Takes are
-//! checked on a worker thread after each commit and whenever a reload finds
-//! takes without a current check.
+//! picks devices between takes; the levels under the takes set how loud the
+//! film and the takes played back are. Takes are checked on a worker thread
+//! after each commit and whenever a reload finds takes without a current
+//! check.
 
 mod checks;
 mod clock;
 mod latency;
+mod levels;
 mod lines;
 mod media;
 mod meter;
@@ -37,7 +39,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::input::{InputEvent, InputState};
-use gpui_kit::base::slider::SliderEvent;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Global,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, ParentElement as _, Render,
@@ -480,10 +481,10 @@ pub struct RecordingWindow {
     /// The connected inputs as last checked.
     inputs: Vec<AvailableInput>,
     panel: panel::Panel,
-    /// The film and monitor volume in dB as set now, and when they last
+    /// The levels' sliders, the levels in dB as set now, and when they last
     /// changed while not yet written to `project.toml`.
-    film_gain_db: f64,
-    monitor_db: f64,
+    levels: levels::Levels,
+    volumes: levels::Volumes,
     volumes_changed_at: Option<f64>,
     peak_meter: meter::PeakMeter,
     /// Peaks of takes committed in this session, for the "clipped" mark
@@ -564,26 +565,10 @@ impl RecordingWindow {
         let models_dir = tw::whisper::models_dir();
         let checks_for = check_key(&loaded.project, &models_dir);
         let loaded_unchecked = loaded.unchecked;
-        let film_gain_db = loaded.project.config.record.film_gain_db;
-        let monitor_db = loaded.project.config.monitor.volume_db;
-        let panel = panel::Panel::new(film_gain_db, monitor_db, cx);
+        let volumes = levels::Volumes::of(&loaded.project.config);
+        let (levels, on_levels) = levels::Levels::new(volumes, window, cx);
         let mut subscriptions = vec![on_quit];
-        for (slider, film) in [(&panel.film_slider, true), (&panel.monitor_slider, false)] {
-            subscriptions.push(cx.subscribe_in(
-                slider,
-                window,
-                move |view: &mut Self, _, event: &SliderEvent, _, cx| {
-                    let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
-                    let db = f64::from(value.end());
-                    if film {
-                        view.set_volumes(db, view.monitor_db);
-                    } else {
-                        view.set_volumes(view.film_gain_db, db);
-                    }
-                    cx.notify();
-                },
-            ));
-        }
+        subscriptions.extend(on_levels);
         let mut view = Self {
             dir,
             media,
@@ -605,9 +590,9 @@ impl RecordingWindow {
             focus,
             subscriptions,
             inputs: Vec::new(),
-            panel,
-            film_gain_db,
-            monitor_db,
+            panel: panel::Panel::new(),
+            levels,
+            volumes,
             volumes_changed_at: None,
             peak_meter: meter::PeakMeter::default(),
             take_peaks: HashMap::new(),
@@ -1203,9 +1188,9 @@ impl RecordingWindow {
         self.scroll.at(now)
     }
 
-    /// The lines and the current line's takes. The line list scrolls just
-    /// enough to show the current line whenever that changed: with the
-    /// arrows, with a passage take moving on, or with a reload.
+    /// The lines, the current line's takes and the levels. The line list
+    /// scrolls just enough to show the current line whenever that changed:
+    /// with the arrows, with a passage take moving on, or with a reload.
     fn side_column(&mut self) -> gpui_kit::AnyElement {
         if self.lines_shown != Some(self.line) {
             self.lines_shown = Some(self.line);
@@ -1232,6 +1217,7 @@ impl RecordingWindow {
                     .unwrap_or_default(),
                 &self.clipped_takes(),
             ))
+            .child(self.render_levels())
             .into_any_element()
     }
 
@@ -1693,7 +1679,7 @@ fn not_rescued_note(without: (usize, usize), failed: &recorder::RescueFailed) ->
 
 /// The audio keys: the panel (A), monitoring (H), the clipping light (K),
 /// the setup check (C) and its latency step alone (L), and the film and
-/// monitor volume.
+/// monitor levels.
 fn audio_actions(
     root: gpui_kit::Stateful<gpui_kit::Div>,
     cx: &mut Context<RecordingWindow>,
@@ -1732,16 +1718,16 @@ fn audio_actions(
         cx.notify();
     }))
     .on_action(cx.listener(|view, _: &FilmQuieter, window, cx| {
-        view.step_volume(-panel::STEP_DB, 0.0, window, cx);
+        view.step_level(levels::Level::Film, -levels::STEP_DB, window, cx);
     }))
     .on_action(cx.listener(|view, _: &FilmLouder, window, cx| {
-        view.step_volume(panel::STEP_DB, 0.0, window, cx);
+        view.step_level(levels::Level::Film, levels::STEP_DB, window, cx);
     }))
     .on_action(cx.listener(|view, _: &MonitorQuieter, window, cx| {
-        view.step_volume(0.0, -panel::STEP_DB, window, cx);
+        view.step_level(levels::Level::Monitor, -levels::STEP_DB, window, cx);
     }))
     .on_action(cx.listener(|view, _: &MonitorLouder, window, cx| {
-        view.step_volume(0.0, panel::STEP_DB, window, cx);
+        view.step_level(levels::Level::Monitor, levels::STEP_DB, window, cx);
     }))
 }
 

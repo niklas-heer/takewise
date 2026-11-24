@@ -1,31 +1,22 @@
 //! The audio panel (A): input, channel and output pickers, a live meter per
-//! input channel, film and monitor volume, the monitor switch with the
-//! reason it is off, the direct-monitoring hint, and device problems in
-//! plain words with a "Switch to 48 kHz" button.
+//! input channel, the monitor switch with the reason it is off, the
+//! direct-monitoring hint, and device problems in plain words with a
+//! "Switch to 48 kHz" button. The levels are always on screen, under the
+//! takes (see `levels`).
 //!
 //! Device and route changes apply between takes only; during a take the
 //! pickers are disabled.
 
-use gpui_kit::base::slider::SliderState;
-use gpui_kit::base::{Select, Slider, SliderIndicator, SliderThumb, SliderTrack, Switch};
+use gpui_kit::base::{Select, Switch};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
-    div, prelude::FluentBuilder as _, px, relative, rgb,
+    AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use takewise_core::{self as tw, AvailableInput, RECORD_RATE, Route};
 
 use super::{RecordingWindow, colors, meter};
 
-/// Film volume range in dB (AVPlayer cannot amplify).
-pub const FILM_DB: (f64, f64) = (-60.0, 0.0);
-/// Monitor volume range in dB.
-pub const MONITOR_DB: (f64, f64) = (-60.0, 6.0);
-/// One volume key press.
-pub const STEP_DB: f64 = 1.0;
-/// How long a volume change waits before it is written to `project.toml`
-/// (a dragged slider writes once).
-pub const VOLUME_SAVE_DELAY_S: f64 = 0.5;
 /// How long to wait before reopening a channel meter that failed.
 const METER_RETRY_S: f64 = 2.0;
 
@@ -110,22 +101,10 @@ pub struct Panel {
     /// it was, and that a Bluetooth output may need measuring again (see
     /// `remembered.rs`).
     pub remembered: Option<String>,
-    pub film_slider: Entity<SliderState>,
-    pub monitor_slider: Entity<SliderState>,
 }
 
 impl Panel {
-    pub fn new(film_db: f64, monitor_db: f64, cx: &mut Context<RecordingWindow>) -> Self {
-        #[allow(clippy::cast_possible_truncation)]
-        let slider = |(min, max): (f64, f64), value: f64, cx: &mut Context<RecordingWindow>| {
-            cx.new(|_| {
-                SliderState::new()
-                    .min(min as f32)
-                    .max(max as f32)
-                    .step(STEP_DB as f32)
-                    .default_value(value as f32)
-            })
-        };
+    pub fn new() -> Self {
         Self {
             open: false,
             picker: None,
@@ -134,14 +113,12 @@ impl Panel {
             meter_retry_at: 0.0,
             calibration: None,
             remembered: None,
-            film_slider: slider(FILM_DB, film_db, cx),
-            monitor_slider: slider(MONITOR_DB, monitor_db, cx),
         }
     }
 }
 
 /// A tooltip's text.
-struct Tip(SharedString);
+pub(super) struct Tip(pub SharedString);
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -275,77 +252,6 @@ impl RecordingWindow {
             Err(err) => format!("{err}. Recording stays off until the input runs at 48 kHz."),
         });
         self.check_inputs();
-    }
-
-    /// Changes the film and/or monitor volume by `film`/`monitor` dB,
-    /// clamped to their ranges. The film's level changes at once, also
-    /// during a take; `project.toml` is written shortly after, between
-    /// takes.
-    pub(super) fn step_volume(
-        &mut self,
-        film: f64,
-        monitor: f64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let film_db = (self.film_gain_db + film).clamp(FILM_DB.0, FILM_DB.1);
-        let monitor_db = (self.monitor_db + monitor).clamp(MONITOR_DB.0, MONITOR_DB.1);
-        self.set_volumes(film_db, monitor_db);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            self.panel
-                .film_slider
-                .update(cx, |s, cx| s.set_value(film_db as f32, window, cx));
-            self.panel
-                .monitor_slider
-                .update(cx, |s, cx| s.set_value(monitor_db as f32, window, cx));
-        }
-        cx.notify();
-    }
-
-    /// Sets both volumes (from a key or a slider).
-    pub(super) fn set_volumes(&mut self, film_db: f64, monitor_db: f64) {
-        if (film_db - self.film_gain_db).abs() > f64::EPSILON {
-            self.film_gain_db = film_db;
-            self.media.film_set_gain_db(film_db);
-        }
-        self.monitor_db = monitor_db;
-        self.project.config.record.film_gain_db = self.film_gain_db;
-        self.project.config.monitor.volume_db = self.monitor_db;
-        self.volumes_changed_at = Some(self.media.host_now_s());
-    }
-
-    /// Writes changed volumes to `project.toml` once they rested a moment,
-    /// never during a take (or at once with `now`).
-    pub(super) fn save_volumes(&mut self, now: bool) {
-        let Some(changed) = self.volumes_changed_at else {
-            return;
-        };
-        let rested = self.media.host_now_s() - changed >= VOLUME_SAVE_DELAY_S;
-        if self.recorder.is_recording() || !(now || rested) {
-            return;
-        }
-        self.volumes_changed_at = None;
-        let volumes = tw::Volumes {
-            film_gain_db: Some(self.film_gain_db),
-            voice_gain_db: None,
-            monitor_db: Some(self.monitor_db),
-        };
-        if let Err(err) = tw::set_volumes(&self.dir, volumes) {
-            self.message = Some(format!("Could not save the volume: {err}"));
-        }
-    }
-
-    /// After a reload: unsaved volume changes stay; otherwise the file's
-    /// values (an agent may have edited them) are taken.
-    pub(super) fn sync_volumes(&mut self) {
-        if self.volumes_changed_at.is_some() {
-            self.project.config.record.film_gain_db = self.film_gain_db;
-            self.project.config.monitor.volume_db = self.monitor_db;
-        } else {
-            self.film_gain_db = self.project.config.record.film_gain_db;
-            self.monitor_db = self.project.config.monitor.volume_db;
-        }
     }
 
     /// H: monitoring is toggled between takes only; until it is available,
@@ -484,23 +390,6 @@ impl RecordingWindow {
                 output.as_deref(),
                 enabled,
                 cx,
-            ))
-            .child(volume(
-                "Film volume",
-                &self.panel.film_slider,
-                self.film_gain_db,
-                "− / +",
-            ))
-            .child(volume(
-                "Monitor volume",
-                &self.panel.monitor_slider,
-                self.monitor_db,
-                // The keys are not advertised while monitoring cannot run.
-                if self.media.monitor_unavailable().is_some() {
-                    ""
-                } else {
-                    ", / ."
-                },
             ))
             .child(self.monitor_switch())
             .children(self.latency_notes())
@@ -724,71 +613,6 @@ fn button(
         .text_color(rgb(colors::BACKGROUND))
         .when(enabled, |el| el.cursor_pointer())
         .child(label)
-}
-
-/// A labelled volume slider with its value and keys.
-fn volume(
-    label: &'static str,
-    state: &Entity<SliderState>,
-    db: f64,
-    keys: &'static str,
-) -> AnyElement {
-    let (min, max) = if label.starts_with("Film") {
-        FILM_DB
-    } else {
-        MONITOR_DB
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let fill = ((db - min) / (max - min)).clamp(0.0, 1.0) as f32;
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(4.))
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .text_color(rgb(colors::DIM))
-                .child(label)
-                .child(if keys.is_empty() {
-                    format!("{db:+.0} dB")
-                } else {
-                    format!("{db:+.0} dB · {keys}")
-                }),
-        )
-        .child(
-            Slider::new(state)
-                .accessibility_label(label)
-                .w_full()
-                .h(px(16.))
-                .child(
-                    SliderTrack::new(state)
-                        .relative()
-                        .w_full()
-                        .h(px(16.))
-                        .flex()
-                        .items_center()
-                        .child(
-                            SliderIndicator::new(state)
-                                .w_full()
-                                .h(px(4.))
-                                .rounded(px(2.))
-                                .bg(rgb(colors::SELECTED))
-                                .child(div().h_full().w(relative(fill)).bg(rgb(colors::ACCENT))),
-                        )
-                        .child(
-                            SliderThumb::new(state)
-                                .absolute()
-                                .top(px(2.))
-                                .left(relative(fill))
-                                .ml(px(-6.))
-                                .size(px(12.))
-                                .rounded_full()
-                                .bg(rgb(colors::TEXT)),
-                        ),
-                ),
-        )
-        .into_any_element()
 }
 
 #[cfg(test)]

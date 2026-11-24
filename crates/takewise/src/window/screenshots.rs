@@ -158,9 +158,9 @@ const LOOP_TAKES: [usize; 2] = [4, 5];
 const LOOP_WIDTH: u32 = 1000;
 /// The loop's close-up of the takes and their verdicts, in logical pixels
 /// of a [`HERO`] window: the side column's list of takes, which begins
-/// halfway down the column above the key hints (two rows of them at this
-/// width).
-const CLOSE_UP: (f32, f32, f32, f32) = (700.0, 293.5, 300.0, 128.0);
+/// halfway down the room the levels leave above the key hints (two rows
+/// of them at this width).
+const CLOSE_UP: (f32, f32, f32, f32) = (700.0, 245.5, 300.0, 128.0);
 
 /// Runs `takewise screenshots <work> <out>`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -596,6 +596,7 @@ impl Media for DemoMedia {
     fn take_play_at(&mut self, _: f64, _: f64) -> Result<(), String> {
         Ok(())
     }
+    fn take_set_gain_db(&mut self, _: f64) {}
     fn stop_take(&mut self) {}
     fn outputs(&self) -> Vec<DeviceInfo> {
         vec![
@@ -1003,8 +1004,8 @@ async fn setup_check(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     )
 }
 
-/// The audio panel's devices, channel meters and film volume, with the
-/// input meter below it lit red by a peak near clipping.
+/// The audio panel's devices and channel meters, with the input meter
+/// below it lit red by a peak near clipping.
 async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), String> {
     let shot = Shot::open(&demo.dir, WINDOW, false, cx).await?;
     shot.update(cx, |view| {
@@ -1025,14 +1026,14 @@ async fn audio_panel(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), S
     shot.run_until(cx, now + 1.9).await;
     let image = shot.render(cx).await?;
     shot.close(cx);
-    // The panel (between the film and the side column) down to the film
-    // volume, and the meter row under the film: two cards, centred, each
-    // as wide as what it holds.
+    // The panel (between the film and the side column) down to the output,
+    // and the meter row under the film: two cards, centred, each as wide as
+    // what it holds.
     let scale = scale_of(&image, WINDOW.0);
     let panel = crop(
         &image,
         WINDOW.0,
-        (WINDOW.0 - 300.0 - 320.0, 0.0, 319.0, 362.0),
+        (WINDOW.0 - 300.0 - 320.0, 0.0, 319.0, 302.0),
     );
     let meter = crop(&image, WINDOW.0, (266.0, 500.0, 374.0, 44.0));
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1500,7 +1501,7 @@ async fn take_list(demo: &Demo, out: &Path, cx: &mut AsyncApp) -> Result<(), Str
     write_png(
         &out.join("takes.png"),
         &framed(
-            &crop(&image, WINDOW.0, (WINDOW.0 - 300.0, 392.0, 300.0, 230.0)),
+            &crop(&image, WINDOW.0, (WINDOW.0 - 300.0, 344.0, 300.0, 230.0)),
             scale,
         ),
     )

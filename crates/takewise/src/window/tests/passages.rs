@@ -512,7 +512,8 @@ fn shift_p_plays_the_whole_passage_locked_to_the_film(cx: &mut TestAppContext) {
     assert_eq!(
         f.media.0.borrow().take,
         Some(OpenTake {
-            output: Some("Test Phones".to_owned())
+            output: Some("Test Phones".to_owned()),
+            gains_db: vec![0.0],
         }),
         "the passage plays where the film does"
     );

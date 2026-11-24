@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
+use gpui_kit::base::slider::{SliderEvent, SliderValue};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Entity, TestAppContext, VisualTestContext,
@@ -20,6 +21,7 @@ use takewise_media::{CaptureBuffer, DeviceInfo, Frame, OutputSource, Transport};
 
 use super::checks::{Checker, Checks, SharedTranscriber, worker_tag};
 use super::clock::FilmClock;
+use super::levels::Level;
 use super::{Media, RecordingWindow, bind_keys, load};
 
 mod passages;
@@ -78,6 +80,8 @@ struct OpenTake {
     /// Where it plays (`None`: the system default): the output last set,
     /// when it was opened or since.
     output: Option<String>,
+    /// Every level set on it, in order; it opens at full level.
+    gains_db: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -276,7 +280,10 @@ impl Media for FakeMedia {
             ));
         }
         fake.opened_takes.push(path.to_owned());
-        fake.take = Some(OpenTake { output });
+        fake.take = Some(OpenTake {
+            output,
+            gains_db: Vec::new(),
+        });
         Ok(())
     }
     fn take_ready(&self) -> bool {
@@ -285,6 +292,11 @@ impl Media for FakeMedia {
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {
         self.0.borrow_mut().take_plays.push((take_s, host_s));
         Ok(())
+    }
+    fn take_set_gain_db(&mut self, db: f64) {
+        if let Some(take) = &mut self.0.borrow_mut().take {
+            take.gains_db.push(db);
+        }
     }
     fn stop_take(&mut self) {}
     fn outputs(&self) -> Vec<DeviceInfo> {
@@ -2734,7 +2746,7 @@ fn volume_keys_match_characters(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     let volumes = |f: &Fixture, cx: &mut TestAppContext| {
         f.view
-            .read_with(cx, |view, _| (view.film_gain_db, view.monitor_db))
+            .read_with(cx, |view, _| (view.volumes.film, view.volumes.monitor))
     };
     assert_eq!(volumes(&f, cx), (-12.0, -6.0));
     press(cx, f.window, &["-"]);
@@ -2781,6 +2793,97 @@ fn volume_keys_match_characters(cx: &mut TestAppContext) {
         -2.0,
         "the reload after the take keeps it"
     );
+}
+
+/// The value `level`'s slider shows.
+fn slider_db(cx: &mut TestAppContext, f: &Fixture, level: Level) -> f32 {
+    f.view.read_with(cx, |view, cx| {
+        view.levels.slider(level).read(cx).value().end()
+    })
+}
+
+/// Drags `level`'s slider to `db`, as the slider reports a drag.
+fn drag_slider(cx: &mut TestAppContext, f: &Fixture, level: Level, db: f32) {
+    let slider = f
+        .view
+        .read_with(cx, |view, _| view.levels.slider(level).clone());
+    slider.update(cx, |_, cx| {
+        cx.emit(SliderEvent::Change(SliderValue::from(db)));
+    });
+    slider.update(cx, |_, cx| {
+        cx.emit(SliderEvent::Release(SliderValue::from(db)));
+    });
+}
+
+#[gpui_kit::test]
+fn keys_move_the_level_sliders(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    assert_eq!(slider_db(cx, &f, Level::Film), -12.0);
+    assert_eq!(slider_db(cx, &f, Level::Voice), 0.0);
+    press(cx, f.window, &["-", "-", ","]);
+    assert_eq!(slider_db(cx, &f, Level::Film), -14.0);
+    assert_eq!(slider_db(cx, &f, Level::Monitor), -7.0);
+
+    drag_slider(cx, &f, Level::Film, -30.0);
+    f.view
+        .read_with(cx, |view, _| assert_eq!(view.volumes.film, -30.0));
+    assert_eq!(f.media.0.borrow().film_gain_db, Some(-30.0));
+    f.media.set_now(101.0);
+    frame(cx, f.window);
+    assert_eq!(config(&f.dir).record.film_gain_db, -30.0);
+}
+
+#[gpui_kit::test]
+fn the_monitor_level_shows_only_while_monitoring_can_run(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let shown = |cx: &mut TestAppContext| f.view.read_with(cx, |view, _| view.shown_levels());
+    assert_eq!(shown(cx), [Level::Film, Level::Voice]);
+    f.media.0.borrow_mut().monitor_unavailable = None;
+    assert_eq!(shown(cx), [Level::Film, Level::Voice, Level::Monitor]);
+}
+
+#[gpui_kit::test]
+fn the_voice_level_plays_takes_back_quieter(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let gains = |f: &Fixture| {
+        let fake = f.media.0.borrow();
+        fake.take.as_ref().map(|take| take.gains_db.clone())
+    };
+    press(cx, f.window, &["down", "down", "down"]); // d
+    record_take(cx, &f);
+    drag_slider(cx, &f, Level::Voice, -9.0);
+    assert_eq!(gains(&f), None, "no take is open to set");
+
+    // Set before the take starts, with the film.
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(gains(&f), Some(vec![-9.0]));
+    assert_eq!(f.media.0.borrow().take_plays.len(), 1);
+    assert_eq!(
+        f.media.0.borrow().film_gain_db,
+        Some(-12.0),
+        "the film keeps its level"
+    );
+
+    // Changed while it plays: at once, and saved while it still plays.
+    drag_slider(cx, &f, Level::Voice, -20.0);
+    assert_eq!(gains(&f), Some(vec![-9.0, -20.0]));
+    f.media.set_now(201.0);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    let saved = config(&f.dir);
+    assert_eq!(saved.record.voice_gain_db, -20.0);
+    assert_eq!(saved.record.film_gain_db, -12.0);
+
+    // The next playback starts at the new level; above 0 dB is refused.
+    press(cx, f.window, &["p", "p"]);
+    frame(cx, f.window);
+    assert_eq!(gains(&f), Some(vec![-20.0]));
+    drag_slider(cx, &f, Level::Voice, 6.0);
+    f.view
+        .read_with(cx, |view, _| assert_eq!(view.volumes.voice, 0.0));
 }
 
 /// −0.4 dBFS: near clipping, not clipped.

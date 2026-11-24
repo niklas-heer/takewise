@@ -56,6 +56,9 @@ pub trait Media {
     /// Plays take time `take_s` at `host_s` (a negative `take_s` delays the
     /// take's beginning).
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String>;
+    /// The open take's level in dB (0 at most), at once, also while it
+    /// plays.
+    fn take_set_gain_db(&mut self, db: f64);
     fn stop_take(&mut self);
 
     /// The connected output devices.
@@ -213,6 +216,12 @@ impl Media for RealMedia {
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {
         let take = self.take.as_ref().ok_or("no take is open")?;
         take.play_at(take_s, host_s).map_err(|err| err.to_string())
+    }
+
+    fn take_set_gain_db(&mut self, db: f64) {
+        if let Some(take) = &self.take {
+            take.set_gain_db(db);
+        }
     }
 
     fn stop_take(&mut self) {

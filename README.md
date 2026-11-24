@@ -95,7 +95,7 @@ takewise record demo.takewise
 2. **Recommended: press C** for the setup check: your voice level, the room tone, and the latency, measured with your headphones held to the microphone. Enter goes on, Space starts each measurement, and Enter finishes. Without it, Space records all the same, but takes are placed without a latency correction and the export skips noise reduction.
 3. **Press Space** to record. The film starts 3 s before the line (`[record] preroll_s`; projects made before 0.1.2 keep 2 s) and counts in 3-2-1; read as the words fill. Space stops the take, or it ends by itself 1.5 s after the slot.
 4. **Wait for the verdict.** "checking…" turns into `keep`, `listen` or `retake`, with the reason.
-5. **Press P** to play the take back with the film.
+5. **Press P** to play the take back with the film. The **Levels** under the takes set how loud the film and your voice play.
 6. **Press R or Enter.** If the check flags a problem you hear on playback, press R and try again; otherwise press Enter to choose it. Then close the window.
 
 Then export:
@@ -119,9 +119,9 @@ Opened from the Dock or Finder, `Takewise.app` shows a start window instead: **O
 
 ### Reading to picture
 
-<p align="center"><img src="docs/images/recording.png" alt="The recording window during a take of a long line, at 0:48.0 of the film: a REC badge over the ocean and clouds, the slot bar half run out, and the line scrolled up by one row, showing &quot;that run for hundreds of miles. The wind lines them up like waves on a beach,&quot; filled and &quot;one behind the other, all the way to the edge of&quot; still to come, with the next line below." width="830"><br><sub>A long line during a take: it has scrolled up a row, so the current words stay in the middle.</sub></p>
+<p align="center"><img src="docs/images/recording.png" alt="The recording window during a take of a long line, at 0:48.0 of the film: a REC badge over the ocean and clouds, the slot bar half run out, and the line scrolled up by one row, showing &quot;that run for hundreds of miles. The wind lines them up like waves on a beach,&quot; filled and &quot;one behind the other, all the way to the edge of&quot; still to come, with the next line below. Under the takes, the levels: film at −12 dB, voice at 0 dB." width="830"><br><sub>A long line during a take: it has scrolled up a row, so the current words stay in the middle.</sub></p>
 
-The window shows the film, the line to read, its note for the narrator and the next line. A bar shows the slot running out. A line longer than three rows scrolls with the pace guide. E fixes a line's wording in place.
+The window shows the film, the line to read, its note for the narrator and the next line. A bar shows the slot running out. A line longer than three rows scrolls with the pace guide. E fixes a line's wording in place. Under the takes, **Levels** sets how loud the film plays and how loud your takes play back with P: drag a slider, or press − and + for the film. A change is heard at once, also during a take, and is saved in `project.toml`.
 
 ### Passages: sentences that run on
 
@@ -148,9 +148,9 @@ The first finding is the reason shown under the take. These are automated checks
 
 ### Pick the microphone, watch the level
 
-<p align="center"><img src="docs/images/audio-panel.png" alt="The audio panel: the input &quot;USB Audio Interface&quot;, a live meter for each of its two channels with channel 1 moving, the output, the film volume at −12 dB, and below it the input meter with a red &quot;near clipping · K clears&quot; light." width="374"><br><sub>The audio panel, and a peak near clipping.</sub></p>
+<p align="center"><img src="docs/images/audio-panel.png" alt="The audio panel: the input &quot;USB Audio Interface&quot;, a live meter for each of its two channels with channel 1 moving, and the output; below it the input meter with a red &quot;near clipping · K clears&quot; light." width="374"><br><sub>The audio panel, and a peak near clipping.</sub></p>
 
-Press A for the audio panel. Pick the input and the channel your microphone is on: every channel has its own meter, so the one that moves is yours. Then pick the output the film plays through and set the film's volume. The input meter shows a target band and a near-clipping light that stays red until you clear it with K or start the next take.
+Press A for the audio panel. Pick the input and the channel your microphone is on: every channel has its own meter, so the one that moves is yours. Then pick the output your headphones are on: the film and the takes you play back both play there. The input meter shows a target band and a near-clipping light that stays red until you clear it with K or start the next take.
 
 Takewise records at 48 kHz from an input running at that rate. For an input set to another rate, the panel offers **Switch to 48 kHz**.
 
@@ -224,10 +224,10 @@ To place each take on its own instead, see [placing takes one by one](docs/agent
 | E | Edit the line's text (Enter saves, Esc cancels) |
 | ↑ / ↓ | Previous or next line |
 | ← / → | Previous or next take |
-| A | The audio panel: input, channel, output, volume, meters |
+| A | The audio panel: input, channel, output, meters |
 | C | The setup check |
 | L | Measure the latency again: the setup check's latency step alone (15 s) |
-| − / + | Film quieter or louder |
+| − / + | Film quieter or louder (the Film level) |
 | K | Clear the clipping light |
 | I | Install the speech model, while it is missing |
 

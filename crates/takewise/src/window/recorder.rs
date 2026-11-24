@@ -375,6 +375,8 @@ struct Playback {
     /// Film time of the take's first sample.
     take_first_film_s: f64,
     film_gain_db: f64,
+    /// The level the take plays at (`[record] voice_gain_db`).
+    voice_gain_db: f64,
     opened_host_s: f64,
     /// The film's scheduled timebase once both players started.
     started: Option<Timebase>,
@@ -1268,6 +1270,7 @@ impl Recorder {
             stop_film_s,
             take_first_film_s,
             film_gain_db: rec.film_gain_db,
+            voice_gain_db: rec.voice_gain_db,
             opened_host_s: media.host_now_s(),
             started: None,
         });
@@ -1327,10 +1330,20 @@ impl Recorder {
             stop_film_s: first_film_s + length_s,
             take_first_film_s: first_film_s,
             film_gain_db: project.config.record.film_gain_db,
+            voice_gain_db: project.config.record.voice_gain_db,
             opened_host_s: media.host_now_s(),
             started: None,
         });
         Ok(())
+    }
+
+    /// The film and voice levels a playback starts with, when they change
+    /// before it started (the window applies them to running players).
+    pub fn set_playback_levels(&mut self, film_db: f64, voice_db: f64) {
+        if let Phase::Playing(playback) = &mut self.phase {
+            playback.film_gain_db = film_db;
+            playback.voice_gain_db = voice_db;
+        }
     }
 
     pub fn stop_playback(&mut self, media: &mut dyn Media) {
@@ -1561,6 +1574,7 @@ fn start_both(media: &mut dyn Media, playback: &Playback, now: f64) -> Result<Ti
     media.film_set_muted(false);
     media.film_set_gain_db(playback.film_gain_db);
     let tb = media.film_play_at(playback.film_from_s, begin + playback.hold_s)?;
+    media.take_set_gain_db(playback.voice_gain_db);
     let take_host = tb.host_anchor_s + (playback.take_first_film_s - tb.film_anchor_s);
     if take_host > begin {
         // The take's first sample lies after the point the film starts
