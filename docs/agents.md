@@ -103,7 +103,7 @@ takewise check promo.takewise --json
         "speech": [2.0, 3.0],
         "overrun_s": -3.0,
         "peak_dbfs": -6.4,
-        "checker": "takewise 0.1.3 whisper ggml-large-v3-turbo.bin pre=hp60+norm"
+        "checker": "takewise 0.2.0 whisper ggml-large-v3-turbo.bin pre=hp60+norm"
       },
       {
         "line": "close",
