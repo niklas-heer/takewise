@@ -35,8 +35,9 @@ impl RecordingWindow {
     /// During a passage take, when the line being read moved on: the
     /// prompter starts the new line at the top, and the current line
     /// follows it (so the line list shows it, and the film rests there
-    /// after the take). The line a take stopped on is followed too, when
-    /// it moved on in the frame that stopped it.
+    /// after the take). When the take stops, the current line goes to the
+    /// line it rests on: the one being read when the narrator stopped it,
+    /// or the line it started on when it ran to its end.
     pub(super) fn follow_reading(&mut self) {
         let reading = self
             .recorder

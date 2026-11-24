@@ -122,8 +122,10 @@ pub struct Recorder {
     /// Takes whose audio could not be saved yet; kept in memory and retried.
     unsaved: Vec<Unsaved>,
     unsaved_retry_at: f64,
-    /// Which line the last passage take was reading when it stopped (from
-    /// 0, and its id), until the next take starts.
+    /// Which line the last passage take rests on (from 0, and its id),
+    /// until the next take starts: the line it was reading when the
+    /// narrator stopped it, or its first line when it ran to its end, so
+    /// Shift+Space picks it up there or reads it again whole.
     read_last: Option<(usize, String)>,
     /// Passages that could not be published yet; kept in memory and retried.
     unsaved_passages: Vec<Stopped>,
@@ -687,20 +689,27 @@ impl Recorder {
     /// into its takes on a worker thread: they are reported by a later
     /// [`Recorder::tick`].
     pub fn finish_take(&mut self, media: &mut dyn Media, dir: &Path) -> Update {
-        self.stop_take(media, dir, None)
+        self.stop_take(media, dir, None, false)
     }
 
     /// [`Recorder::finish_take`], with `why` the take stopped when it was
-    /// not the narrator who stopped it.
-    fn stop_take(&mut self, media: &mut dyn Media, dir: &Path, why: Option<String>) -> Update {
+    /// not the narrator who stopped it, and whether it ran to its end.
+    fn stop_take(
+        &mut self,
+        media: &mut dyn Media,
+        dir: &Path,
+        why: Option<String>,
+        ran_to_end: bool,
+    ) -> Update {
         let Phase::Recording(take) = mem::replace(&mut self.phase, Phase::Idle) else {
             return Update::default();
         };
         media.stop_capture();
         let mut take = *take;
         self.read_last = take.passage.as_ref().and_then(|passage| {
-            let line = passage.line()?;
-            Some((passage.reading, line.id.clone()))
+            let reading = if ran_to_end { 0 } else { passage.reading };
+            let line = passage.input.lines.get(reading)?;
+            Some((reading, line.id.clone()))
         });
         let written = take.writer.finish();
         // Stopped after audio arrived but before a frame scheduled the film:
@@ -1138,8 +1147,9 @@ impl Recorder {
                         ..Update::default()
                     };
                 }
+                let ran_to_end = failure.is_none();
                 let why = failure.map(|failure| format!("Recording stopped: {failure}"));
-                self.stop_take(media, dir, why)
+                self.stop_take(media, dir, why, ran_to_end)
             }
             Phase::Playing(playback) => match playback.started {
                 Some(tb) if tb.film_at(now) >= playback.stop_film_s => {

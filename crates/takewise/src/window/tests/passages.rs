@@ -229,14 +229,27 @@ fn shift_space_records_a_passage_as_one_file_and_a_take_per_line(cx: &mut TestAp
         "{shown}"
     );
     f.view.read_with(cx, |view, _| {
-        assert_eq!(view.line, 2, "the line read last stays current");
+        assert_eq!(
+            view.line, 0,
+            "a passage read to its end goes back to its first line"
+        );
         assert_eq!(view.take, Some(1), "its new take is selected");
         let take = &view.line_state().expect("line").takes[0];
         assert_eq!(
             super::super::takes::passage_mark(take).as_deref(),
-            Some("passage 3/3")
+            Some("passage 1/3")
         );
     });
+    // So Shift+Space reads the whole passage again.
+    f.media.set_now(200.0);
+    press(cx, f.window, &["shift-space"]);
+    let reading = f.view.read_with(cx, |view, _| {
+        view.recorder
+            .passage_reading()
+            .map(|(index, id)| (index, id.to_owned()))
+    });
+    assert_eq!(reading, Some((0, "a".to_owned())));
+    press(cx, f.window, &["space"]);
 }
 
 /// A passage whose first line is long enough to scroll.
@@ -467,7 +480,7 @@ fn p_plays_a_later_piece_from_its_own_start(cx: &mut TestAppContext) {
     // b's take begins at the cut before it, after the film's start point
     // (b's pre-roll from film 3.4): it starts later, from its beginning.
     let b_first = 5.4 + takes[1].2.line_offset_s;
-    press(cx, f.window, &["up"]); // b
+    press(cx, f.window, &["down"]); // b
     f.media.set_now(200.0);
     press(cx, f.window, &["p"]);
     let (film_s, host_s) = last_play(&f);
@@ -555,7 +568,7 @@ fn shift_enter_chooses_the_passage_for_every_line(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     record_passage(cx, &f);
     // Line b is read once more on its own: its take 2.
-    press(cx, f.window, &["up"]);
+    press(cx, f.window, &["down"]);
     begin(cx, &f, 300.0);
     f.media.set_now(300.5);
     press(cx, f.window, &["space"]);
