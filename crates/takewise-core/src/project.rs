@@ -222,6 +222,10 @@ pub struct RecordConfig {
     pub preroll_s: f64,
     pub tail_s: f64,
     pub film_gain_db: f64,
+    /// Consecutive lines belong to one passage while each line's slot ends
+    /// less than this many seconds before the next line starts (see
+    /// [`Script::passages`]); 0 makes every line a passage of its own.
+    pub passage_gap_s: f64,
 }
 
 impl Default for RecordConfig {
@@ -231,6 +235,7 @@ impl Default for RecordConfig {
             preroll_s: 3.0,
             tail_s: 1.5,
             film_gain_db: -12.0,
+            passage_gap_s: 1.0,
         }
     }
 }
@@ -423,6 +428,7 @@ mod tests {
         assert!((opened.config.record.preroll_s - 3.0).abs() < f64::EPSILON);
         assert!((opened.config.record.tail_s - 1.5).abs() < f64::EPSILON);
         assert!((opened.config.record.film_gain_db + 12.0).abs() < f64::EPSILON);
+        assert!((opened.config.record.passage_gap_s - 1.0).abs() < f64::EPSILON);
         assert_eq!(opened.config.check.language, "en");
         assert_eq!(opened.config.check.whisper_model, "ggml-large-v3-turbo.bin");
         assert_eq!(opened.script.lines, []);
@@ -444,6 +450,7 @@ mod tests {
         assert_eq!(config.calibration, None);
         assert_eq!(config.setup, None);
         assert_eq!(config.input.latency_offset_ms, 12);
+        assert!((config.record.passage_gap_s - 1.0).abs() < f64::EPSILON);
 
         // A new project's file has none of the new tables either.
         let dir = tmp.path().join("new");

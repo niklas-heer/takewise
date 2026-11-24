@@ -1,6 +1,7 @@
 //! The script: the lines to speak, their slots, and validation.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,31 @@ impl Script {
 
     pub fn position(&self, id: &str) -> Option<usize> {
         self.lines.iter().position(|line| line.id == id)
+    }
+
+    /// The script's passages: runs of consecutive lines in which each
+    /// line's slot ends less than `gap_s` before the next line starts
+    /// (`next.start − slot_end(k) < gap_s`), as index ranges in script
+    /// order. Every line is in exactly one; a line with a longer gap on
+    /// both sides is a passage of its own.
+    pub fn passages(&self, film_duration: f64, gap_s: f64) -> Vec<Range<usize>> {
+        let mut passages: Vec<Range<usize>> = Vec::new();
+        for (idx, line) in self.lines.iter().enumerate() {
+            match passages.last_mut() {
+                Some(passage) if line.start - self.slot_end(idx - 1, film_duration) < gap_s => {
+                    passage.end = idx + 1;
+                }
+                _ => passages.push(idx..idx + 1),
+            }
+        }
+        passages
+    }
+
+    /// The passage line `idx` belongs to (see [`Script::passages`]).
+    pub fn passage_of(&self, idx: usize, film_duration: f64, gap_s: f64) -> Option<Range<usize>> {
+        self.passages(film_duration, gap_s)
+            .into_iter()
+            .find(|passage| passage.contains(&idx))
     }
 }
 
@@ -260,6 +286,35 @@ note = "warm, a little wry"
         };
         let problems = validate(&script, 51.5);
         assert_eq!(problems[0].line.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn passages_join_lines_across_short_gaps() {
+        // Sentences 0.1 to 0.7 s apart, then pauses of 1.5 s and 2 s for
+        // the picture.
+        let script = Script {
+            lines: vec![
+                line("a", 0.0, Some(3.0)),
+                line("b", 3.1, Some(6.0)),
+                line("c", 6.7, Some(9.0)),
+                line("d", 10.5, Some(12.0)),
+                line("e", 14.0, Some(15.0)),
+                line("f", 15.0, None),
+                line("g", 20.0, Some(22.0)),
+            ],
+        };
+        // A slot without an end runs to the next line, so it joins it.
+        assert_eq!(script.passages(51.5, 1.0), vec![0..3, 3..4, 4..7]);
+        assert_eq!(script.passage_of(4, 51.5, 1.0), Some(4..7));
+        assert_eq!(script.passage_of(3, 51.5, 1.0), Some(3..4));
+        assert_eq!(script.passage_of(7, 51.5, 1.0), None);
+        // A gap of exactly the limit splits; a wider limit joins more, and
+        // none makes every line a passage of its own.
+        assert_eq!(script.passages(51.5, 1.5), vec![0..3, 3..4, 4..7]);
+        assert_eq!(script.passages(51.5, 1.75), vec![0..4, 4..7]);
+        let alone: Vec<_> = (0..7).map(|i| i..i + 1).collect();
+        assert_eq!(script.passages(51.5, 0.0), alone);
+        assert_eq!(Script::default().passages(51.5, 1.0), vec![]);
     }
 
     #[test]

@@ -152,6 +152,7 @@ mod tests {
             text: "A line.".to_owned(),
             start: 1.0,
             end: 4.0,
+            passage: "a".to_owned(),
             takes,
             chosen: chosen.map(|n| (n, "narrator".to_owned())),
             proposed: Some(proposed),

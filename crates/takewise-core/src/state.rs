@@ -38,6 +38,10 @@ pub struct LineState {
     pub start: f64,
     /// The resolved slot end.
     pub end: f64,
+    /// The passage the line belongs to, named by the id of its first line:
+    /// consecutive lines less than `[record] passage_gap_s` apart, which
+    /// can be recorded in one go.
+    pub passage: String,
     pub takes: Vec<TakeState>,
     /// The latest choice: take number and who chose it.
     #[serde(serialize_with = "serialize_chosen")]
@@ -93,6 +97,21 @@ fn serialize_chosen<S: Serializer>(
 }
 
 impl Project {
+    /// The script's passages by `[record] passage_gap_s`, as index ranges
+    /// in script order (see [`crate::Script::passages`]).
+    pub fn passages(&self) -> Vec<std::ops::Range<usize>> {
+        self.script
+            .passages(self.film_duration(), self.config.record.passage_gap_s)
+    }
+
+    /// The passage line `idx` belongs to: what a passage take of that line
+    /// records, from `idx` to the passage's end.
+    pub fn passage_of(&self, idx: usize) -> Option<std::ops::Range<usize>> {
+        self.passages()
+            .into_iter()
+            .find(|passage| passage.contains(&idx))
+    }
+
     /// The line as it is now, with its resolved slot end.
     pub fn snapshot(&self, line_id: &str) -> Option<Snapshot> {
         let idx = self.script.position(line_id)?;
@@ -223,10 +242,16 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
     let mut problems = validate(&project.script, project.film_duration());
     let mut notices = Vec::new();
     let mut lines = Vec::with_capacity(project.script.lines.len());
-    for line in &project.script.lines {
+    let passages = project.passages();
+    for (idx, line) in project.script.lines.iter().enumerate() {
         let Some(current) = project.snapshot(&line.id) else {
             continue;
         };
+        let passage = passages
+            .iter()
+            .find(|passage| passage.contains(&idx))
+            .and_then(|passage| project.script.lines.get(passage.start))
+            .map_or_else(|| line.id.clone(), |first| first.id.clone());
         let mut seen = HashSet::new();
         let mut takes = Vec::new();
         let mut ranks = Vec::new();
@@ -258,6 +283,7 @@ pub fn fold(project: &Project, ledger: &Ledger) -> State {
             text: current.text.clone(),
             start: current.start,
             end: current.end,
+            passage,
             takes,
             chosen,
             proposed,
@@ -1050,6 +1076,47 @@ text = "Today we start."
             }]
         );
         assert_eq!(line(&state, "opening").takes, []);
+    }
+
+    #[test]
+    fn fold_names_each_lines_passage() {
+        // Two sentences 0.5 s apart, then one after a pause of 2 s.
+        const SCRIPT: &str = r#"
+[[line]]
+id = "one"
+start = 10.0
+end = 13.0
+text = "One."
+
+[[line]]
+id = "two"
+start = 13.5
+end = 16.0
+text = "Two."
+
+[[line]]
+id = "three"
+start = 18.0
+text = "Three."
+"#;
+        let (_tmp, project) = setup(SCRIPT);
+        let state = fold_now(&project);
+        let passages: Vec<&str> = state.lines.iter().map(|l| l.passage.as_str()).collect();
+        assert_eq!(passages, ["one", "one", "three"]);
+        assert_eq!(project.passage_of(1), Some(0..2));
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["lines"][1]["passage"], "one");
+
+        // `[record] passage_gap_s` moves the limit.
+        let config = fs::read_to_string(project.dir.join("project.toml")).unwrap();
+        fs::write(
+            project.dir.join("project.toml"),
+            config.replace("passage_gap_s = 1.0", "passage_gap_s = 0.25"),
+        )
+        .unwrap();
+        let state = fold_now(&reopen(&project));
+        let passages: Vec<&str> = state.lines.iter().map(|l| l.passage.as_str()).collect();
+        assert_eq!(passages, ["one", "two", "three"]);
     }
 
     #[test]
