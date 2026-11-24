@@ -222,38 +222,38 @@ impl RecordingWindow {
         }
     }
 
-    /// Plays the film (and later the monitor) through `name`.
+    /// Plays the film and the takes (and later the monitor) through `name`.
     pub(super) fn choose_output(&mut self, name: &str) {
         let Some(note) = self.change_route(None, Some(name)) else {
             return;
         };
-        let said = match self.media.film_set_output(name) {
+        let said = match self.media.set_output(name) {
             Ok(()) => {
                 self.film_output = Some(name.to_owned());
                 self.check_inputs();
-                format!("The film plays through {name}.")
+                format!("The film and your takes play through {name}.")
             }
             Err(err) => {
-                format!("Saved {name} as the output, but the film cannot play there: {err}")
+                format!("Saved {name} as the output, but cannot play there: {err}")
             }
         };
         self.message = Some(format!("{said}{note}"));
     }
 
-    /// Plays the film through the configured output, if there is one; says
-    /// so when it is missing.
+    /// Plays the film and the takes through the configured output, if there
+    /// is one; says so when it is missing.
     pub(super) fn apply_output(&mut self) {
         let Some(name) = self.project.config.output.device.clone() else {
             return;
         };
-        if let Err(err) = self.media.film_set_output(&name) {
+        if let Err(err) = self.media.set_output(&name) {
             self.film_output = None;
             let fallback = self
                 .media
                 .default_output()
                 .unwrap_or_else(|| "the system output".to_owned());
             self.message = Some(format!(
-                "{name} is not connected ({err}); the film plays through {fallback}."
+                "{name} is not connected ({err}); the film and your takes play through {fallback}."
             ));
         } else {
             self.film_output = Some(name);

@@ -503,10 +503,19 @@ fn shift_space_on_a_passages_last_line_records_that_line(cx: &mut TestAppContext
 #[gpui_kit::test]
 fn shift_p_plays_the_whole_passage_locked_to_the_film(cx: &mut TestAppContext) {
     let f = open_passages(cx);
+    f.view
+        .update(cx, |view, _| view.choose_output("Test Phones"));
     record_passage(cx, &f);
     f.media.set_now(200.0);
     press(cx, f.window, &["shift-p"]);
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        f.media.0.borrow().take,
+        Some(OpenTake {
+            output: Some("Test Phones".to_owned())
+        }),
+        "the passage plays where the film does"
+    );
     // The passage file from its own first sample, film 0.6: both start at
     // host 200.3.
     let wav = passage_files(&f.dir, ".wav").remove(0);

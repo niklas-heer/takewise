@@ -123,6 +123,35 @@ impl Av {
         seconds(unsafe { self.player.currentTime() })
     }
 
+    /// Level in dB; AVPlayer cannot amplify, so gains above 0 dB play at
+    /// 0 dB.
+    fn set_gain_db(&self, db: f64) {
+        #[allow(clippy::cast_possible_truncation)]
+        let volume = 10f64.powf(db / 20.0).clamp(0.0, 1.0) as f32;
+        // SAFETY: a main-thread AVPlayer setter.
+        unsafe { self.player.setVolume(volume) };
+    }
+
+    /// Plays through the output device with this name instead of the
+    /// system's default output.
+    fn set_output_device(&self, name: &str) -> Result<()> {
+        let uid = crate::devices::uid(&crate::devices::find_output(name)?)?;
+        // SAFETY: a main-thread AVPlayer setter (macOS only) with a CoreAudio
+        // device UID.
+        unsafe {
+            self.player
+                .setAudioOutputDeviceUniqueID(Some(&NSString::from_str(&uid)));
+        };
+        Ok(())
+    }
+
+    /// The UID of the output device set with `set_output_device`; `None`
+    /// while the player follows the system's default output.
+    fn output_device_uid(&self) -> Option<String> {
+        // SAFETY: a main-thread AVPlayer read (macOS only).
+        unsafe { self.player.audioOutputDeviceUniqueID() }.map(|uid| uid.to_string())
+    }
+
     fn timebase(&self) -> Timebase {
         let now = host_time_now_s();
         // SAFETY: AVPlayerItem.timebase is readable on the main thread.
@@ -210,10 +239,7 @@ impl FilmPlayer {
     /// Film audio level in dB; AVPlayer cannot amplify, so gains above
     /// 0 dB play at 0 dB.
     pub fn set_gain_db(&self, db: f64) {
-        #[allow(clippy::cast_possible_truncation)]
-        let volume = 10f64.powf(db / 20.0).clamp(0.0, 1.0) as f32;
-        // SAFETY: a main-thread AVPlayer setter.
-        unsafe { self.av.player.setVolume(volume) };
+        self.av.set_gain_db(db);
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -224,15 +250,13 @@ impl FilmPlayer {
     /// Plays through the output device with this name instead of the
     /// system's default output.
     pub fn set_output_device(&self, name: &str) -> Result<()> {
-        let uid = crate::devices::uid(&crate::devices::find_output(name)?)?;
-        // SAFETY: a main-thread AVPlayer setter (macOS only) with a CoreAudio
-        // device UID.
-        unsafe {
-            self.av
-                .player
-                .setAudioOutputDeviceUniqueID(Some(&NSString::from_str(&uid)));
-        };
-        Ok(())
+        self.av.set_output_device(name)
+    }
+
+    /// The UID of the output device the film plays through; `None` while it
+    /// follows the system's default output.
+    pub fn output_device_uid(&self) -> Option<String> {
+        self.av.output_device_uid()
     }
 
     pub fn current_film_s(&self) -> f64 {
@@ -259,6 +283,10 @@ impl FilmPlayer {
 
 /// A take played locked to the film (a second AVPlayer, audio only). Main
 /// thread only.
+///
+/// It plays through the system's default output until
+/// [`TakePlayer::set_output_device`] says otherwise, so a take heard with
+/// the film needs the film's output set on it too.
 pub struct TakePlayer {
     av: Av,
 }
@@ -287,5 +315,23 @@ impl TakePlayer {
 
     pub fn stop(&self) {
         self.av.pause();
+    }
+
+    /// Take level in dB; AVPlayer cannot amplify, so gains above 0 dB play
+    /// at 0 dB. Takes effect at once, also while the take plays.
+    pub fn set_gain_db(&self, db: f64) {
+        self.av.set_gain_db(db);
+    }
+
+    /// Plays through the output device with this name instead of the
+    /// system's default output, also while the take plays.
+    pub fn set_output_device(&self, name: &str) -> Result<()> {
+        self.av.set_output_device(name)
+    }
+
+    /// The UID of the output device the take plays through; `None` while it
+    /// follows the system's default output.
+    pub fn output_device_uid(&self) -> Option<String> {
+        self.av.output_device_uid()
     }
 }

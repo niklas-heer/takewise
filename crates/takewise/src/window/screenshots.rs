@@ -618,7 +618,7 @@ impl Media for DemoMedia {
     fn default_output(&self) -> Option<String> {
         Some(SPEAKERS.to_owned())
     }
-    fn film_set_output(&mut self, device: &str) -> Result<(), String> {
+    fn set_output(&mut self, device: &str) -> Result<(), String> {
         if self.outputs().iter().any(|output| output.name == device) {
             Ok(())
         } else {

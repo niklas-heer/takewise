@@ -48,7 +48,9 @@ pub trait Media {
     /// The capture's last error, such as an unplugged device.
     fn capture_error(&self) -> Option<String>;
 
-    /// Opens a take for playback; it loads asynchronously.
+    /// Opens a take (or a passage) for playback, through the output set
+    /// with [`Media::set_output`]; it loads asynchronously. Fails when that
+    /// output cannot be used, rather than playing elsewhere.
     fn open_take(&mut self, path: &Path) -> Result<(), String>;
     fn take_ready(&self) -> bool;
     /// Plays take time `take_s` at `host_s` (a negative `take_s` delays the
@@ -60,8 +62,10 @@ pub trait Media {
     fn outputs(&self) -> Vec<DeviceInfo>;
     /// The name of the system's default output device.
     fn default_output(&self) -> Option<String>;
-    /// Plays the film through the output device with this name.
-    fn film_set_output(&mut self, device: &str) -> Result<(), String>;
+    /// Plays the film and the takes through the output device with this
+    /// name: the film and an open take at once, and every film and take
+    /// opened later.
+    fn set_output(&mut self, device: &str) -> Result<(), String>;
     /// Starts metering every channel of `device` (replacing any meter).
     fn start_channel_meter(&mut self, device: &str) -> Result<(), String>;
     fn stop_channel_meter(&mut self);
@@ -82,7 +86,7 @@ pub trait Media {
 /// The real media: AVPlayer for the film and takes, cpal for capture.
 pub struct RealMedia {
     film: FilmPlayer,
-    /// The output the film was last set to play through.
+    /// The output the film and takes were last set to play through.
     output: Option<String>,
     take: Option<TakePlayer>,
     capture: Option<Capture>,
@@ -100,13 +104,6 @@ impl RealMedia {
             capture: None,
             meter: None,
         })
-    }
-
-    /// Plays the film through the output device with this name.
-    pub fn set_output_device(&self, name: &str) -> Result<(), String> {
-        self.film
-            .set_output_device(name)
-            .map_err(|err| err.to_string())
     }
 }
 
@@ -199,7 +196,13 @@ impl Media for RealMedia {
 
     fn open_take(&mut self, path: &Path) -> Result<(), String> {
         self.stop_take();
-        self.take = Some(TakePlayer::open(path).map_err(|err| err.to_string())?);
+        self.take = None;
+        let take = TakePlayer::open(path).map_err(|err| err.to_string())?;
+        if let Some(output) = &self.output {
+            take.set_output_device(output)
+                .map_err(|err| format!("Cannot play through {output}: {err}."))?;
+        }
+        self.take = Some(take);
         Ok(())
     }
 
@@ -226,9 +229,15 @@ impl Media for RealMedia {
         takewise_media::default_output().ok().map(|d| d.name)
     }
 
-    fn film_set_output(&mut self, device: &str) -> Result<(), String> {
-        self.set_output_device(device)?;
+    fn set_output(&mut self, device: &str) -> Result<(), String> {
+        self.film
+            .set_output_device(device)
+            .map_err(|err| err.to_string())?;
         self.output = Some(device.to_owned());
+        if let Some(take) = &self.take {
+            take.set_output_device(device)
+                .map_err(|err| err.to_string())?;
+        }
         Ok(())
     }
 

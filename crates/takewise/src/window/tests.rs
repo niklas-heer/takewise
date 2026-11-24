@@ -46,6 +46,8 @@ struct Fake {
     outputs: Vec<DeviceInfo>,
     /// Where the film plays (`None`: the system default).
     film_output: Option<String>,
+    /// The take open for playback, if one is.
+    take: Option<OpenTake>,
     film_gain_db: Option<f64>,
     /// The device and channel of the last capture started.
     capture_input: Option<(String, u16)>,
@@ -68,6 +70,14 @@ struct Fake {
     opened_takes: Vec<PathBuf>,
     /// Every `take_play_at` call: (`take_s`, `host_s`).
     take_plays: Vec<(f64, f64)>,
+}
+
+/// A take open in the fake, as the real media opens it.
+#[derive(Debug, Clone, PartialEq)]
+struct OpenTake {
+    /// Where it plays (`None`: the system default): the output last set,
+    /// when it was opened or since.
+    output: Option<String>,
 }
 
 #[derive(Clone)]
@@ -105,6 +115,7 @@ impl FakeMedia {
                 output("Built-in Output", Transport::BuiltIn, OutputSource::Unknown),
             ],
             film_output: None,
+            take: None,
             film_gain_db: None,
             capture_input: None,
             channel_meter: None,
@@ -254,7 +265,18 @@ impl Media for FakeMedia {
         self.0.borrow().capture_error.clone()
     }
     fn open_take(&mut self, path: &Path) -> Result<(), String> {
-        self.0.borrow_mut().opened_takes.push(path.to_owned());
+        let mut fake = self.0.borrow_mut();
+        fake.take = None;
+        let output = fake.film_output.clone();
+        if let Some(name) = &output
+            && !fake.outputs.iter().any(|o| &o.name == name)
+        {
+            return Err(format!(
+                "Cannot play through {name}: no output device named {name:?}."
+            ));
+        }
+        fake.opened_takes.push(path.to_owned());
+        fake.take = Some(OpenTake { output });
         Ok(())
     }
     fn take_ready(&self) -> bool {
@@ -271,12 +293,15 @@ impl Media for FakeMedia {
     fn default_output(&self) -> Option<String> {
         Some("MacBook Speakers".to_owned())
     }
-    fn film_set_output(&mut self, device: &str) -> Result<(), String> {
+    fn set_output(&mut self, device: &str) -> Result<(), String> {
         let mut fake = self.0.borrow_mut();
         if !fake.outputs.iter().any(|output| output.name == device) {
             return Err(format!("no output device named {device:?}"));
         }
         fake.film_output = Some(device.to_owned());
+        if let Some(take) = &mut fake.take {
+            take.output = Some(device.to_owned());
+        }
         Ok(())
     }
     fn start_channel_meter(&mut self, device: &str) -> Result<(), String> {
@@ -814,6 +839,64 @@ fn play_in_context_locks_the_take_to_the_film(cx: &mut TestAppContext) {
     assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
     press(cx, f.window, &["p"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn takes_play_through_the_films_output(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let take_output = |f: &Fixture| {
+        let fake = f.media.0.borrow();
+        fake.take.as_ref().map(|take| take.output.clone())
+    };
+    f.view
+        .update(cx, |view, _| view.choose_output("Test Phones"));
+    assert!(
+        message(cx, &f.view).contains("The film and your takes play through Test Phones."),
+        "{}",
+        message(cx, &f.view)
+    );
+    press(cx, f.window, &["down", "down", "down"]); // d
+    record_take(cx, &f);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        take_output(&f),
+        Some(Some("Test Phones".to_owned())),
+        "the take plays where the film does, not through the system output"
+    );
+
+    // Another output while the take plays: the take moves with the film.
+    f.view
+        .update(cx, |view, _| view.choose_output("External Headphones"));
+    assert_eq!(
+        f.media.0.borrow().film_output.as_deref(),
+        Some("External Headphones")
+    );
+    assert_eq!(
+        take_output(&f),
+        Some(Some("External Headphones".to_owned()))
+    );
+    press(cx, f.window, &["p"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+
+    // The output is unplugged: P says so and plays nothing elsewhere.
+    f.media
+        .0
+        .borrow_mut()
+        .outputs
+        .retain(|o| o.name != "External Headphones");
+    f.media.set_now(300.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    let said = message(cx, &f.view);
+    assert!(
+        said.contains("Cannot play through External Headphones"),
+        "{said}"
+    );
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(take_output(&f), None, "no take is open");
 }
 
 #[gpui_kit::test]
