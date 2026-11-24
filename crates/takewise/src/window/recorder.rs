@@ -975,7 +975,10 @@ impl Recorder {
     }
 
     /// Plays line `idx` in context: pre-roll, the take locked to the film,
-    /// and the tail. Starts once the take has loaded.
+    /// and the tail. Starts once the take has loaded. A piece of a passage
+    /// plays through its own end and the tail, as it ends at the cut before
+    /// the next line, which can lie past the slot's tail; it can even begin
+    /// there, when the line's slot was shortened after the recording.
     pub fn start_playback(
         &mut self,
         media: &mut dyn Media,
@@ -1004,11 +1007,20 @@ impl Recorder {
         media.open_take(&project.dir.join(&take.file))?;
         let rec = &project.config.record;
         let plan = plan_take(line.start, snapshot.end, rec.preroll_s, rec.tail_s);
+        let take_first_film_s = line.start + take.line_offset_s;
+        let stop_film_s = take
+            .passage
+            .as_ref()
+            .map_or(plan.capture_stop_film_s, |piece| {
+                let samples = piece.to_sample.saturating_sub(piece.from_sample);
+                let end_s = take_first_film_s + samples as f64 / f64::from(RECORD_RATE);
+                plan.capture_stop_film_s.max(end_s + rec.tail_s)
+            });
         self.phase = Phase::Playing(Playback {
             film_from_s: plan.film_from_s,
             hold_s: plan.hold_first_frame_s,
-            stop_film_s: plan.capture_stop_film_s,
-            take_first_film_s: line.start + take.line_offset_s,
+            stop_film_s,
+            take_first_film_s,
             film_gain_db: rec.film_gain_db,
             opened_host_s: media.host_now_s(),
             started: None,

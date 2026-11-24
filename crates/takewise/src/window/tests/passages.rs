@@ -495,6 +495,62 @@ fn p_plays_a_later_piece_from_its_own_start(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn p_plays_a_piece_through_its_end_past_its_slot(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    // b (start 1.0) ends its slot where c starts (1.5), so play in context
+    // of a take of one line stops at film 3.0, the tail after it. This
+    // piece begins after that, at film 3.5, and lasts 1 s.
+    let snapshot = Project::open(&f.dir)
+        .expect("project")
+        .snapshot("b")
+        .expect("snapshot");
+    let input = RecordedInput {
+        sample_rate: 48_000,
+        device: DEVICE.to_owned(),
+        channel: 1,
+        line_offset_s: 2.5,
+        snapshot,
+        dropouts: None,
+        film_shift_ms: None,
+        passage: Some(tw::PassagePiece {
+            id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            index: 1,
+            count: 2,
+            from_sample: 48_000,
+            to_sample: 96_000,
+            preroll_floor_dbfs: -70.0,
+        }),
+    };
+    let partial = tw::begin_take(&f.dir, "b", &input).expect("begin");
+    tw::write_take_wav(&partial.wav, &vec![0; 48_000], 48_000).expect("wav");
+    tw::commit_take(&f.dir, partial).expect("commit");
+    f.view.update(cx, |view, _| view.reload());
+
+    press(cx, f.window, &["down"]); // b
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    // The film plays from 0.0 at host 201.3 (after holding its first frame
+    // through b's short pre-roll); the piece starts at film 3.5.
+    let (from_s, at_host_s) = f.media.0.borrow().take_plays[0];
+    assert!(
+        close(from_s, 0.0) && close(at_host_s, 204.8),
+        "{from_s} {at_host_s}"
+    );
+    // It plays through the piece's end (film 4.5) and the tail: to film
+    // 6.0, host 207.3.
+    for (now, playing) in [(204.5, true), (207.2, true), (207.4, false)] {
+        f.media.set_now(now);
+        frame(cx, f.window);
+        assert_eq!(
+            f.view.read_with(cx, |view, _| view.recorder.is_playing()),
+            playing,
+            "at host {now}"
+        );
+    }
+}
+
+#[gpui_kit::test]
 fn shift_enter_chooses_the_passage_for_every_line(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     record_passage(cx, &f);

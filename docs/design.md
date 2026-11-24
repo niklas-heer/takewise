@@ -368,7 +368,7 @@ Added 2026-11-24 (milestone 6, see `docs/plans/2026-11-24-m6-passages-and-rememb
 - On stop, the passage is published in the frame (finish, cut, the two renames). `split` then runs on a worker thread, which also measures each take's peak for the "clipped" mark; the window keeps the audio's lock until the takes are there and then reloads. Closing the window waits for it.
 - A passage that cannot be published stays in memory with its lock and is retried every two seconds, like a take; a published one whose cut failed is cut again, and by any repair.
 
-**Hearing one.** **Shift+P** plays the selected take's passage: the passage file locked to the film from its own first sample, to the passage's end. **P** still plays one take in context. When a take's first sample lies after the point the film starts from (any piece but the first), the take is scheduled at its own host time, from its beginning, instead of at a negative offset.
+**Hearing one.** **Shift+P** plays the selected take's passage: the passage file locked to the film from its own first sample, to the passage's end. **P** still plays one take in context, and plays a piece through its own end and `tail_s`: a piece ends at the cut before the next line, which can lie past its slot's tail, and a slot shortened after the recording can even end before the piece begins. When a take's first sample lies after the point the film starts from (any piece but the first), the take is scheduled at its own host time, from its beginning, instead of at a negative offset.
 
 ## Distribution
 
