@@ -7,7 +7,8 @@
 //! does not give its tests. `plays_film_frames` plays the film named by
 //! `TAKEWISE_SMOKE_FILM`; `routes_take_to_output` plays a silent take
 //! through `TAKEWISE_SMOKE_OUTPUT`, else an output that is not the system's
-//! default, as the window plays takes through the project's output.
+//! default (it skips, saying so, when there is none), as the window plays
+//! takes through the project's output.
 //! `shows_about_panel` brings up the About panel for a moment; with
 //! `TAKEWISE_SMOKE_ABOUT_PNG` set it captures the panel there (this needs
 //! screen recording access for the app that runs the test). Capture needs
@@ -176,14 +177,19 @@ fn plays_film_frames() -> Outcome {
 fn routes_take_to_output() -> Outcome {
     let outputs = output_devices().map_err(|e| e.to_string())?;
     let default = default_output().map_err(|e| e.to_string())?;
-    let name = match std::env::var("TAKEWISE_SMOKE_OUTPUT") {
-        Ok(name) => name,
-        Err(_) => outputs
-            .iter()
-            .find(|o| o.name != default.name)
-            .unwrap_or(&default)
-            .name
-            .clone(),
+    let name = if let Ok(name) = std::env::var("TAKEWISE_SMOKE_OUTPUT") {
+        name
+    } else {
+        // The default output would prove nothing: a take plays there
+        // without being set to it.
+        let Some(other) = outputs.iter().find(|o| o.name != default.name) else {
+            println!(
+                "    only the default output {:?} is connected; skipped (connect another, or set TAKEWISE_SMOKE_OUTPUT)",
+                default.name
+            );
+            return Ok(());
+        };
+        other.name.clone()
     };
     let wav = std::env::temp_dir().join(format!("takewise-smoke-{}.wav", std::process::id()));
     takewise_core::write_take_wav(&wav, &vec![0; 24_000], 48_000).map_err(|e| e.to_string())?;
