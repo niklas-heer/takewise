@@ -4153,6 +4153,59 @@ fn setup_check_calibrates_the_latency(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_latency_measurement_waits_for_a_missing_output(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Test Phones")).expect("output");
+    });
+    to_latency_step(cx, &f);
+    unplug(&f, "Test Phones");
+    press(cx, f.window, &["space"]);
+    assert!(!f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    let err = setup_of(cx, &f)
+        .latency
+        .expect("an outcome")
+        .expect_err("refused");
+    assert_eq!(
+        err,
+        "Test Phones is not connected: connect it or pick another output (A)."
+    );
+    assert_eq!(f.media.0.borrow().films.len(), 0, "no beeps played");
+}
+
+#[gpui_kit::test]
+fn the_film_comes_back_when_the_output_goes_during_the_measurement(cx: &mut TestAppContext) {
+    let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {
+        tw::set_route(dir, None, Some("Test Phones")).expect("output");
+    });
+    to_latency_step(cx, &f);
+    press(cx, f.window, &["space"]);
+    assert!(f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    some_calibration(cx, &f, 10);
+    unplug(&f, "Test Phones");
+    some_calibration(cx, &f, 150);
+    assert!(!f.view.read_with(cx, |view, _| view.calibrating.is_some()));
+    let films = f.media.0.borrow().films.clone();
+    assert_eq!(
+        films.last(),
+        Some(&Project::open(&f.dir).expect("project").film_path()),
+        "the project's film is back: {films:?}"
+    );
+    // The output returns: the film is moved to it again.
+    f.media.0.borrow_mut().outputs.push(output(
+        "Test Phones",
+        Transport::Usb,
+        OutputSource::Unknown,
+    ));
+    let now = f.media.0.borrow().now;
+    f.media.set_now(now + 3.0);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().output_sets.last(),
+        Some(&Some("Test Phones".to_owned()))
+    );
+}
+
+#[gpui_kit::test]
 fn the_film_level_leaves_the_beeps_alone(cx: &mut TestAppContext) {
     let f = open(cx, &[(DEVICE, 48_000)]);
     to_latency_step(cx, &f);

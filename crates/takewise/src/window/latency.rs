@@ -52,6 +52,10 @@ impl RecordingWindow {
         if let Some(problem) = &self.input_problem {
             return Err(problem.clone());
         }
+        // The beeps play where takes do, never on the system output in
+        // place of a missing one.
+        self.sync_output(true)
+            .map_err(|problem| problem.for_playback())?;
         let route = self.current_route();
         let device = route.input.clone().ok_or("No input device chosen.")?;
         let output = route.output.clone().unwrap_or_else(|| "unknown".to_owned());
@@ -158,7 +162,9 @@ impl RecordingWindow {
     }
 
     /// Puts the project's film back, at its volume and parked where it was;
-    /// it warms up again before the next take.
+    /// it warms up again before the next take. It comes back whether or not
+    /// its output is there: it opens on the device the players are set to,
+    /// and is moved again once a missing output returns.
     fn restore_film(&mut self) {
         if let Err(err) = self.media.film_open(&self.project.film_path()) {
             self.message = Some(format!("Could not reopen the film: {err}"));
