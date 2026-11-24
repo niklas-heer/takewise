@@ -10,7 +10,11 @@ use std::process::Command;
 use assert_cmd::assert::OutputAssertExt as _;
 use predicates::prelude::*;
 use serde_json::Value;
-use takewise_core::{Project, RecordedInput, TakeRef, begin_take, commit_take, write_take_wav};
+use takewise_core::passage::Latency;
+use takewise_core::{
+    PartialPassage, PartialWav, PassageInput, PassageLine, Project, RecordedInput, TakeRef,
+    begin_passage, begin_take, commit_take, publish_passage, write_take_wav,
+};
 
 const RATE: u32 = 48_000;
 
@@ -1115,4 +1119,226 @@ fn models_install_refuses_a_foreign_file() {
         fs::read_to_string(tmp.path().join("ggml-large-v3-turbo.bin")).unwrap(),
         "not a model"
     );
+}
+
+/// Three sentences 0.5 and 0.4 s apart: one passage.
+const PASSAGE_SCRIPT: &str = r#"
+[[line]]
+id = "one"
+start = 10.0
+end = 13.0
+text = "One."
+
+[[line]]
+id = "two"
+start = 13.5
+end = 16.0
+text = "Two."
+
+[[line]]
+id = "three"
+start = 16.4
+end = 19.0
+text = "Three."
+"#;
+
+/// A passage of the three lines whose first sample lies at 7 s of the film
+/// (when `placed`), `tenths` of a second long, with a 440 Hz burst for each
+/// sentence.
+fn passage(dir: &Path, tenths: usize, placed: bool) -> (PassageInput, Vec<i32>) {
+    let samples = |tenths: usize| tenths * RATE as usize / 10;
+    let project = Project::open(dir).unwrap();
+    let input = PassageInput {
+        sample_rate: RATE,
+        device: "Test Mic".to_owned(),
+        channel: 1,
+        latency: Latency {
+            input_s: 0.01,
+            offset_ms: 0.0,
+        },
+        preroll_s: 3.0,
+        lines: project
+            .script
+            .lines
+            .iter()
+            .map(|line| PassageLine {
+                id: line.id.clone(),
+                snapshot: project.snapshot(&line.id).unwrap(),
+            })
+            .collect(),
+        first_sample_film_s: placed.then_some(7.0),
+        dropouts: None,
+        film_shift_ms: None,
+    };
+    let mut audio = vec![0i32; samples(tenths)];
+    // The sentences, in tenths of a second from the passage's first sample:
+    // 10.0 to 12.8 s, 13.6 to 15.8 s and 16.5 to 18.6 s of the film.
+    for (from, to) in [(30, 58), (66, 88), (95, 116)] {
+        for (i, sample) in audio
+            .iter_mut()
+            .enumerate()
+            .skip(samples(from))
+            .take(samples(to - from))
+        {
+            let t = i as f64 / f64::from(RATE);
+            *sample = ((t * 440.0 * std::f64::consts::TAU).sin() * 4_000_000.0) as i32;
+        }
+    }
+    (input, audio)
+}
+
+/// Streams a passage into its partial files and stops there, as a crash
+/// mid-take leaves it.
+fn crashed_passage(dir: &Path, placed: bool) -> PartialPassage {
+    let (input, audio) = passage(dir, 135, placed);
+    let partial = begin_passage(dir, &input).unwrap();
+    let mut wav = PartialWav::create(&partial.wav, RATE).unwrap();
+    wav.write(&audio).unwrap();
+    wav.flush().unwrap();
+    drop(wav);
+    partial
+}
+
+#[test]
+fn choose_passage_chooses_its_takes_and_names_the_lines_it_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), PASSAGE_SCRIPT).unwrap();
+    // Stopped mid-word in the second sentence: the third has no piece.
+    let (input, audio) = passage(&dir, 72, true);
+    let partial = begin_passage(&dir, &input).unwrap();
+    write_take_wav(&partial.wav, &audio, RATE).unwrap();
+    let id = publish_passage(&dir, &partial).unwrap().id;
+
+    // Published but not cut yet: status says so, and repair cuts it.
+    let before = status(&dir);
+    assert_eq!(before["notices"][0]["code"], "passage-not-split");
+    let (code, value) = json(takewise().arg("status").arg(&dir).arg("--repair"));
+    assert_eq!(code, 0, "{value}");
+    let data = &value["data"];
+    assert_eq!(data["repair"]["pieces"].as_array().unwrap().len(), 2);
+    let notices = data["notices"].as_array().unwrap();
+    assert!(
+        notices.iter().all(|n| n["code"] != "passage-not-split"),
+        "{data}"
+    );
+    for line in data["lines"].as_array().unwrap() {
+        assert_eq!(line["passage"], "one", "{line}");
+    }
+    let take = &data["lines"][1]["takes"][0];
+    assert_eq!(take["file"], "takes/two/001.wav");
+    assert_eq!(take["passage"]["id"], id.as_str());
+    assert_eq!(take["passage"]["index"], 1);
+    assert_eq!(take["passage"]["count"], 2);
+    assert_eq!(take["passage"]["from_sample"], 297_600);
+    assert_eq!(take["passage"]["to_sample"], 345_600);
+    assert!(take["passage"]["preroll_floor_dbfs"].is_number());
+    assert_eq!(data["lines"][2]["takes"], serde_json::json!([]));
+
+    let choose = |args: &[&str]| json(takewise().arg("choose").arg(&dir).args(args));
+    let (code, value) = choose(&["--passage", &id, "--by", "claude"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(
+        value["data"],
+        serde_json::json!({
+            "passage": id,
+            "by": "claude",
+            "chosen": [{ "line": "one", "take": 1 }, { "line": "two", "take": 1 }],
+            "skipped": [{ "line": "three", "reason": "the passage has no take of this line" }],
+        })
+    );
+    let lines = status(&dir)["lines"].clone();
+    assert_eq!(lines[0]["chosen"]["by"], "claude");
+    assert_eq!(lines[1]["chosen"]["take"], 1);
+    assert_eq!(lines[2]["chosen"], Value::Null);
+
+    // All or nothing: one missing file refuses the passage.
+    let events = fs::read_to_string(dir.join("takes.jsonl")).unwrap();
+    fs::remove_file(dir.join("takes/two/001.wav")).unwrap();
+    let (code, value) = choose(&["--passage", &id]);
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(value["error"]["code"], "missing-file");
+    assert_eq!(fs::read_to_string(dir.join("takes.jsonl")).unwrap(), events);
+
+    let (code, value) = choose(&["--passage", "0000"]);
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "unknown-passage");
+    // A line and a take, or a passage: never both, never neither.
+    takewise()
+        .arg("choose")
+        .arg(&dir)
+        .args(["one", "1", "--passage", &id])
+        .assert()
+        .code(2);
+    takewise().arg("choose").arg(&dir).assert().code(2);
+    takewise()
+        .arg("choose")
+        .arg(&dir)
+        .args(["--passage", &id])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("is missing"));
+}
+
+#[test]
+fn status_repair_finishes_a_crashed_passage_and_reports_an_unplaced_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), PASSAGE_SCRIPT).unwrap();
+    let crashed = crashed_passage(&dir, true);
+    let unplaced = crashed_passage(&dir, false);
+    let unplaced_wav = format!("takes/.passages/.{}.wav.partial", unplaced.id);
+
+    let before = status(&dir);
+    assert_eq!(before["partials"].as_array().unwrap().len(), 4, "{before}");
+    let codes: Vec<&str> = before["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["code"].as_str())
+        .filter(|code| code.contains("passage"))
+        .collect();
+    assert_eq!(codes.len(), 2, "{before}");
+    assert!(codes.contains(&"partial-passage") && codes.contains(&"passage-unplaced"));
+
+    let (code, value) = json(takewise().arg("status").arg(&dir).arg("--repair"));
+    assert_eq!(code, 0, "{value}");
+    let data = &value["data"];
+    assert_eq!(data["repair"]["passages_published"][0], crashed.id.as_str());
+    assert_eq!(data["repair"]["pieces"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        data["repair"]["passages_unplaced"][0],
+        unplaced_wav.as_str()
+    );
+    for line in data["lines"].as_array().unwrap() {
+        let take = &line["takes"][0];
+        assert_eq!(take["passage"]["id"], crashed.id.as_str(), "{line}");
+        assert_eq!(take["passage"]["count"], 3);
+        assert_eq!(take["missing"], false);
+    }
+    assert!(
+        dir.join(format!("takes/.passages/{}.wav", crashed.id))
+            .is_file()
+    );
+    // The unplaced one is kept, and still reported with its path.
+    assert!(unplaced.wav.is_file() && unplaced.meta.is_file());
+    assert_eq!(data["partials"].as_array().unwrap().len(), 2);
+    let notice = data["notices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["code"] == "passage-unplaced")
+        .unwrap_or_else(|| panic!("{data}"));
+    assert!(
+        notice["message"].as_str().unwrap().contains(&unplaced_wav),
+        "{notice}"
+    );
+
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .arg("--repair")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("interrupted before it was placed"));
 }

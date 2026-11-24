@@ -82,7 +82,9 @@ enum Command {
         /// (notices, such as crash leftovers, do not count).
         #[arg(long)]
         strict: bool,
-        /// Adopt take files left without a ledger event by a crash first.
+        /// First adopt take files left without a ledger event by a crash,
+        /// finish passages a crash interrupted, and cut published passages
+        /// that still lack their takes.
         #[arg(long)]
         repair: bool,
         /// Re-measure the film and update `film_info`.
@@ -128,11 +130,19 @@ enum Command {
         #[arg(long, value_parser = parse_score)]
         score: Option<f64>,
     },
-    /// Choose a take for a line.
+    /// Choose a take for a line, or with --passage the take of every line
+    /// that was cut from one passage.
     Choose {
         dir: PathBuf,
-        line: String,
-        take: u32,
+        #[arg(required_unless_present = "passage", conflicts_with = "passage")]
+        line: Option<String>,
+        #[arg(required_unless_present = "passage", conflicts_with = "passage")]
+        take: Option<u32>,
+        /// Choose the takes cut from this passage (a take's `passage.id` in
+        /// `status --json`), for every line that has one: all of them or,
+        /// when one's file is missing, none.
+        #[arg(long)]
+        passage: Option<String>,
         #[arg(long, default_value = "narrator")]
         by: String,
     },
@@ -337,20 +347,9 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             dir,
             line,
             take,
+            passage,
             by,
-        } => {
-            match tw::choose_take(&dir, &line, take, &by) {
-                Err(err @ tw::Error::MissingFile { .. }) => {
-                    return Ok(Outcome::new(json!({ "line": line, "take": take }), "")
-                        .with_finding("missing-file", err.to_string()));
-                }
-                result => result?,
-            }
-            Ok(Outcome::new(
-                json!({ "line": line, "take": take, "by": by }),
-                format!("Chose {line} take {take} ({by})"),
-            ))
-        }
+        } => choose(&dir, line.as_deref(), take, passage.as_deref(), &by),
         Command::Export(args) => export(&args),
         Command::Doctor { dir } => Ok(doctor(dir.as_deref())),
         Command::MicStatus { out } => mic_status(&out),
@@ -359,6 +358,67 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             ModelsCommand::Install => models_install(),
         },
     }
+}
+
+/// `choose`: one take of one line, or with `--passage` every take cut from
+/// one passage. A missing take file, or a passage not yet cut into all its
+/// takes, is a finding (exit 1) and chooses nothing.
+fn choose(
+    dir: &Path,
+    line: Option<&str>,
+    take: Option<u32>,
+    passage: Option<&str>,
+    by: &str,
+) -> Result<Outcome, CliError> {
+    let (line, take) = match (passage, line, take) {
+        (Some(passage), ..) => return choose_passage(dir, passage, by),
+        (None, Some(line), Some(take)) => (line, take),
+        // clap requires a line and a take without --passage.
+        _ => {
+            return Err(CliError::Setup(
+                "choose needs a line and a take, or --passage <id>".to_owned(),
+            ));
+        }
+    };
+    match tw::choose_take(dir, line, take, by) {
+        Err(err @ tw::Error::MissingFile { .. }) => {
+            return Ok(Outcome::new(json!({ "line": line, "take": take }), "")
+                .with_finding("missing-file", err.to_string()));
+        }
+        result => result?,
+    }
+    Ok(Outcome::new(
+        json!({ "line": line, "take": take, "by": by }),
+        format!("Chose {line} take {take} ({by})"),
+    ))
+}
+
+fn choose_passage(dir: &Path, passage: &str, by: &str) -> Result<Outcome, CliError> {
+    let choice = match tw::choose_passage(dir, passage, by) {
+        Err(err @ tw::Error::MissingFile { .. }) => {
+            return Ok(Outcome::new(json!({ "passage": passage }), "")
+                .with_finding("missing-file", err.to_string()));
+        }
+        Err(err @ tw::Error::PassageNotSplit { .. }) => {
+            return Ok(Outcome::new(json!({ "passage": passage }), "")
+                .with_finding("passage-not-split", err.to_string()));
+        }
+        result => result?,
+    };
+    let chosen: Vec<String> = choice
+        .chosen
+        .iter()
+        .map(|take| format!("{} take {}", take.line, take.take))
+        .collect();
+    let mut text = if chosen.is_empty() {
+        "Chose nothing".to_owned()
+    } else {
+        format!("Chose {} ({by})", chosen.join(", "))
+    };
+    for skipped in &choice.skipped {
+        let _ = write!(text, "\nskipped {}: {}", skipped.line, skipped.reason);
+    }
+    Ok(Outcome::new(&choice, text))
 }
 
 /// Writes this process's microphone permission to `out` (run inside
@@ -666,6 +726,30 @@ fn status_text(project: &Project, data: &StatusData) -> String {
             let _ = writeln!(
                 text,
                 "repair: {} has no audio; kept, not adopted",
+                path.display()
+            );
+        }
+        for id in &repair.passages_published {
+            let _ = writeln!(text, "repaired: finished passage {id}");
+        }
+        for take in &repair.pieces {
+            let _ = writeln!(
+                text,
+                "repaired: cut {} take {} from its passage",
+                take.line, take.take
+            );
+        }
+        for failure in &repair.passages_failed {
+            let _ = writeln!(
+                text,
+                "repair: passage {} could not be finished: {}",
+                failure.passage, failure.error
+            );
+        }
+        for path in &repair.passages_unplaced {
+            let _ = writeln!(
+                text,
+                "repair: {} is a passage interrupted before it was placed on the film; kept, not cut",
                 path.display()
             );
         }
