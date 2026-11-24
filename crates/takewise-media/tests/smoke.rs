@@ -24,17 +24,18 @@ use objc2_app_kit::NSApplication;
 use takewise_media::{
     About, Capture, ChannelMeter, DeviceInfo, FilmPlayer, TakePlayer, Transport, default_input,
     default_output, host_time_now_s, input_devices, input_latency_s, output_devices, pump_run_loop,
-    set_nominal_sample_rate, show_about_panel,
+    set_nominal_sample_rate, show_about_panel, watching_devices,
 };
 
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 7] = [
+const TESTS: [Test; 8] = [
     ("lists_input_devices", lists_input_devices),
     ("plays_film_frames", plays_film_frames),
     ("routes_take_to_output", routes_take_to_output),
     ("shows_about_panel", shows_about_panel),
+    ("watches_device_changes", watches_device_changes),
     ("captures_one_channel", captures_one_channel),
     ("meters_every_channel", meters_every_channel),
     ("switches_nominal_rate", switches_nominal_rate),
@@ -222,6 +223,32 @@ fn play_silence_through(wav: &std::path::Path, name: &str) -> Outcome {
     ensure(take.output_device_uid() == uid, || {
         "the take's output changed while it played".to_owned()
     })
+}
+
+/// CoreAudio accepts the device-change listeners. With
+/// `TAKEWISE_SMOKE_WATCH=1` it also waits up to 30 s for a change: plug or
+/// unplug headphones meanwhile, and the counter must move.
+fn watches_device_changes() -> Outcome {
+    ensure(watching_devices(), || {
+        "CoreAudio refused the device listeners".to_owned()
+    })?;
+    if std::env::var_os("TAKEWISE_SMOKE_WATCH").is_none() {
+        return Ok(());
+    }
+    let before = takewise_media::device_generation();
+    println!("    plug or unplug an output within 30 s…");
+    let waiting = Instant::now();
+    while takewise_media::device_generation() == before {
+        ensure(waiting.elapsed() < Duration::from_secs(30), || {
+            "no device change seen in 30 s".to_owned()
+        })?;
+        pump_run_loop(0.1);
+    }
+    println!(
+        "    devices changed: {before} -> {}",
+        takewise_media::device_generation()
+    );
+    Ok(())
 }
 
 /// The standard About panel opens with Takewise's credits.

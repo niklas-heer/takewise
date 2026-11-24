@@ -199,7 +199,7 @@ pub(crate) fn output_source(device_uid: &str) -> OutputSource {
     }
 }
 
-fn address(
+pub(crate) fn address(
     selector: AudioObjectPropertySelector,
     scope: AudioObjectPropertyScope,
 ) -> AudioObjectPropertyAddress {
@@ -255,7 +255,7 @@ fn nominal_rate(id: AudioObjectID) -> Option<f64> {
 }
 
 /// The CoreAudio object id of the device with this UID.
-fn device_id(device_uid: &str) -> Option<AudioObjectID> {
+pub(crate) fn device_id(device_uid: &str) -> Option<AudioObjectID> {
     let cf = CFString::from_str(device_uid);
     let cf_ref: *const CFString = &raw const *cf;
     let addr = address(
