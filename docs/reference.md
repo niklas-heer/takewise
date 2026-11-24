@@ -60,7 +60,7 @@ Opening `Takewise.app` from the Dock or Finder shows the start window. **Open pr
 The menu bar is the same in the start window and every recording window:
 
 - **Takewise:** **About Takewise** (the standard About panel: version and build, what Takewise is, and a link to the repository), **Install Command Line Tool…** (see [Building from source](#building-from-source)), Services, **Hide Takewise** (⌘H), **Hide Others** (⌥⌘H), **Show All**, and **Quit Takewise** (⌘Q). Quitting refuses while a take or passage exists only in memory, as closing a window does (see the `record` notes above).
-- **File:** **Open Project…** (⌘O), as in the start window.
+- **File:** **Open Project…** (⌘O) opens the folder picker in whichever window is in front, as in the start window: a project opens in its own window (or comes to the front), and a folder that is no project yet goes on in a start window, which asks for the film.
 - **Help:** **Takewise Help** opens the README on GitHub, **Keyboard Shortcuts** its keys, **Release Notes** the GitHub release of the version running, and **Report an Issue…** a new issue.
 
 ## Passages in the window

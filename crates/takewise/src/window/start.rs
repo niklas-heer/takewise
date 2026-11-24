@@ -13,9 +13,10 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-    KeyBinding, ParentElement as _, PathPromptOptions, Render, StatefulInteractiveElement as _,
-    Styled as _, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, PathPromptOptions,
+    Render, StatefulInteractiveElement as _, Styled as _, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, div, px, rgb, size,
 };
 use takewise_core as tw;
 
@@ -295,7 +296,35 @@ pub fn open_with_message(cx: &mut App, message: String) -> Result<(), String> {
     open_window(Some(message), cx)
 }
 
+/// The folder picker of "Open project…".
+pub fn folder_prompt() -> PathPromptOptions {
+    PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("Open".into()),
+    }
+}
+
+/// "Open project…" from a recording window, with a folder that is no
+/// project yet: a start window that asks for the film to start one.
+pub fn open_choosing_film(folder: PathBuf, cx: &mut App) -> Result<(), String> {
+    let (window, view) = new_window(None, cx)?;
+    window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| view.choose_film(folder, window, cx));
+        })
+        .map_err(|err| err.to_string())
+}
+
 fn open_window(message: Option<String>, cx: &mut App) -> Result<(), String> {
+    new_window(message, cx).map(drop)
+}
+
+fn new_window(
+    message: Option<String>,
+    cx: &mut App,
+) -> Result<(AnyWindowHandle, Entity<StartWindow>), String> {
     let recent = recent_path().map(|p| load_recent(&p)).unwrap_or_default();
     let bounds = Bounds::centered(None, size(px(560.), px(520.)), cx);
     let options = WindowOptions {
@@ -313,7 +342,6 @@ fn open_window(message: Option<String>, cx: &mut App) -> Result<(), String> {
             view
         })
     })
-    .map(drop)
     .map_err(|err| err.to_string())
 }
 
@@ -331,12 +359,7 @@ impl StartWindow {
     /// "Open project…": a folder picker; a project opens, any other folder
     /// asks for the film to start one.
     fn choose_folder(window: &mut Window, cx: &mut Context<Self>) {
-        let chosen = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open".into()),
-        });
+        let chosen = cx.prompt_for_paths(folder_prompt());
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = chosen.await else {
                 return;
@@ -754,6 +777,16 @@ mod tests {
             .expect("open test window")
             .1
         })
+    }
+
+    #[gpui_kit::test]
+    fn open_project_in_the_start_window_opens_the_folder_picker(cx: &mut TestAppContext) {
+        open_start(cx, Vec::new());
+        cx.update(super::super::menu_actions);
+        let window = cx.windows()[0];
+        cx.dispatch_action(window, OpenProject);
+        assert!(cx.did_prompt_for_paths());
+        assert_eq!(cx.windows().len(), 1, "no second start window");
     }
 
     #[gpui_kit::test]

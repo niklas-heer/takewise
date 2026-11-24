@@ -384,7 +384,8 @@ fn menu_actions(cx: &mut App) {
         }
     });
     // From the menu with no window to show the outcome in, it is said in
-    // a new start window.
+    // a new start window. Every window opens the folder picker itself; with
+    // none open, a start window offers it.
     cx.on_action(|_: &InstallCommand, cx: &mut App| {
         let _ = start::open_with_message(cx, crate::cli_install::install());
     });
@@ -1593,6 +1594,47 @@ impl RecordingWindow {
         cx.notify();
     }
 
+    /// File › Open Project… (⌘O) here: the folder picker, as in the start
+    /// window; a project opens in its own window (or comes to the front),
+    /// and a folder that is no project yet goes on in a start window, which
+    /// asks for the film.
+    fn choose_folder(window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(start::folder_prompt());
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(folder) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.open_folder(&folder, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
+        let opened = match start::classify(folder) {
+            start::Picked::Project(dir) => {
+                if focus_open(&dir, cx) {
+                    start::remember_opened(&folder_key(&dir));
+                    Ok(())
+                } else {
+                    prepare(&dir).and_then(|(dir, loaded)| {
+                        start::remember_opened(&dir);
+                        open_recording(dir, loaded, cx)
+                    })
+                }
+            }
+            start::Picked::New(folder) => start::open_choosing_film(folder, cx),
+        };
+        if let Err(err) = opened {
+            self.message = Some(format!("Cannot open {}: {err}", folder.display()));
+        }
+    }
+
     fn move_take(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.recorder.is_recording() {
             return;
@@ -1944,6 +1986,9 @@ impl Render for RecordingWindow {
             .on_action(cx.listener(|view, _: &InstallCommand, _, cx| {
                 view.message = Some(crate::cli_install::install());
                 cx.notify();
+            }))
+            .on_action(cx.listener(|_, _: &start::OpenProject, window, cx| {
+                Self::choose_folder(window, cx);
             }))
             .size_full()
             .flex()

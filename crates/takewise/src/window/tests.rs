@@ -3207,6 +3207,31 @@ fn levels_out_of_range_in_the_file_are_clamped(cx: &mut TestAppContext) {
     assert_eq!(gains, Some(vec![0.0]));
 }
 
+#[gpui_kit::test]
+fn open_project_in_a_recording_window_opens_the_folder_picker(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    cx.update(super::menu_actions);
+    cx.dispatch_action(f.window, super::start::OpenProject);
+    assert!(cx.did_prompt_for_paths(), "the folder picker");
+    assert_eq!(cx.windows().len(), 1, "no start window");
+
+    // The project open here comes to the front; nothing else opens.
+    let dir = f.dir.clone();
+    cx.simulate_path_prompt_response(move |_| Some(vec![dir]));
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1);
+    assert!(!message(cx, &f.view).starts_with("Cannot open"));
+
+    // A folder that is no project yet: a start window asks for the film.
+    cx.dispatch_action(f.window, super::start::OpenProject);
+    let empty = tempfile::tempdir().expect("dir");
+    let folder = empty.path().to_owned();
+    cx.simulate_path_prompt_response(move |_| Some(vec![folder]));
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 2, "a start window");
+    assert!(cx.did_prompt_for_paths(), "the film picker");
+}
+
 /// −0.4 dBFS: near clipping, not clipped.
 const LOUD: i32 = 8_000_000;
 
