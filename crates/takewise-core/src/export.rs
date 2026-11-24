@@ -1,8 +1,9 @@
 //! Export: one narration file (WAV or FLAC) aligned to the film's first
 //! frame, and a manifest. `raw` places the takes as recorded; `clean`
-//! filters each take and sets one static gain for the loudness (see
-//! `docs/design.md`, "Export and Resolve handoff" and "Export cleanup and
-//! formats").
+//! filters each take and sets one static gain for the loudness. The pieces
+//! of a passage chosen for consecutive lines are joined again and exported
+//! as the passage was recorded (see `docs/design.md`, "Export and Resolve
+//! handoff" and "Export cleanup and formats").
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -18,13 +19,13 @@ use crate::clean::{Cleaner, NOISE_REDUCTION_DB, find_room_tone};
 use crate::error::{Error, Result, io};
 use crate::ffmpeg::{Ffmpeg, read_float_wav};
 use crate::fsutil::{lock, rename_temp, write_temp};
-use crate::ledger::{Checked, EventKind, Ledger, Verdict, read};
+use crate::ledger::{Checked, EventKind, Ledger, PassagePiece, Verdict, read};
 use crate::project::{ExportConfig, ExportFormat, Processing, Project};
 use crate::render::{self, Loudness, MAX_TRUE_PEAK_DBTP, SOURCE_RATE, TARGET_LUFS, Target, UNIT};
 use crate::script::{Line, validate};
 use crate::speech::{Analysis, analyze_take};
 use crate::state::{State, TakeState, fold};
-use crate::takes::read_take_wav;
+use crate::takes::{read_take_wav, write_take_wav};
 
 pub const EXPORT_DIR: &str = "export";
 /// The narration file as a 48 kHz WAV; see [`narration_file`].
@@ -166,6 +167,13 @@ pub struct ManifestLine {
     /// skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub noise_reduction: Option<String>,
+    /// The id of the next line, when this line's take and the next line's
+    /// are consecutive pieces of one passage, still placed as recorded:
+    /// the two are exported as one stretch of audio, as recorded, without a
+    /// cut or fades between them, and this line's ranges end where the
+    /// next line's begin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seam_with: Option<String>,
 }
 
 /// A transcribed word placed in the film.
@@ -205,30 +213,229 @@ struct ManifestFilm<'a> {
     modified: &'a str,
 }
 
-/// A take ready to be mixed in.
+/// A line's take, placed on its own.
 struct Placed {
     line: ManifestLine,
-    /// The take (or its cleaned copy) at 48 kHz, in 24-bit units.
+    /// The line's place in the script.
+    index: usize,
+    /// The take at 48 kHz, in 24-bit units.
     samples: Vec<f64>,
     take: u32,
+    /// The piece of a passage the take is.
+    piece: Option<PassagePiece>,
     /// The take's pre-roll noise floor, for matching a room tone.
     floor_dbfs: f64,
+    /// The destination sample of the take's first sample, before cropping.
+    offset: i64,
     /// Source start and destination start and end, after cropping.
     src: usize,
     dest: (usize, usize),
     /// The speech without its margins in destination samples, cropped.
     speech: (usize, usize),
-    /// The most samples the fade in and the fade out may take: a margin
-    /// shortened by a split gap leaves less room, so the fades never cut
-    /// into the speech.
-    fade_room: (usize, usize),
     /// The take was recorded against different text than the line has now.
     old_text: bool,
     /// The unclamped speech in film seconds, when part of it lies outside
     /// the film.
     cropped_speech: Option<(f64, f64)>,
+}
+
+/// One stretch of audio to be mixed in: a take, or a seam run, the takes of
+/// consecutive lines that are consecutive pieces of one passage and still
+/// lie as they were recorded. A seam run is trimmed and faded only at its
+/// outer edges, so the passage keeps its breaths and its room between the
+/// lines.
+struct Unit {
+    /// The lines it covers, in script order; never empty.
+    parts: Vec<Part>,
+    /// The take, or the pieces one after the other (or its cleaned copy),
+    /// at 48 kHz, in 24-bit units.
+    samples: Vec<f64>,
+    /// The pre-roll noise floor (the passage's, for pieces), for matching a
+    /// room tone.
+    floor_dbfs: f64,
+    /// Source start in `samples` and destination start and end, after
+    /// cropping.
+    src: usize,
+    dest: (usize, usize),
+    /// The most samples the fade in and the fade out may take: a margin
+    /// shortened by a split gap leaves less room, so the fades never cut
+    /// into the speech.
+    fade_room: (usize, usize),
+}
+
+/// One line's share of a [`Unit`].
+struct Part {
+    line: ManifestLine,
+    take: u32,
+    /// Where the line's take begins in the unit's samples, and its length.
+    start: usize,
+    len: usize,
+    /// The line's speech without its margins in destination samples,
+    /// cropped.
+    speech: (usize, usize),
+    /// Where the audio this line answers for ends, in destination samples:
+    /// its speech end or, when it is joined to the next line, the start of
+    /// that line's speech, since the pause between them is kept.
+    until: usize,
+    old_text: bool,
+    cropped_speech: Option<(f64, f64)>,
     /// `clean` only: why noise reduction was skipped for this take.
     nr_skipped: Option<String>,
+}
+
+/// The last take of a [`Unit`], which the next line's take may continue.
+struct Tail {
+    /// The line's place in the script.
+    index: usize,
+    piece: PassagePiece,
+    /// The destination sample of the run's first take's first sample, and
+    /// that sample's place in the passage file.
+    anchor: i64,
+    first_sample: u64,
+}
+
+impl Tail {
+    fn of(p: &Placed) -> Option<Tail> {
+        let piece = p.piece.clone()?;
+        Some(Tail {
+            index: p.index,
+            anchor: p.offset,
+            first_sample: piece.from_sample,
+            piece,
+        })
+    }
+
+    /// When `p` continues the run that ends in this take: the run's new
+    /// tail, and how many samples (at most one) `p`'s own placement lies
+    /// before its place in the run. It continues the run as the next line's
+    /// take and the next piece of the same passage, beginning where this
+    /// piece ends, with `joined` samples of the run before it and its own
+    /// placement within a sample of the run's: a line moved since it was
+    /// recorded lies elsewhere.
+    fn continued_by(&self, p: &Placed, joined: usize) -> Option<(Tail, i64)> {
+        let piece = p.piece.as_ref()?;
+        let next = p.index == self.index + 1
+            && piece.id == self.piece.id
+            && piece.index == self.piece.index + 1
+            && piece.from_sample == self.piece.to_sample;
+        let before = piece.from_sample.checked_sub(self.first_sample)?;
+        // The take files are the passage's samples, none missing.
+        let whole = to_u64(joined) == before
+            && Some(to_u64(p.samples.len())) == piece.to_sample.checked_sub(piece.from_sample);
+        let shift = self
+            .anchor
+            .checked_add(i64::try_from(before).ok()?)?
+            .checked_sub(p.offset)?;
+        let tail = Tail {
+            index: p.index,
+            piece: piece.clone(),
+            ..*self
+        };
+        (next && whole && shift.abs() <= 1).then_some((tail, shift))
+    }
+}
+
+impl Unit {
+    fn single(p: Placed) -> Unit {
+        Unit {
+            parts: vec![Part {
+                line: p.line,
+                take: p.take,
+                start: 0,
+                len: p.samples.len(),
+                speech: p.speech,
+                until: p.speech.1,
+                old_text: p.old_text,
+                cropped_speech: p.cropped_speech,
+                nr_skipped: None,
+            }],
+            samples: p.samples,
+            floor_dbfs: p.floor_dbfs,
+            src: p.src,
+            dest: p.dest,
+            fade_room: (usize::MAX, usize::MAX),
+        }
+    }
+
+    /// Joins `p` to the end of the run: its samples follow the run's, and
+    /// the run now ends where `p`'s range does, `shift` samples from where
+    /// `p` alone would end.
+    fn join(&mut self, mut p: Placed, shift: i64, film_len: usize) {
+        let moved = |n: usize| {
+            let n = i64::try_from(n).unwrap_or(i64::MAX).saturating_add(shift);
+            to_usize(n).min(film_len)
+        };
+        self.dest.1 = moved(p.dest.1).max(self.dest.0);
+        let speech = (moved(p.speech.0), moved(p.speech.1).min(self.dest.1));
+        if let Some(last) = self.parts.last_mut() {
+            last.until = speech.0.max(last.speech.1);
+            last.line.seam_with = Some(p.line.id.clone());
+        }
+        self.parts.push(Part {
+            line: p.line,
+            take: p.take,
+            start: self.samples.len(),
+            len: p.samples.len(),
+            speech,
+            until: speech.1,
+            old_text: p.old_text,
+            cropped_speech: p.cropped_speech,
+            nr_skipped: None,
+        });
+        self.samples.append(&mut p.samples);
+    }
+
+    /// The speech from the first line's start to the last line's end,
+    /// without the margins, in destination samples.
+    fn speech(&self) -> (usize, usize) {
+        let start = self.parts.first().map_or(0, |part| part.speech.0);
+        let end = self.parts.last().map_or(start, |part| part.until);
+        (start, end)
+    }
+
+    /// Writes each line's source range in its own take and its destination
+    /// range into its manifest entry; the ranges of joined lines meet at
+    /// the cuts of their passage.
+    fn set_line_ranges(&mut self) {
+        let (from, to) = (self.src, self.src + (self.dest.1 - self.dest.0));
+        for part in &mut self.parts {
+            let begin = part.start.clamp(from, to);
+            let end = (part.start + part.len).clamp(begin, to);
+            part.line.source_samples = [to_u64(begin - part.start), to_u64(end - part.start)];
+            part.line.dest_samples = [
+                to_u64(self.dest.0 + (begin - from)),
+                to_u64(self.dest.0 + (end - from)),
+            ];
+        }
+    }
+}
+
+/// The units to mix, gathered from the placed takes in script order: each
+/// take alone, or joined to the take before it when it continues that one's
+/// passage (see [`Tail::continued_by`]).
+#[derive(Default)]
+struct Units {
+    units: Vec<Unit>,
+    /// The take the last unit ends in, when it is a piece of a passage.
+    tail: Option<Tail>,
+}
+
+impl Units {
+    /// Adds the next placed take. A piece is joined as soon as it is
+    /// placed, so a run's audio is held once, not also piece by piece.
+    fn push(&mut self, p: Placed, film_len: usize) {
+        let seam = match (&self.tail, self.units.last()) {
+            (Some(tail), Some(unit)) => tail.continued_by(&p, unit.samples.len()),
+            _ => None,
+        };
+        if let (Some((next, shift)), Some(unit)) = (seam, self.units.last_mut()) {
+            self.tail = Some(next);
+            unit.join(p, shift, film_len);
+        } else {
+            self.tail = Tail::of(&p);
+            self.units.push(Unit::single(p));
+        }
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -503,7 +710,7 @@ fn refuse(export_dir: &Path, refused: Vec<Refusal>) -> Result<ExportReport> {
 
 /// The takes placed in the film, ready to render.
 struct Plan {
-    placed: Vec<Placed>,
+    units: Vec<Unit>,
     tight: Vec<ExportWarning>,
 }
 
@@ -516,12 +723,12 @@ fn plan(
     opts: &ExportOptions,
     film: &FilmOnDisk,
 ) -> std::result::Result<Plan, Vec<Refusal>> {
-    let (placed, tight, mut refused) = gather(project, ledger, state, opts.use_proposed);
+    let (units, tight, mut refused) = gather(project, ledger, state, opts.use_proposed);
     if let Some(film) = film_refusal(project, film) {
         refused.insert(0, film);
     }
     if refused.is_empty() {
-        Ok(Plan { placed, tight })
+        Ok(Plan { units, tight })
     } else {
         Err(refused)
     }
@@ -547,18 +754,18 @@ fn render_export(
     settings: ExportConfig,
     plan: Plan,
 ) -> Result<Rendered> {
-    let Plan { mut placed, tight } = plan;
+    let Plan { mut units, tight } = plan;
     let dir = project.dir.join(EXPORT_DIR);
     let ffmpeg = ffmpeg_for(settings)?;
     if settings.processing == Processing::Clean {
         let ffmpeg = ffmpeg.as_ref().ok_or_else(|| missing_ffmpeg(settings))?;
-        clean_takes(project, ledger, &mut placed, ffmpeg)?;
+        clean_takes(project, ledger, &mut units, ffmpeg)?;
     }
     let film_len = to_usize(seconds_to_samples(
         project.film_duration(),
         project.config.sample_rate,
     ));
-    let mixed = mix(&placed, film_len, project.config.sample_rate);
+    let mixed = mix(&units, film_len, project.config.sample_rate);
     let target = Target {
         sample_rate: settings.sample_rate,
         bit_depth: settings.bit_depth,
@@ -577,13 +784,14 @@ fn render_export(
         }
     };
 
-    let mut warnings = warnings(&placed, project.film_duration());
+    let mut warnings = warnings(&units, project.film_duration());
     warnings.extend(tight);
     warnings.extend(loudness_warning(&report));
-    let lines: Vec<ManifestLine> = placed
+    let lines: Vec<ManifestLine> = units
         .into_iter()
-        .map(|p| {
-            let mut line = p.line;
+        .flat_map(|unit| unit.parts)
+        .map(|part| {
+            let mut line = part.line;
             line.dest_samples = line
                 .dest_samples
                 .map(|n| render::at_rate(n, settings.sample_rate));
@@ -653,14 +861,15 @@ fn loudness_warning(report: &ExportSettings) -> Option<ExportWarning> {
 }
 
 /// Places each line's take, or collects why export refuses: script
-/// problems, lines without a usable take, overlapping speech. Splits the
-/// margins of neighbours and returns `tight-gap` warnings.
+/// problems, lines without a usable take, overlapping speech. Joins the
+/// pieces of a passage that follow each other, splits the margins of
+/// neighbours and returns `tight-gap` warnings.
 fn gather(
     project: &Project,
     ledger: &Ledger,
     state: &State,
     use_proposed: bool,
-) -> (Vec<Placed>, Vec<ExportWarning>, Vec<Refusal>) {
+) -> (Vec<Unit>, Vec<ExportWarning>, Vec<Refusal>) {
     let mut refused = Vec::new();
     let problems = validate(&project.script, project.film_duration());
     if !problems.is_empty() {
@@ -673,11 +882,13 @@ fn gather(
         });
     }
 
+    let rate = project.config.sample_rate;
+    let film_len = to_usize(seconds_to_samples(project.film_duration(), rate));
     let mut refusals = Refusals::default();
-    let mut placed: Vec<Placed> = Vec::new();
-    for line in &project.script.lines {
-        match place(project, ledger, state, use_proposed, line) {
-            Ok(p) => placed.push(p),
+    let mut placed = Units::default();
+    for (index, line) in project.script.lines.iter().enumerate() {
+        match place(project, ledger, state, use_proposed, index, line) {
+            Ok(p) => placed.push(p, film_len),
             Err((code, message)) => refusals.add(code, &line.id, message),
         }
     }
@@ -689,9 +900,10 @@ fn gather(
             message,
         });
     }
-    let tight = split_margins(&mut placed, project.config.sample_rate);
-    refused.extend(overlaps(&placed));
-    (placed, tight, refused)
+    let mut units = placed.units;
+    let tight = split_margins(&mut units, rate);
+    refused.extend(overlaps(&units));
+    (units, tight, refused)
 }
 
 /// Writes the manifest and puts both files in place: the old manifest goes
@@ -763,12 +975,15 @@ fn missing_ffmpeg(settings: ExportConfig) -> Error {
     ))
 }
 
-/// Replaces each placed take's samples with its cleaned copy (the whole
-/// take, so placement is unchanged) and notes its noise reduction.
+/// Replaces each unit's samples with their cleaned copy (the whole take,
+/// so placement is unchanged) and notes its noise reduction. A seam run is
+/// cleaned as one file, its pieces one after the other as in the passage,
+/// so no filter starts anew at a cut; its room tone is the one of its first
+/// piece, matched with the passage's noise floor as every piece's is.
 fn clean_takes(
     project: &Project,
     ledger: &Ledger,
-    placed: &mut [Placed],
+    units: &mut [Unit],
     ffmpeg: &Ffmpeg,
 ) -> Result<()> {
     let processor = Cleaner::new(ffmpeg.clone()).map_err(Error::Ffmpeg)?;
@@ -776,39 +991,55 @@ fn clean_takes(
         .prefix("takewise-clean-")
         .tempdir()
         .map_err(io(std::env::temp_dir()))?;
-    for (i, p) in placed.iter_mut().enumerate() {
+    for (i, unit) in units.iter_mut().enumerate() {
+        let Some(first) = unit.parts.first() else {
+            continue;
+        };
         let recorded = ledger.events.iter().find_map(|e| match &e.kind {
-            EventKind::Recorded(rec) if e.line == p.line.id && e.take == p.take => {
+            EventKind::Recorded(rec) if e.line == first.line.id && e.take == first.take => {
                 Some((rec, e.at))
             }
             _ => None,
         });
         let room = match recorded {
-            Some((rec, at)) => find_room_tone(&project.dir, rec, at, p.floor_dbfs),
+            Some((rec, at)) => find_room_tone(&project.dir, rec, at, unit.floor_dbfs),
             None => Err("the take has no recorded event".to_owned()),
         };
-        let src = project.dir.join(&p.line.take_file);
+        let src = if unit.parts.len() == 1 {
+            project.dir.join(&first.line.take_file)
+        } else {
+            // The pieces as 24-bit audio again, exactly as in their files.
+            #[allow(clippy::cast_possible_truncation)]
+            let joined: Vec<i32> = unit.samples.iter().map(|&v| v as i32).collect();
+            let path = tmp.path().join(format!("{i}-joined.wav"));
+            write_take_wav(&path, &joined, project.config.sample_rate)?;
+            path
+        };
         let out = tmp.path().join(format!("{i}.wav"));
         let info = processor
             .clean_take(&src, room.as_ref().ok(), &out)
             .map_err(Error::Ffmpeg)?;
         let (cleaned, _) = read_float_wav(&out).map_err(Error::Ffmpeg)?;
-        let len = p.samples.len();
-        p.samples = cleaned.into_iter().map(|v| v * UNIT).collect();
-        p.samples.resize(len, 0.0);
-        p.nr_skipped = match (&room, info.noise_floor_db) {
+        let len = unit.samples.len();
+        unit.samples = cleaned.into_iter().map(|v| v * UNIT).collect();
+        unit.samples.resize(len, 0.0);
+        let nr_skipped = match (&room, info.noise_floor_db) {
             (Ok(_), Some(_)) => None,
             (Err(why), _) => Some(why.clone()),
             (Ok(_), None) => Some("no noise floor to reduce to".to_owned()),
         };
-        p.line.noise_reduction = Some(match (&room, info.noise_floor_db, &p.nr_skipped) {
+        let noise_reduction = match (&room, info.noise_floor_db, &nr_skipped) {
             (Ok(tone), Some(floor), _) => format!(
                 "afftdn {NOISE_REDUCTION_DB:.0} dB at a noise floor of {floor:.1} dB from {}",
                 tone.file
             ),
             (_, _, Some(why)) => format!("skipped: {why}"),
             _ => "skipped".to_owned(),
-        });
+        };
+        for part in &mut unit.parts {
+            part.nr_skipped.clone_from(&nr_skipped);
+            part.line.noise_reduction = Some(noise_reduction.clone());
+        }
     }
     Ok(())
 }
@@ -896,6 +1127,7 @@ fn place(
     ledger: &Ledger,
     state: &State,
     use_proposed: bool,
+    index: usize,
     line: &Line,
 ) -> std::result::Result<Placed, (&'static str, &'static str)> {
     let rate = project.config.sample_rate;
@@ -987,17 +1219,19 @@ fn place(
             speech_film_s: [clamped.0, clamped.1],
             words_film_s: check.and_then(|c| words_film_s(c, take_start_film)),
             noise_reduction: None,
+            seam_with: None,
         },
+        index,
         samples: samples.iter().map(|&s| f64::from(s)).collect(),
         take: take_no,
+        piece: take.passage.clone(),
         floor_dbfs: analysis.noise_floor_dbfs,
+        offset,
         src: src0,
         dest: (dest0, dest1),
         speech: (to_usize(speech_dest.0), to_usize(speech_dest.1)),
-        fade_room: (usize::MAX, usize::MAX),
         old_text: take.recorded_against_old_text,
         cropped_speech,
-        nr_skipped: None,
     })
 }
 
@@ -1035,9 +1269,9 @@ fn words_film_s(checked: &Checked, take_start_film: f64) -> Option<Vec<ManifestW
     )
 }
 
-fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
+fn warnings(units: &[Unit], film_duration: f64) -> Vec<ExportWarning> {
     let mut warnings = Vec::new();
-    for p in placed {
+    for p in units.iter().flat_map(|unit| &unit.parts) {
         if p.old_text {
             warnings.push(ExportWarning {
                 code: "recorded-against-old-text",
@@ -1069,79 +1303,96 @@ fn warnings(placed: &[Placed], film_duration: f64) -> Vec<ExportWarning> {
     warnings
 }
 
-/// Where only the margins of two neighbouring takes overlap, splits the
+/// Where only the margins of two neighbouring units overlap, splits the
 /// gap between their speech at its midpoint: each keeps its margin up to
-/// there. Takes whose speech overlaps are left for [`overlaps`]. Returns a
+/// there. Units whose speech overlaps are left for [`overlaps`]. Returns a
 /// `tight-gap` warning for each pair whose speech is less than
-/// [`TIGHT_GAP_S`] apart.
-fn split_margins(placed: &mut [Placed], rate: u32) -> Vec<ExportWarning> {
+/// [`TIGHT_GAP_S`] apart. The lines of a seam run are not split from each
+/// other: only the run's outer margins are.
+fn split_margins(units: &mut [Unit], rate: u32) -> Vec<ExportWarning> {
     let tight_gap = to_usize(seconds_to_samples(TIGHT_GAP_S, rate));
     let mut warnings = Vec::new();
-    let mut order: Vec<usize> = (0..placed.len()).collect();
-    order.sort_by_key(|&i| placed[i].speech);
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    order.sort_by_key(|&i| units[i].speech());
     for pair in order.windows(2) {
         let (a, b) = (pair[0], pair[1]);
-        let (a_end, b_start) = (placed[a].speech.1, placed[b].speech.0);
+        let (a_end, b_start) = (units[a].speech().1, units[b].speech().0);
         if a_end <= b_start && b_start - a_end < tight_gap {
             let ms = (b_start - a_end) as f64 * 1000.0 / f64::from(rate);
+            let before = units[a].parts.last().map_or("", |part| &part.line.id);
+            let after = units[b].parts.first().map_or("", |part| &part.line.id);
             warnings.push(ExportWarning {
                 code: "tight-gap",
-                line: Some(placed[a].line.id.clone()),
+                line: Some(before.to_owned()),
                 message: format!(
-                    "the speech of {} and {} is only {ms:.0} ms apart; the cut between them has shortened fades",
-                    placed[a].line.id, placed[b].line.id
+                    "the speech of {before} and {after} is only {ms:.0} ms apart; the cut between them has shortened fades"
                 ),
             });
         }
-        if a_end > b_start || placed[a].dest.1 <= placed[b].dest.0 {
+        if a_end > b_start || units[a].dest.1 <= units[b].dest.0 {
             continue;
         }
         let mid = a_end + (b_start - a_end) / 2;
-        let first = &mut placed[a];
+        let first = &mut units[a];
         first.dest.1 = first.dest.1.min(mid);
         first.fade_room.1 = first.dest.1 - a_end;
-        let second = &mut placed[b];
+        let second = &mut units[b];
         if second.dest.0 < mid {
             second.src += mid - second.dest.0;
             second.dest.0 = mid;
         }
         second.fade_room.0 = b_start - second.dest.0;
     }
-    for p in placed {
-        let len = p.dest.1 - p.dest.0;
-        p.line.source_samples = [to_u64(p.src), to_u64(p.src + len)];
-        p.line.dest_samples = [to_u64(p.dest.0), to_u64(p.dest.1)];
+    for unit in units {
+        unit.set_line_ranges();
     }
     warnings
 }
 
-/// Pairs of takes whose speech (without the margins) overlaps in the film.
-fn overlaps(placed: &[Placed]) -> Vec<Refusal> {
+/// Pairs of lines from different units whose audio overlaps in the film:
+/// their speech (without the margins) or, for a line joined to the next,
+/// the pause kept up to that line's speech.
+fn overlaps(units: &[Unit]) -> Vec<Refusal> {
+    let parts: Vec<(usize, &Part)> = units
+        .iter()
+        .enumerate()
+        .flat_map(|(unit, u)| u.parts.iter().map(move |part| (unit, part)))
+        .collect();
     let mut refused = Vec::new();
-    for (i, a) in placed.iter().enumerate() {
-        for b in placed.iter().skip(i + 1) {
-            if a.speech.0 < b.speech.1 && b.speech.0 < a.speech.1 {
-                refused.push(Refusal {
-                    code: "overlap",
-                    lines: vec![a.line.id.clone(), b.line.id.clone()],
-                    message: format!(
-                        "the speech of {} and {} overlaps in the film; choose another take or move a start",
-                        a.line.id, b.line.id
-                    ),
-                });
+    for (i, &(unit, a)) in parts.iter().enumerate() {
+        for &(other, b) in parts.iter().skip(i + 1) {
+            if unit == other || a.speech.0 >= b.until || b.speech.0 >= a.until {
+                continue;
             }
+            let (a_id, b_id) = (&a.line.id, &b.line.id);
+            let speech = a.speech.0 < b.speech.1 && b.speech.0 < a.speech.1;
+            let message = if speech {
+                format!(
+                    "the speech of {a_id} and {b_id} overlaps in the film; choose another take or move a start"
+                )
+            } else {
+                format!(
+                    "{a_id} and {b_id} overlap in the film: one is joined to the next line of its passage, and the other's speech falls into the pause kept between them; choose another take or move a start"
+                )
+            };
+            refused.push(Refusal {
+                code: "overlap",
+                lines: vec![a_id.clone(), b_id.clone()],
+                message,
+            });
         }
     }
     refused
 }
 
-/// Copies each placed range into a silent film-length buffer with linear
+/// Copies each unit's range into a silent film-length buffer with linear
 /// fades at both ends, each as long as its room allows (none where a split
-/// gap leaves no margin). In 24-bit units, unrounded.
-fn mix(placed: &[Placed], film_len: usize, rate: u32) -> Vec<f64> {
+/// gap leaves no margin); a seam run has none at its cuts. In 24-bit units,
+/// unrounded.
+fn mix(units: &[Unit], film_len: usize, rate: u32) -> Vec<f64> {
     let mut out = vec![0.0; film_len];
     let fade = to_usize(seconds_to_samples(FADE_S, rate)).max(1);
-    for p in placed {
+    for p in units {
         let len = p.dest.1 - p.dest.0;
         let ramp = |room: usize| fade.min(len / 2).max(1).min(room);
         let (fade_in, fade_out) = (ramp(p.fade_room.0), ramp(p.fade_room.1));
@@ -1231,12 +1482,18 @@ mod tests {
 
     /// [`take`] with a sound at each of `bursts`.
     fn take_with(dir: &Path, line: &str, bursts: &[(f64, f64)]) -> TakeRef {
+        take_from(dir, line, -2.0, bursts)
+    }
+
+    /// [`take_with`], captured from `line_offset_s` seconds after the
+    /// line's start.
+    fn take_from(dir: &Path, line: &str, line_offset_s: f64, bursts: &[(f64, f64)]) -> TakeRef {
         let project = Project::open(dir).unwrap();
         let input = RecordedInput {
             sample_rate: RATE,
             device: "Test Mic".to_owned(),
             channel: 1,
-            line_offset_s: -2.0,
+            line_offset_s,
             snapshot: project.snapshot(line).unwrap(),
             dropouts: None,
             film_shift_ms: None,
@@ -2052,6 +2309,477 @@ mod tests {
         .unwrap();
         assert_eq!(report.refused, []);
         assert_eq!(stages, [Stage::Planned, Stage::Rendered]);
+    }
+
+    /// Four sentences that run into each other.
+    const PASSAGE: &str = r#"
+[[line]]
+id = "a"
+start = 10.0
+end = 13.0
+text = "One."
+
+[[line]]
+id = "b"
+start = 13.5
+end = 16.0
+text = "Two."
+
+[[line]]
+id = "c"
+start = 16.4
+end = 19.0
+text = "Three."
+
+[[line]]
+id = "d"
+start = 19.4
+end = 22.0
+text = "Four."
+"#;
+
+    /// [`PASSAGE`] and a line after a real pause.
+    fn passage_and_later() -> String {
+        format!(
+            "{PASSAGE}\n[[line]]\nid = \"later\"\nstart = 25.0\nend = 27.0\ntext = \"Later.\"\n"
+        )
+    }
+
+    /// Film time of a recorded passage's first sample: 3 s of pre-roll
+    /// before line a.
+    const PASSAGE_FIRST_S: f64 = 7.0;
+    /// The film sample of the passage's first sample.
+    const PASSAGE_FIRST: usize = 336_000;
+
+    /// Records `audio` as one passage over `lines`, from film time
+    /// [`PASSAGE_FIRST_S`] on, and cuts it into its takes.
+    fn record_passage(dir: &Path, lines: &[&str], audio: &[i32]) -> crate::passage::Passage {
+        use crate::passage::{Latency, PassageInput, PassageLine, UnsavedPassage};
+        let project = Project::open(dir).unwrap();
+        let input = PassageInput {
+            sample_rate: RATE,
+            device: "Test Mic".to_owned(),
+            channel: 1,
+            latency: Latency {
+                input_s: 0.012,
+                offset_ms: -29.0,
+            },
+            preroll_s: 3.0,
+            lines: lines
+                .iter()
+                .map(|id| PassageLine {
+                    id: (*id).to_owned(),
+                    snapshot: project.snapshot(id).unwrap(),
+                })
+                .collect(),
+            first_sample_film_s: Some(PASSAGE_FIRST_S),
+            dropouts: None,
+            film_shift_ms: None,
+        };
+        let mut unsaved = UnsavedPassage {
+            input,
+            samples: audio.to_vec(),
+            partial: None,
+            lock: None,
+            complete: false,
+        };
+        let passage = crate::passage::save_passage(dir, &mut unsaved).unwrap();
+        let split = crate::passage::split(dir, &passage.id).unwrap();
+        assert_eq!(split.takes.len(), lines.len(), "one take per line");
+        passage
+    }
+
+    /// The four sentences of [`PASSAGE`] read in one go: room noise from
+    /// film time 7 s to 23 s with each sentence in its slot, 0.8, 0.7 and
+    /// 0.9 s apart, so the cuts fall at 13.2, 16.15 and 19.05 s.
+    fn spoken_passage() -> Vec<i32> {
+        let mut audio = noise(16.0);
+        for (from, to) in [(10.0, 12.8), (13.6, 15.8), (16.5, 18.6), (19.5, 21.5)] {
+            burst(&mut audio, from - PASSAGE_FIRST_S, to - PASSAGE_FIRST_S);
+        }
+        audio
+    }
+
+    /// Records [`spoken_passage`] over lines a to d and chooses it whole.
+    fn chosen_passage(dir: &Path) -> Vec<i32> {
+        let audio = spoken_passage();
+        let passage = record_passage(dir, &["a", "b", "c", "d"], &audio);
+        let chosen = crate::passage::choose_passage(dir, &passage.id, "narrator").unwrap();
+        assert_eq!(chosen.chosen.len(), 4, "{chosen:?}");
+        // The passage file is the capture, whole.
+        let (file, _) = read_take_wav(&dir.join(passage.file())).unwrap();
+        assert_eq!(file, audio);
+        audio
+    }
+
+    fn seams(report: &ExportReport) -> Vec<(&str, Option<&str>)> {
+        report
+            .lines
+            .iter()
+            .map(|line| (line.id.as_str(), line.seam_with.as_deref()))
+            .collect()
+    }
+
+    fn line<'a>(report: &'a ExportReport, id: &str) -> &'a ManifestLine {
+        report.lines.iter().find(|line| line.id == id).unwrap()
+    }
+
+    /// Asserts that the narration from `from` to `to` (film samples) is the
+    /// passage recorded from [`PASSAGE_FIRST`] on, sample for sample.
+    fn assert_as_recorded(out: &[i32], passage: &[i32], from: u64, to: u64) {
+        let (from, to) = (to_usize_u(from), to_usize_u(to));
+        assert!(from < to, "{from}..{to}");
+        for d in from..to {
+            assert_eq!(out[d], passage[d - PASSAGE_FIRST], "film sample {d}");
+        }
+    }
+
+    /// 10 ms at 48 kHz: the length of a fade.
+    const FADE: u64 = 480;
+
+    #[test]
+    fn a_passage_chosen_whole_exports_as_recorded() {
+        let (_tmp, dir) = setup(&passage_and_later());
+        let passage = chosen_passage(&dir);
+        let after = take(&dir, "later", Some((2.0, 3.0)));
+        choose(&dir, &after);
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(report.warnings, []);
+        assert_eq!(
+            seams(&report),
+            [
+                ("a", Some("b")),
+                ("b", Some("c")),
+                ("c", Some("d")),
+                ("d", None),
+                ("later", None)
+            ]
+        );
+
+        // The run is trimmed at its outer edges only: 150 ms before the
+        // first sentence and after the last. In between, each line's range
+        // ends at its cut, where the next line's begins.
+        let ranges: Vec<([u64; 2], [u64; 2])> = report
+            .lines
+            .iter()
+            .map(|line| (line.source_samples, line.dest_samples))
+            .collect();
+        let (first, cuts, last) = (
+            480_000 - 7_200,
+            [633_600, 775_200, 914_400],
+            1_032_000 + 7_200,
+        );
+        assert_eq!(ranges[0], ([144_000 - 7_200, 297_600], [first, cuts[0]]));
+        assert_eq!(ranges[1], ([0, 141_600], [cuts[0], cuts[1]]));
+        assert_eq!(ranges[2], ([0, 139_200], [cuts[1], cuts[2]]));
+        assert_eq!(ranges[3], ([0, 117_600 + 7_200], [cuts[2], last]));
+        for line in &report.lines[..4] {
+            assert_eq!(line.take_file, format!("takes/{}/001.wav", line.id));
+        }
+        // Each line keeps its own speech.
+        let speech: Vec<[f64; 2]> = report.lines.iter().map(|l| l.speech_film_s).collect();
+        for (got, want) in speech
+            .iter()
+            .zip([(10.0, 12.8), (13.6, 15.8), (16.5, 18.6)])
+        {
+            assert!((got[0] - want.0).abs() < 0.02 && (got[1] - want.1).abs() < 0.02);
+        }
+
+        // The narration is the passage, sample for sample, from one outer
+        // fade to the other: the pauses keep their room, and no cut fades.
+        let out = narration(&dir);
+        assert_as_recorded(&out, &passage, first + FADE, last - FADE);
+        let pause = to_usize_u(cuts[0]) - 4_800..to_usize_u(cuts[0]) + 4_800;
+        let room = out[pause].iter().filter(|&&s| s != 0).count();
+        assert!(room > 9_000, "the room at a cut: {room} samples");
+        let (first, last) = (to_usize_u(first), to_usize_u(last));
+        assert_eq!((out[first - 1], out[first], out[last]), (0, 0, 0));
+        assert!(out[..first].iter().all(|&s| s == 0), "silent before");
+
+        let m = manifest(&dir);
+        assert_eq!(m["lines"][0]["seam_with"], "b");
+        assert_eq!(m["lines"][2]["seam_with"], "d");
+        assert!(m["lines"][3].get("seam_with").is_none(), "{m}");
+        assert!(m["lines"][4].get("seam_with").is_none(), "{m}");
+        assert_eq!(m["lines"][1]["dest_samples"][0], cuts[0]);
+    }
+
+    #[test]
+    fn a_moved_line_breaks_only_its_own_seams() {
+        // b starts 0.2 s later than it was recorded at: it is cut from a
+        // and from c as any two takes are, while c and d stay joined.
+        let (_tmp, dir) = setup(PASSAGE);
+        let passage = chosen_passage(&dir);
+        set_line_field(&dir, "b", Field::Start(13.7), None).unwrap();
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [("a", None), ("b", None), ("c", Some("d")), ("d", None)]
+        );
+        let (a, b, c, d) = (
+            line(&report, "a"),
+            line(&report, "b"),
+            line(&report, "c"),
+            line(&report, "d"),
+        );
+        // a ends 150 ms after its speech, not at the cut; b moved with its
+        // line; c starts 150 ms before its speech.
+        assert_eq!(a.dest_samples, [480_000 - 7_200, 614_400 + 7_200]);
+        assert_eq!(b.source_samples, [19_200 - 7_200, 124_800 + 7_200]);
+        assert_eq!(b.dest_samples[0], 662_400 - 7_200);
+        assert_eq!(c.dest_samples, [792_000 - 7_200, 914_400]);
+        assert_eq!(d.dest_samples, [914_400, 1_032_000 + 7_200]);
+        let out = narration(&dir);
+        assert_as_recorded(
+            &out,
+            &passage,
+            c.dest_samples[0] + FADE,
+            d.dest_samples[1] - FADE,
+        );
+        // Between a and b the narration is silent: the cut is spliced.
+        assert_eq!(out[to_usize_u(a.dest_samples[1])], 0);
+        assert_eq!(out[to_usize_u(b.dest_samples[0])], 0);
+
+        // The last line moved: only its seam with c is gone.
+        let (_tmp, dir) = setup(PASSAGE);
+        chosen_passage(&dir);
+        set_line_field(&dir, "d", Field::Start(19.6), None).unwrap();
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [("a", Some("b")), ("b", Some("c")), ("c", None), ("d", None)]
+        );
+        assert_eq!(line(&report, "c").dest_samples[1], 892_800 + 7_200);
+
+        // A start that still rounds to within a sample of the recording
+        // keeps the seam, and the ranges still meet.
+        let (_tmp, dir) = setup(PASSAGE);
+        let passage = chosen_passage(&dir);
+        set_line_field(&dir, "d", Field::Start(19.400_02), None).unwrap();
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(seams(&report)[2..4], [("c", Some("d")), ("d", None)]);
+        let (c, d) = (line(&report, "c"), line(&report, "d"));
+        assert_eq!(c.dest_samples[1], d.dest_samples[0]);
+        assert_eq!(d.dest_samples, [914_400, 1_032_000 + 7_200]);
+        assert_as_recorded(
+            &narration(&dir),
+            &passage,
+            c.dest_samples[0],
+            d.dest_samples[1] - FADE,
+        );
+    }
+
+    #[test]
+    fn passage_pieces_and_line_takes_mix() {
+        // b is read again on its own and that take chosen: a and b, and b
+        // and c, are cut as any two takes are; c and d stay joined.
+        let (_tmp, dir) = setup(&passage_and_later());
+        let passage = chosen_passage(&dir);
+        let again = take(&dir, "b", Some((2.1, 4.2)));
+        choose(&dir, &again);
+        let after = take(&dir, "later", Some((2.0, 3.0)));
+        choose(&dir, &after);
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [
+                ("a", None),
+                ("b", None),
+                ("c", Some("d")),
+                ("d", None),
+                ("later", None)
+            ]
+        );
+        let (a, b, c, d) = (
+            line(&report, "a"),
+            line(&report, "b"),
+            line(&report, "c"),
+            line(&report, "d"),
+        );
+        assert_eq!(b.take_file, "takes/b/002.wav");
+        // The line take lies where it was recorded: 2 s before 13.5 s.
+        assert_eq!(b.source_samples, [100_800 - 7_200, 201_600 + 7_200]);
+        assert_eq!(b.dest_samples[0], 552_000 + 100_800 - 7_200);
+        assert_eq!(a.dest_samples, [480_000 - 7_200, 614_400 + 7_200]);
+        assert_eq!(c.dest_samples, [792_000 - 7_200, 914_400]);
+        let out = narration(&dir);
+        assert_as_recorded(
+            &out,
+            &passage,
+            a.dest_samples[0] + FADE,
+            a.dest_samples[1] - FADE,
+        );
+        assert_as_recorded(
+            &out,
+            &passage,
+            c.dest_samples[0] + FADE,
+            d.dest_samples[1] - FADE,
+        );
+        let (again, _) = read_take_wav(&dir.join(&b.take_file)).unwrap();
+        for k in FADE..(b.dest_samples[1] - b.dest_samples[0] - FADE) {
+            assert_eq!(
+                out[to_usize_u(b.dest_samples[0] + k)],
+                again[to_usize_u(b.source_samples[0] + k)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_may_start_after_the_passages_first_piece() {
+        // a is read on its own; b, c and d are the passage's pieces 1 to 3.
+        let (_tmp, dir) = setup(PASSAGE);
+        let audio = spoken_passage();
+        record_passage(&dir, &["a", "b", "c", "d"], &audio);
+        let alone = take(&dir, "a", Some((2.0, 4.5)));
+        choose(&dir, &alone);
+        for id in ["b", "c", "d"] {
+            crate::takes::choose_take(&dir, id, 1, "narrator").unwrap();
+        }
+        let report = run(&dir, false);
+        assert_eq!(report.refused, [], "{report:?}");
+        assert_eq!(
+            seams(&report),
+            [("a", None), ("b", Some("c")), ("c", Some("d")), ("d", None)]
+        );
+        let (a, b, c, d) = (
+            line(&report, "a"),
+            line(&report, "b"),
+            line(&report, "c"),
+            line(&report, "d"),
+        );
+        assert_eq!(a.take_file, "takes/a/002.wav");
+        // The run starts 150 ms before b's speech, 0.4 s into its piece,
+        // and lies where the passage was recorded.
+        assert_eq!(b.source_samples, [19_200 - 7_200, 141_600]);
+        assert_eq!(b.dest_samples, [652_800 - 7_200, 775_200]);
+        assert_eq!(c.source_samples, [0, 139_200]);
+        assert_eq!(d.dest_samples, [914_400, 1_032_000 + 7_200]);
+        assert_as_recorded(
+            &narration(&dir),
+            &audio,
+            b.dest_samples[0] + FADE,
+            d.dest_samples[1] - FADE,
+        );
+    }
+
+    #[test]
+    fn speech_in_a_pause_a_passage_keeps_is_an_overlap() {
+        // The take of "later" was captured from 12.5 s of the film, and its
+        // speech lies at 13.05 to 13.35 s: in the pause between a and b,
+        // which the passage keeps.
+        let (_tmp, dir) = setup(&passage_and_later());
+        chosen_passage(&dir);
+        let stray = take_from(&dir, "later", -12.5, &[(0.55, 0.85)]);
+        choose(&dir, &stray);
+        let report = run(&dir, false);
+        assert_eq!(refused_codes(&report), vec!["overlap"]);
+        assert_eq!(
+            report.refused[0].lines,
+            vec!["a".to_owned(), "later".to_owned()]
+        );
+        assert!(
+            report.refused[0].message.contains("pause"),
+            "{:?}",
+            report.refused
+        );
+        // Without the seam, the two lie apart: a is cut after its speech.
+        set_line_field(&dir, "b", Field::Start(13.6), None).unwrap();
+        assert_eq!(run(&dir, false).refused, []);
+    }
+
+    #[test]
+    fn clean_keeps_a_passage_continuous() {
+        let Some(ffmpeg) = ffmpeg_or_skip() else {
+            return;
+        };
+        // The narrator reads through the cue at 13.5 s: the cut between a
+        // and b falls into the sound, at 13.5 s. A click at 14.5 s of the
+        // film, a second into b's piece, is the passage's peak.
+        let script = PASSAGE.split("[[line]]\nid = \"c\"").next().unwrap();
+        let (_tmp, dir) = setup(script);
+        let mut audio = noise(10.0);
+        crate::testutil::burst_at(&mut audio, 3.0, 8.0, -30.0);
+        let click = 360_000;
+        audio[click] = 6 << 20;
+        let passage = record_passage(&dir, &["a", "b"], &audio);
+        assert!(!passage.cuts.as_ref().unwrap()[0].pause, "{passage:?}");
+        let cut = to_usize_u(passage.cuts.as_ref().unwrap()[0].sample);
+        assert_eq!(cut, 312_000);
+        crate::passage::choose_passage(&dir, &passage.id, "narrator").unwrap();
+        let tone = crate::room::RoomInput {
+            input: "Test Mic",
+            channel: 1,
+            output: "Phones",
+            floor_dbfs: -65.0,
+            gated: false,
+        };
+        crate::room::save_room_tone(&dir, &noise(5.0), RATE, jiff::Timestamp::now(), &tone)
+            .unwrap();
+
+        let raw = narration(&dir_after(&dir, ExportConfig::default()));
+        let raw_at = peak_at(&raw.iter().map(|&s| f64::from(s)).collect::<Vec<_>>());
+        assert_eq!(raw_at, PASSAGE_FIRST + click);
+        let report = export_with(
+            &dir,
+            ExportConfig {
+                processing: Processing::Clean,
+                ..ExportConfig::default()
+            },
+        );
+        assert_eq!(seams(&report), [("a", Some("b")), ("b", None)]);
+        // Both lines got the noise reduction, matched with the passage's
+        // floor: b's piece has no pre-roll of its own.
+        let notes: Vec<&str> = report
+            .lines
+            .iter()
+            .map(|line| line.noise_reduction.as_deref().unwrap())
+            .collect();
+        assert!(notes[0].starts_with("afftdn 10 dB"), "{notes:?}");
+        assert_eq!(notes[0], notes[1]);
+        // The filters' delay is compensated over the whole run: the click
+        // lies where raw has it.
+        let clean: Vec<f64> = narration(&dir).iter().map(|&s| f64::from(s)).collect();
+        assert!(peak_at(&clean).abs_diff(raw_at) <= 1, "{}", peak_at(&clean));
+
+        // Around the cut the narration is the passage cleaned as one file,
+        // at one gain; cleaned piece by piece, the filters start anew at
+        // the cut and it is not.
+        let processor = Cleaner::new(ffmpeg).unwrap();
+        let room = crate::room::room_tones(&dir).unwrap().remove(0);
+        let cleaned = |file: &str| -> Vec<f64> {
+            let out = dir.join("cleaned.wav");
+            processor
+                .clean_take(&dir.join(file), Some(&room), &out)
+                .unwrap();
+            read_float_wav(&out).unwrap().0
+        };
+        let whole = cleaned(&passage.file());
+        let mut pieces = cleaned("takes/a/001.wav");
+        pieces.extend(cleaned("takes/b/001.wav"));
+        assert_eq!(whole.len(), pieces.len());
+        // How far `got` is from `want` at its best gain, as a share of the
+        // energy, over 50 ms on either side of the cut.
+        let window = cut - 2_400..cut + 2_400;
+        let distance = |got: &[f64], want: &[f64]| -> f64 {
+            let dot = |x: &[f64], y: &[f64]| x.iter().zip(y).map(|(a, b)| a * b).sum::<f64>();
+            let gain = dot(got, want) / dot(want, want);
+            let off: f64 = got
+                .iter()
+                .zip(want)
+                .map(|(g, w)| (g - gain * w).powi(2))
+                .sum();
+            off / (gain * gain * dot(want, want))
+        };
+        let exported = &clean[PASSAGE_FIRST + window.start..PASSAGE_FIRST + window.end];
+        let as_one = distance(exported, &whole[window.clone()]);
+        let restarted = distance(&pieces[window.clone()], &whole[window.clone()]);
+        assert!(as_one < 1e-6, "{as_one:e}");
+        assert!(restarted > 1e-4, "{restarted:e}");
     }
 
     #[test]

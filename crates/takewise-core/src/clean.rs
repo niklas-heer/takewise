@@ -1,7 +1,8 @@
 //! The `clean` export's processing of each used take: a high-pass at 80 Hz
 //! and, with a matching room tone, gentle noise reduction (`afftdn`, 10 dB,
-//! the room tone's floor as the noise floor). Takes are never changed: the
-//! result is a new 48 kHz float file. `afftdn` delays its output by its
+//! the room tone's floor as the noise floor). The pieces of a passage that
+//! export joins are processed as one file, so the filters run through its
+//! cuts. Takes are never changed: the result is a new 48 kHz float file. `afftdn` delays its output by its
 //! window; the delay is measured with a click when a [`Cleaner`] is made and
 //! compensated, so cleaned speech sits on the same samples as the take's.
 
@@ -113,8 +114,9 @@ impl Cleaner {
         Ok(Cleaner { ffmpeg, nr_delay })
     }
 
-    /// Writes `src` cleaned to `out` (48 kHz mono float, the same length):
-    /// high-passed, and noise-reduced with `room`'s floor when given.
+    /// Writes `src` (a take, or joined pieces of a passage) cleaned to `out`
+    /// (48 kHz mono float, the same length): high-passed, and noise-reduced
+    /// with `room`'s floor when given.
     pub fn clean_take(
         &self,
         src: &Path,
