@@ -24,6 +24,7 @@ mod panel;
 mod passage;
 mod prompter;
 mod recorder;
+mod recover;
 mod remembered;
 #[cfg(feature = "screenshots")]
 pub mod screenshots;
@@ -641,6 +642,8 @@ pub struct RecordingWindow {
     take_warning: Option<String>,
     /// The failing streaks of device lookups, by kind.
     failing: output::Failures,
+    /// When a failed film may be reopened next.
+    film_reopen_at: f64,
     /// The last take result shown, which no notice about the output may
     /// replace.
     take_result: Option<String>,
@@ -741,6 +744,7 @@ impl RecordingWindow {
             ticked_at: None,
             take_warning: None,
             failing: output::Failures::default(),
+            film_reopen_at: 0.0,
             take_result: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
@@ -1252,6 +1256,15 @@ impl RecordingWindow {
             self.say_route(problem.for_recording());
             return;
         }
+        // A film that failed is reopened between takes; a take on it
+        // would only stop at once.
+        if self.media.film_failure().is_some() || !self.media.film_ready() {
+            self.message = Some(
+                "The film is being opened again after its output went away; press Space again in a moment."
+                    .to_owned(),
+            );
+            return;
+        }
         self.message = None;
         self.peak_meter.clear();
         self.scroll.reset();
@@ -1318,6 +1331,7 @@ impl RecordingWindow {
         }
         let now = self.media.host_now_s();
         self.watch_output(now);
+        self.recover_players(now);
         let busy = self.recorder.is_recording() || self.recorder.is_playing();
         if !busy
             && self

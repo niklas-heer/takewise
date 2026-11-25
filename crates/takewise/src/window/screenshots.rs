@@ -506,6 +506,12 @@ impl Media for DemoMedia {
     fn film_ready(&self) -> bool {
         self.0.borrow().film.is_ready()
     }
+    fn film_failure(&self) -> Option<String> {
+        None
+    }
+    fn take_failure(&self) -> Option<String> {
+        None
+    }
     fn film_open(&mut self, _: &Path) -> Result<(), String> {
         Err("the screenshots show one film".to_owned())
     }

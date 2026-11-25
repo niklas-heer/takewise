@@ -78,6 +78,12 @@ struct Fake {
     default_name_fails: bool,
     /// Whether an opened take is still loading.
     take_loading: bool,
+    /// Why the film's or the take's player failed (as AVFoundation fails
+    /// a playing item whose output went away), and why reopening the film
+    /// fails, when it does.
+    film_failed: Option<String>,
+    take_failed: Option<String>,
+    film_open_error: Option<String>,
     /// Where the film plays (`None`: the system default).
     film_output: Option<String>,
     /// The take open for playback, if one is.
@@ -167,6 +173,9 @@ impl FakeMedia {
             listing_fails: false,
             default_name_fails: false,
             take_loading: false,
+            film_failed: None,
+            take_failed: None,
+            film_open_error: None,
             film_output: None,
             take: None,
             take_output_error: None,
@@ -241,7 +250,13 @@ impl Media for FakeMedia {
         self.0.borrow().now
     }
     fn film_ready(&self) -> bool {
-        true
+        self.0.borrow().film_failed.is_none()
+    }
+    fn film_failure(&self) -> Option<String> {
+        self.0.borrow().film_failed.clone()
+    }
+    fn take_failure(&self) -> Option<String> {
+        self.0.borrow().take_failed.clone()
     }
     fn film_play_at(&mut self, film_s: f64, host_s: f64) -> Result<Timebase, String> {
         if let Some(err) = self.0.borrow().play_error.clone() {
@@ -272,7 +287,13 @@ impl Media for FakeMedia {
         }
     }
     fn film_open(&mut self, path: &Path) -> Result<(), String> {
-        self.0.borrow_mut().films.push(path.to_owned());
+        let mut fake = self.0.borrow_mut();
+        if let Some(err) = fake.film_open_error.clone() {
+            return Err(err);
+        }
+        fake.films.push(path.to_owned());
+        // A new player: not failed.
+        fake.film_failed = None;
         Ok(())
     }
     fn film_pause(&mut self) {
@@ -320,8 +341,9 @@ impl Media for FakeMedia {
     }
     fn open_take(&mut self, path: &Path) -> Result<(), String> {
         // On the device the film was last set to, as the real media: it is
-        // not looked up again.
+        // not looked up again. A new player: not failed.
         let mut fake = self.0.borrow_mut();
+        fake.take_failed = None;
         let output = fake.film_output.clone();
         fake.opened_takes.push(path.to_owned());
         fake.take = Some(OpenTake {
@@ -331,7 +353,8 @@ impl Media for FakeMedia {
         Ok(())
     }
     fn take_ready(&self) -> bool {
-        !self.0.borrow().take_loading
+        let fake = self.0.borrow();
+        !fake.take_loading && fake.take_failed.is_none()
     }
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {
         self.0.borrow_mut().take_plays.push((take_s, host_s));
@@ -2034,6 +2057,157 @@ fn a_probe_decides_but_places_nothing(cx: &mut TestAppContext) {
     let takes = recorded(&f.dir);
     let offset = takes.last().expect("the take").2.line_offset_s;
     assert!(close(offset, 5.57 - 8.0), "placed at {offset}");
+}
+
+/// The project's film path.
+fn film_of(f: &Fixture) -> PathBuf {
+    Project::open(&f.dir).expect("project").film_path()
+}
+
+#[gpui_kit::test]
+fn a_film_that_failed_mid_play_is_reopened_and_plays_again(cx: &mut TestAppContext) {
+    // As macOS does when the headphones go off: the playing item fails
+    // for good; the playback stops, the film is reopened, and P works.
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    f.media.set_now(200.5);
+    frame(cx, f.window);
+    let films = f.media.0.borrow().films.len();
+    f.media.0.borrow_mut().film_failed = Some("The operation could not be completed".to_owned());
+    f.media.set_now(200.6);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(
+        message(cx, &f.view).contains("the film could not play on after its output went away"),
+        "{}",
+        message(cx, &f.view)
+    );
+    assert_eq!(f.media.0.borrow().films.len(), films + 1, "reopened");
+    assert_eq!(f.media.0.borrow().films.last(), Some(&film_of(&f)));
+    let plays = f.media.0.borrow().take_plays.len();
+    f.media.set_now(201.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        f.media.0.borrow().take_plays.len(),
+        plays + 1,
+        "played again"
+    );
+
+    // A take whose player failed: stopped; the next P opens a new one.
+    f.media.set_now(201.5);
+    frame(cx, f.window);
+    f.media.0.borrow_mut().take_failed = Some("failed".to_owned());
+    f.media.set_now(201.6);
+    frame(cx, f.window);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert!(message(cx, &f.view).contains("the take could not play on"));
+    f.media.set_now(202.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn a_failed_film_is_reopened_once_its_output_is_back(cx: &mut TestAppContext) {
+    // The headphones go off mid-play: the film fails, and is not reopened
+    // while they are gone (a new player would fail the same way); on
+    // again, it is reopened at the next tick.
+    let f = on_test_phones(cx);
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    f.media.set_now(200.5);
+    frame(cx, f.window);
+    let films = f.media.0.borrow().films.len();
+    unplug(&f, "Test Phones");
+    f.media.0.borrow_mut().film_failed = Some("failed".to_owned());
+    for at in [200.6, 203.0, 206.0] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        f.media.0.borrow().films.len(),
+        films,
+        "not while it is gone"
+    );
+    plug(&f, "Test Phones");
+    f.media.set_now(206.1);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().films.len(),
+        films + 1,
+        "reopened once back"
+    );
+    f.media.set_now(207.0);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+}
+
+#[gpui_kit::test]
+fn recording_works_again_once_a_failed_film_is_reopened(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    // Failed, and reopening fails too: it says so, Space waits, and it
+    // is tried again two seconds later.
+    f.media.0.borrow_mut().film_failed = Some("failed".to_owned());
+    f.media.0.borrow_mut().film_open_error = Some("no".to_owned());
+    f.media.set_now(100.0);
+    frame(cx, f.window);
+    assert!(message(cx, &f.view).contains("Could not reopen the film: no"));
+    press(cx, f.window, &["space"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert!(message(cx, &f.view).contains("press Space again in a moment"));
+    f.media.0.borrow_mut().film_open_error = None;
+    f.media.set_now(101.0);
+    frame(cx, f.window);
+    assert!(
+        f.media.0.borrow().film_failed.is_some(),
+        "not before two seconds"
+    );
+    f.media.set_now(102.1);
+    frame(cx, f.window);
+    assert!(f.media.0.borrow().film_failed.is_none(), "reopened");
+    // Space records, and the film is scheduled.
+    let plays = f.media.0.borrow().plays.len();
+    begin(cx, &f, 110.0);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert!(
+        f.media.0.borrow().plays.len() > plays,
+        "the film is scheduled"
+    );
+    f.media.set_now(110.5);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2);
+}
+
+#[gpui_kit::test]
+fn a_film_that_fails_during_a_take_is_reopened_after_it(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    begin(cx, &f, 100.0);
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    let films = f.media.0.borrow().films.len();
+    f.media.0.borrow_mut().film_failed = Some("failed".to_owned());
+    f.media.set_now(100.6);
+    frame(cx, f.window);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(f.media.0.borrow().films.len(), films, "not during the take");
+    f.media.set_now(100.7);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2, "the take is kept");
+    f.media.set_now(100.8);
+    frame(cx, f.window);
+    assert_eq!(
+        f.media.0.borrow().films.len(),
+        films + 1,
+        "reopened after it"
+    );
+    assert!(f.media.0.borrow().film_failed.is_none());
 }
 
 #[gpui_kit::test]

@@ -19,6 +19,10 @@ pub trait Media {
     fn host_now_s(&self) -> f64;
 
     fn film_ready(&self) -> bool;
+    /// Why the film's player can no longer play, once it failed: macOS
+    /// fails a playing item whose output device goes away, for good, even
+    /// when the device comes back; only a new player plays again.
+    fn film_failure(&self) -> Option<String>;
     /// Replaces the film with the one at `path` (the calibration's beep
     /// film, then the project's again), playing through the same output.
     fn film_open(&mut self, path: &Path) -> Result<(), String>;
@@ -55,6 +59,9 @@ pub trait Media {
     /// through, not looked up again); it loads asynchronously.
     fn open_take(&mut self, path: &Path) -> Result<(), String>;
     fn take_ready(&self) -> bool;
+    /// Why the open take's player can no longer play, once it failed (as
+    /// for the film; the next take opened gets a new player).
+    fn take_failure(&self) -> Option<String>;
     /// Plays take time `take_s` at `host_s` (a negative `take_s` delays the
     /// take's beginning).
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String>;
@@ -187,6 +194,10 @@ impl Media for RealMedia {
         self.film.is_ready()
     }
 
+    fn film_failure(&self) -> Option<String> {
+        self.film.failure()
+    }
+
     fn film_open(&mut self, path: &Path) -> Result<(), String> {
         let film = FilmPlayer::open(path).map_err(|err| err.to_string())?;
         film.set_output_uid(self.output_uid.as_deref());
@@ -273,6 +284,10 @@ impl Media for RealMedia {
 
     fn take_ready(&self) -> bool {
         self.take.as_ref().is_some_and(TakePlayer::is_ready)
+    }
+
+    fn take_failure(&self) -> Option<String> {
+        self.take.as_ref().and_then(TakePlayer::failure)
     }
 
     fn take_play_at(&mut self, take_s: f64, host_s: f64) -> Result<(), String> {

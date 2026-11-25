@@ -109,7 +109,7 @@ impl RecordingWindow {
             }
             Err(err) => {
                 self.recorder.stop_tap();
-                self.restore_film();
+                let _ = self.restore_film();
                 Err(err)
             }
         }
@@ -227,21 +227,23 @@ impl RecordingWindow {
         self.calibrating = None;
         self.recorder.stop_tap();
         self.media.film_pause();
-        self.restore_film();
+        let _ = self.restore_film();
     }
 
     /// Puts the project's film back, at its volume and parked where it was;
     /// it warms up again before the next take. It comes back whether or not
     /// its output is there: it opens on the device the players are set to,
     /// and is moved again once a missing output returns.
-    fn restore_film(&mut self) {
-        if let Err(err) = self.media.film_open(&self.project.film_path()) {
+    pub(super) fn restore_film(&mut self) -> bool {
+        let opened = self.media.film_open(&self.project.film_path());
+        if let Err(err) = &opened {
             self.message = Some(format!("Could not reopen the film: {err}"));
         }
         self.media.film_set_gain_db(self.volumes.film);
         self.media.film_set_muted(false);
         self.recorder.rewarm();
         self.park();
+        opened.is_ok()
     }
 
     /// Stores a consistent measurement's offset with the devices it was
