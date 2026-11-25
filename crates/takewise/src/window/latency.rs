@@ -199,6 +199,9 @@ impl RecordingWindow {
         if !matches!(seen, Seen::Dropped(_) | Seen::Unreadable) {
             return;
         }
+        // Seen here before CoreAudio says so: the route is set again (and
+        // confirmed) before the film is reopened on it.
+        self.route_due = true;
         self.end_calibration();
         if let Some(setup) = &mut self.setup {
             setup.latency = Some(Err(OUTPUT_CHANGED.to_owned()));

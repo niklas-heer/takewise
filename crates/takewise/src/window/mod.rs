@@ -756,7 +756,8 @@ impl RecordingWindow {
         };
         // A film that never loads counts as failed, as a reopened one does.
         let now = view.media.host_now_s();
-        view.film.opened(now);
+        let generation = view.media.device_generation();
+        view.film.opened(now, generation);
         // The levels in use, within their ranges, are what takes play at.
         view.volumes.write_into(&mut view.project.config);
         view.after_reload(None);

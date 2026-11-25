@@ -260,6 +260,9 @@ impl RecordingWindow {
         let Some(name) = self.project.config.output.device.clone() else {
             self.output_missing = None;
             self.output_error = None;
+            // No device of its own to read: a streak of failed reads of
+            // the one chosen before is over.
+            self.failing.applied.ok();
             if self.route_due || self.film_output.is_some() {
                 self.media
                     .set_output(None)
@@ -399,15 +402,15 @@ impl RecordingWindow {
     /// No listing, and nothing set; not before the latest device change
     /// has been acted on.
     pub(super) fn route_usable(&self) -> bool {
-        if self.route_due
-            || self.failing.applied.since.is_some()
-            || self.devices_watched != self.media.device_generation()
-        {
+        if self.route_due || self.devices_watched != self.media.device_generation() {
             return false;
         }
         match &self.project.config.output.device {
+            // A streak of failed reads of the applied device counts only
+            // for that device, never against the system output.
             Some(name) => {
-                self.film_output.as_ref() == Some(name)
+                self.failing.applied.since.is_none()
+                    && self.film_output.as_ref() == Some(name)
                     && self.output_missing.is_none()
                     && matches!(self.applied_device, Some((_, Some(_))))
             }
