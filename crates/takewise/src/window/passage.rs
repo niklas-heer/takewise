@@ -122,6 +122,10 @@ impl RecordingWindow {
             self.say_route(problem.for_playback());
             return;
         }
+        if let Some(problem) = self.film_problem(false) {
+            self.message = Some(problem);
+            return;
+        }
         self.message = self
             .recorder
             .start_passage_playback(&mut *self.media, &self.project, &piece)

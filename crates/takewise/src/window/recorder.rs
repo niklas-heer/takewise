@@ -966,6 +966,12 @@ impl Recorder {
         self.stop_take(media, dir, None, false)
     }
 
+    /// Stops the take because `why` (not the narrator), and commits it as
+    /// [`Recorder::finish_take`] does: its audio is kept.
+    pub fn abort_take(&mut self, media: &mut dyn Media, dir: &Path, why: String) -> Update {
+        self.stop_take(media, dir, Some(why), false)
+    }
+
     /// [`Recorder::finish_take`], with `why` the take stopped when it was
     /// not the narrator who stopped it, and whether it ran to its end.
     fn stop_take(

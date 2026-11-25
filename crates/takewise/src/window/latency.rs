@@ -13,6 +13,7 @@ use takewise_core::{self as tw, CalibrationInfo, Route};
 use takewise_media::DeviceLookup;
 
 use super::output::{Lookup, Seen};
+use super::recover::FilmState;
 use super::setup::{Setup, calibration_needed, line};
 use super::{RecordingWindow, colors};
 use crate::calibrate::{self, Measurement, Run};
@@ -42,7 +43,7 @@ pub struct Calibrating {
 /// could not be read. A device that went away and came back keeps its UID
 /// but has another object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum OutputIdentity {
+pub(super) enum OutputIdentity {
     Device(String, u32),
     System(u32),
     Unknown,
@@ -98,6 +99,8 @@ impl RecordingWindow {
             .and_then(|()| Run::new(&*self.media, &device, &output));
         match started {
             Ok(run) => {
+                self.film = FilmState::Reopen;
+                self.film_on = self.output_identity();
                 self.calibrating = Some(Calibrating {
                     run,
                     _work: work,
@@ -109,7 +112,7 @@ impl RecordingWindow {
             }
             Err(err) => {
                 self.recorder.stop_tap();
-                let _ = self.restore_film();
+                self.reopen_film_now();
                 Err(err)
             }
         }
@@ -163,7 +166,7 @@ impl RecordingWindow {
 
     /// The output device the film plays through now: the one the players
     /// are set to, or the system's default output.
-    fn output_identity(&self) -> OutputIdentity {
+    pub(super) fn output_identity(&self) -> OutputIdentity {
         match (&self.film_output, &self.applied_device) {
             (Some(_), Some((uid, Some(object)))) => OutputIdentity::Device(uid.clone(), *object),
             (Some(_), _) => OutputIdentity::Unknown,
@@ -227,23 +230,24 @@ impl RecordingWindow {
         self.calibrating = None;
         self.recorder.stop_tap();
         self.media.film_pause();
-        let _ = self.restore_film();
+        self.reopen_film_now();
     }
 
     /// Puts the project's film back, at its volume and parked where it was;
-    /// it warms up again before the next take. It comes back whether or not
-    /// its output is there: it opens on the device the players are set to,
-    /// and is moved again once a missing output returns.
-    pub(super) fn restore_film(&mut self) -> bool {
+    /// it warms up again before the next take. Only once its output can be
+    /// used (see [`RecordingWindow::reopen_film`]): a player opened on a
+    /// missing output fails.
+    pub(super) fn restore_film(&mut self) -> Result<(), String> {
         let opened = self.media.film_open(&self.project.film_path());
-        if let Err(err) = &opened {
-            self.message = Some(format!("Could not reopen the film: {err}"));
+        if opened.is_ok() {
+            self.film_on = self.output_identity();
+            self.film = FilmState::Open;
         }
         self.media.film_set_gain_db(self.volumes.film);
         self.media.film_set_muted(false);
         self.recorder.rewarm();
         self.park();
-        opened.is_ok()
+        opened
     }
 
     /// Stores a consistent measurement's offset with the devices it was

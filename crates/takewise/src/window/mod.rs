@@ -644,6 +644,19 @@ pub struct RecordingWindow {
     failing: output::Failures,
     /// When a failed film may be reopened next.
     film_reopen_at: f64,
+    /// Whether the project's film is open, or waits to be reopened, or
+    /// failed for good.
+    film: recover::FilmState,
+    /// The output device the film was opened on: a failure once it is
+    /// gone, or back as another device, is put down to that.
+    film_on: latency::OutputIdentity,
+    /// When the film was reopened, until it is ready.
+    film_loading_since: Option<f64>,
+    /// The device generation at which the film could not be reopened:
+    /// tried again only once the devices change.
+    film_given_up: Option<u64>,
+    /// What a failed reopen said, taken back once one works.
+    film_warning: Option<String>,
     /// The last take result shown, which no notice about the output may
     /// replace.
     take_result: Option<String>,
@@ -745,6 +758,11 @@ impl RecordingWindow {
             take_warning: None,
             failing: output::Failures::default(),
             film_reopen_at: 0.0,
+            film: recover::FilmState::Open,
+            film_on: latency::OutputIdentity::Unknown,
+            film_loading_since: None,
+            film_given_up: None,
+            film_warning: None,
             take_result: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
@@ -1256,13 +1274,10 @@ impl RecordingWindow {
             self.say_route(problem.for_recording());
             return;
         }
-        // A film that failed is reopened between takes; a take on it
-        // would only stop at once.
-        if self.media.film_failure().is_some() || !self.media.film_ready() {
-            self.message = Some(
-                "The film is being opened again after its output went away; press Space again in a moment."
-                    .to_owned(),
-            );
+        // A take on a film that failed, or has not loaded, would only stop
+        // at once.
+        if let Some(problem) = self.film_problem(true) {
+            self.message = Some(problem);
             return;
         }
         self.message = None;
@@ -1537,6 +1552,11 @@ impl RecordingWindow {
         };
         if let Err(problem) = self.route_for_start() {
             self.say_route(problem.for_playback());
+            cx.notify();
+            return;
+        }
+        if let Some(problem) = self.film_problem(false) {
+            self.message = Some(problem);
             cx.notify();
             return;
         }
