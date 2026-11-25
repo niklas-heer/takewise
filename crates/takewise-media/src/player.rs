@@ -8,10 +8,12 @@ use std::path::Path;
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_av_foundation::{AVPlayer, AVPlayerItem, AVPlayerItemStatus, AVPlayerItemVideoOutput};
+use objc2_av_foundation::{
+    AVPlayer, AVPlayerItem, AVPlayerItemStatus, AVPlayerItemVideoOutput, AVPlayerStatus,
+};
 use objc2_core_foundation::{CFRetained, CFType};
 use objc2_core_media::{CMClock, CMSyncConvertTime, CMSyncGetRelativeRate, CMTime, kCMTimeZero};
-use objc2_foundation::{NSDate, NSRunLoop, NSString, NSURL};
+use objc2_foundation::{NSDate, NSError, NSRunLoop, NSString, NSURL};
 use takewise_core::Timebase;
 
 use crate::Frame;
@@ -84,6 +86,51 @@ impl Av {
     fn is_ready(&self) -> bool {
         // SAFETY: a KVO property read on the main thread.
         unsafe { self.item.status() == AVPlayerItemStatus::ReadyToPlay }
+    }
+
+    /// Why the item or the player can no longer play, once either failed
+    /// (AVFoundation then needs a new item, or a new player).
+    fn failure(&self) -> Option<String> {
+        // SAFETY: KVO property reads on the main thread.
+        let (item, player) = unsafe {
+            (
+                (self.item.status() == AVPlayerItemStatus::Failed).then(|| self.item.error()),
+                (self.player.status() == AVPlayerStatus::Failed).then(|| self.player.error()),
+            )
+        };
+        let describe = |error: Option<Retained<NSError>>| {
+            error.map_or_else(
+                || "no reason given".to_owned(),
+                |error| error.localizedDescription().to_string(),
+            )
+        };
+        item.map(describe).or_else(|| player.map(describe))
+    }
+
+    /// The item's and the player's status and error, for diagnostics.
+    fn state(&self) -> String {
+        // SAFETY: KVO property reads on the main thread.
+        let (item, item_error, player, player_error) = unsafe {
+            (
+                self.item.status().0,
+                self.item.error(),
+                self.player.status().0,
+                self.player.error(),
+            )
+        };
+        let error = |error: Option<Retained<NSError>>| {
+            error.map_or_else(
+                || "none".to_owned(),
+                |error| format!("{} ({})", error.localizedDescription(), error.code()),
+            )
+        };
+        format!(
+            "item status {item} error {}, player status {player} error {}, rate {}",
+            error(item_error),
+            error(player_error),
+            // SAFETY: a main-thread AVPlayer read.
+            unsafe { self.player.rate() }
+        )
     }
 
     /// Plays from `media_s` starting exactly at host time `host_time_s`.
@@ -210,6 +257,17 @@ impl FilmPlayer {
         self.av.is_ready()
     }
 
+    /// Why it can no longer play, once its item or player failed (a new
+    /// one must be opened then).
+    pub fn failure(&self) -> Option<String> {
+        self.av.failure()
+    }
+
+    /// Its item's and player's status and error, for diagnostics.
+    pub fn state(&self) -> String {
+        self.av.state()
+    }
+
     /// Plays from film time `film_s` starting exactly at host time
     /// `host_time_s` (now or later). Until then the film holds its frame.
     /// Fails with [`Error::NotReady`] before the film has loaded.
@@ -309,6 +367,17 @@ impl TakePlayer {
 
     pub fn is_ready(&self) -> bool {
         self.av.is_ready()
+    }
+
+    /// Why it can no longer play, once its item or player failed (a new
+    /// one must be opened then).
+    pub fn failure(&self) -> Option<String> {
+        self.av.failure()
+    }
+
+    /// Its item's and player's status and error, for diagnostics.
+    pub fn state(&self) -> String {
+        self.av.state()
     }
 
     /// Plays take time `take_s` at host time `host_time_s`. A negative

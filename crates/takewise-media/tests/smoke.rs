@@ -9,6 +9,9 @@
 //! through `TAKEWISE_SMOKE_OUTPUT`, else an output that is not the system's
 //! default (it skips, saying so, when there is none), as the window plays
 //! takes through the project's output.
+//! `players_after_output_loss` plays `TAKEWISE_SMOKE_FILM` and a silent
+//! take through a private aggregate device, destroys it and creates it
+//! again under the same UID, and logs what becomes of the players.
 //! `shows_about_panel` brings up the About panel for a moment; with
 //! `TAKEWISE_SMOKE_ABOUT_PNG` set it captures the panel there (this needs
 //! screen recording access for the app that runs the test). Capture needs
@@ -30,12 +33,13 @@ use takewise_media::{
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 8] = [
+const TESTS: [Test; 9] = [
     ("lists_input_devices", lists_input_devices),
     ("plays_film_frames", plays_film_frames),
     ("routes_take_to_output", routes_take_to_output),
     ("shows_about_panel", shows_about_panel),
     ("watches_device_changes", watches_device_changes),
+    ("players_after_output_loss", players_after_output_loss),
     ("captures_one_channel", captures_one_channel),
     ("meters_every_channel", meters_every_channel),
     ("switches_nominal_rate", switches_nominal_rate),
@@ -265,6 +269,166 @@ fn watches_device_changes() -> Outcome {
         takewise_media::device_generation()
     );
     Ok(())
+}
+
+/// What becomes of a playing film and take whose output goes away and
+/// comes back under the same UID, as headphones switched off and on: a
+/// private aggregate device over the built-in output is destroyed and
+/// created again. Logs the players' status and error at each step;
+/// plays `TAKEWISE_SMOKE_FILM` at -60 dB.
+// One scripted scenario, logged step by step: kept in one piece to read.
+#[allow(clippy::too_many_lines)]
+fn players_after_output_loss() -> Outcome {
+    use takewise_media::aggregate::{create_aggregate, destroy_aggregate};
+    const UID: &str = "com.niklasheer.takewise.smoke.reconnect";
+    let film_path = film_path()?;
+    let builtin = output_devices()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|o| o.transport == Transport::BuiltIn)
+        .ok_or("no built-in output")?;
+    let sub = takewise_media::output_uid(&builtin.name).map_err(|e| e.to_string())?;
+    let id = create_aggregate(UID, "Takewise smoke output", &sub).map_err(|e| e.to_string())?;
+    pump_run_loop(0.5);
+    println!(
+        "    aggregate {id} over {:?}: {:?}",
+        builtin.name,
+        takewise_media::output_object(UID)
+    );
+    let wav = std::env::temp_dir().join(format!("takewise-loss-{}.wav", std::process::id()));
+    takewise_core::write_take_wav(&wav, &vec![0; 48_000 * 20], 48_000)
+        .map_err(|e| e.to_string())?;
+    let outcome = (|| {
+        let film = FilmPlayer::open(&film_path).map_err(|e| e.to_string())?;
+        let take = TakePlayer::open(&wav).map_err(|e| e.to_string())?;
+        film.set_output_uid(Some(UID));
+        take.set_output_uid(Some(UID));
+        let loading = Instant::now();
+        while !(film.is_ready() && take.is_ready()) {
+            ensure(loading.elapsed() < Duration::from_secs(10), || {
+                "not ready after 10 s".to_owned()
+            })?;
+            pump_run_loop(0.01);
+        }
+        film.set_gain_db(-60.0);
+        take.set_gain_db(-60.0);
+        let show = |when: &str, film: &FilmPlayer, take: &TakePlayer| {
+            println!(
+                "    {when}:\n      film ready {} failure {:?} at {:.2} s; {}\n      take ready {} failure {:?} at {:.2} s; {}",
+                film.is_ready(),
+                film.failure(),
+                film.current_film_s(),
+                film.state(),
+                take.is_ready(),
+                take.failure(),
+                take.current_s(),
+                take.state()
+            );
+        };
+        let start = host_time_now_s() + 0.2;
+        film.play_at(0.0, start).map_err(|e| e.to_string())?;
+        take.play_at(0.0, start).map_err(|e| e.to_string())?;
+        pump_run_loop(1.0);
+        show("playing", &film, &take);
+
+        destroy_aggregate(id).map_err(|e| e.to_string())?;
+        pump_run_loop(2.0);
+        println!(
+            "    device destroyed: {:?}",
+            takewise_media::output_object(UID)
+        );
+        show("after the loss", &film, &take);
+
+        // A new player while the device is gone, set to its UID.
+        let early = FilmPlayer::open(&film_path).map_err(|e| e.to_string())?;
+        early.set_output_uid(Some(UID));
+        pump_run_loop(1.0);
+        println!(
+            "    a new film player while it is gone: ready {} failure {:?}; {}",
+            early.is_ready(),
+            early.failure(),
+            early.state()
+        );
+        early.set_gain_db(-60.0);
+        let start = host_time_now_s() + 0.2;
+        let played = early
+            .play_at(0.0, start)
+            .map(drop)
+            .map_err(|e| e.to_string());
+        pump_run_loop(1.0);
+        println!(
+            "    played while gone: {played:?}; ready {} failure {:?} at {:.2} s; {}",
+            early.is_ready(),
+            early.failure(),
+            early.current_film_s(),
+            early.state()
+        );
+        early.pause();
+
+        let id2 =
+            create_aggregate(UID, "Takewise smoke output", &sub).map_err(|e| e.to_string())?;
+        pump_run_loop(1.0);
+        println!(
+            "    created again as {id2}: {:?}",
+            takewise_media::output_object(UID)
+        );
+        show("back, output not set again", &film, &take);
+        film.pause();
+        take.stop();
+        let replay = |film: &FilmPlayer, take: &TakePlayer| {
+            let start = host_time_now_s() + 0.2;
+            let f = film
+                .play_at(1.0, start)
+                .map(drop)
+                .map_err(|e| e.to_string());
+            let t = take.play_at(1.0, start).map_err(|e| e.to_string());
+            pump_run_loop(1.0);
+            (f, t)
+        };
+        let (f, t) = replay(&film, &take);
+        println!("    play again: film {f:?}, take {t:?}");
+        show("played again, output not set again", &film, &take);
+
+        film.pause();
+        take.stop();
+        film.set_output_uid(Some(UID));
+        take.set_output_uid(Some(UID));
+        pump_run_loop(0.5);
+        let (f, t) = replay(&film, &take);
+        println!("    play again: film {f:?}, take {t:?}");
+        show("played again, output set again", &film, &take);
+        film.pause();
+        take.stop();
+
+        let fresh = FilmPlayer::open(&film_path).map_err(|e| e.to_string())?;
+        fresh.set_output_uid(Some(UID));
+        let loading = Instant::now();
+        while !fresh.is_ready() && loading.elapsed() < Duration::from_secs(10) {
+            pump_run_loop(0.01);
+        }
+        println!(
+            "    a new film player: ready {} failure {:?}; {}",
+            fresh.is_ready(),
+            fresh.failure(),
+            fresh.state()
+        );
+        let start = host_time_now_s() + 0.2;
+        fresh.set_gain_db(-60.0);
+        fresh.play_at(0.0, start).map_err(|e| e.to_string())?;
+        pump_run_loop(1.0);
+        let at = fresh.current_film_s();
+        println!(
+            "    the new film player plays: at {at:.2} s; {}",
+            fresh.state()
+        );
+        fresh.pause();
+        destroy_aggregate(id2).map_err(|e| e.to_string())?;
+        ensure(fresh.failure().is_none() && at > 0.5, || {
+            "a new film player did not play on the device that came back".to_owned()
+        })
+    })();
+    let _ = std::fs::remove_file(&wav);
+    outcome
 }
 
 /// The standard About panel opens with Takewise's credits.

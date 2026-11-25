@@ -25,7 +25,7 @@ objc2-core-audio = { version = "0.3.2", default-features = false, features = ["s
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime", "CMSync", "CMBase"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSDictionary", "NSValue", "NSDate", "NSRunLoop", "NSObject", "NSAttributedString", "NSRange"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSURL", "NSDictionary", "NSValue", "NSDate", "NSRunLoop", "NSObject", "NSAttributedString", "NSRange", "NSArray", "NSError"] }
 
 [workspace.lints.rust]
 # Denied everywhere but takewise-media, the macOS bridge crate
