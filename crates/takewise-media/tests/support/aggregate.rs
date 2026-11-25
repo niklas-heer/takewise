@@ -15,7 +15,7 @@ use objc2_core_audio::{
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
-use crate::error::{Error, Result};
+type Result<T> = std::result::Result<T, String>;
 
 fn key(key: &std::ffi::CStr) -> Retained<NSString> {
     NSString::from_str(&key.to_string_lossy())
@@ -61,9 +61,7 @@ pub fn create_aggregate(uid: &str, name: &str, sub_uid: &str) -> Result<AudioObj
     if status == 0 && id != 0 {
         Ok(id)
     } else {
-        Err(Error::Audio(format!(
-            "could not create the aggregate device ({status})"
-        )))
+        Err(format!("could not create the aggregate device ({status})"))
     }
 }
 
@@ -74,8 +72,6 @@ pub fn destroy_aggregate(id: AudioObjectID) -> Result<()> {
     if status == 0 {
         Ok(())
     } else {
-        Err(Error::Audio(format!(
-            "could not destroy the aggregate device ({status})"
-        )))
+        Err(format!("could not destroy the aggregate device ({status})"))
     }
 }

@@ -107,32 +107,6 @@ impl Av {
         item.map(describe).or_else(|| player.map(describe))
     }
 
-    /// The item's and the player's status and error, for diagnostics.
-    fn state(&self) -> String {
-        // SAFETY: KVO property reads on the main thread.
-        let (item, item_error, player, player_error) = unsafe {
-            (
-                self.item.status().0,
-                self.item.error(),
-                self.player.status().0,
-                self.player.error(),
-            )
-        };
-        let error = |error: Option<Retained<NSError>>| {
-            error.map_or_else(
-                || "none".to_owned(),
-                |error| format!("{} ({})", error.localizedDescription(), error.code()),
-            )
-        };
-        format!(
-            "item status {item} error {}, player status {player} error {}, rate {}",
-            error(item_error),
-            error(player_error),
-            // SAFETY: a main-thread AVPlayer read.
-            unsafe { self.player.rate() }
-        )
-    }
-
     /// Plays from `media_s` starting exactly at host time `host_time_s`.
     fn play_at(&self, media_s: f64, host_time_s: f64) -> Result<()> {
         if !self.is_ready() {
@@ -263,11 +237,6 @@ impl FilmPlayer {
         self.av.failure()
     }
 
-    /// Its item's and player's status and error, for diagnostics.
-    pub fn state(&self) -> String {
-        self.av.state()
-    }
-
     /// Plays from film time `film_s` starting exactly at host time
     /// `host_time_s` (now or later). Until then the film holds its frame.
     /// Fails with [`Error::NotReady`] before the film has loaded.
@@ -373,11 +342,6 @@ impl TakePlayer {
     /// one must be opened then).
     pub fn failure(&self) -> Option<String> {
         self.av.failure()
-    }
-
-    /// Its item's and player's status and error, for diagnostics.
-    pub fn state(&self) -> String {
-        self.av.state()
     }
 
     /// Plays take time `take_s` at host time `host_time_s`. A negative

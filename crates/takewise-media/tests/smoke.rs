@@ -30,6 +30,12 @@ use takewise_media::{
     set_nominal_sample_rate, show_about_panel, watching_devices,
 };
 
+// A private output device to switch off and on: CoreAudio calls, in the
+// one crate allowed `unsafe`.
+#[allow(unsafe_code)]
+#[path = "support/aggregate.rs"]
+mod aggregate;
+
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
 
@@ -274,12 +280,14 @@ fn watches_device_changes() -> Outcome {
 /// What becomes of a playing film and take whose output goes away and
 /// comes back under the same UID, as headphones switched off and on: a
 /// private aggregate device over the built-in output is destroyed and
-/// created again. Logs the players' status and error at each step;
+/// created again. Asserts that both players fail for good when it goes,
+/// that a player opened while it is gone fails too, and that one opened
+/// once it is back plays; logs each step;
 /// plays `TAKEWISE_SMOKE_FILM` at -60 dB.
 // One scripted scenario, logged step by step: kept in one piece to read.
 #[allow(clippy::too_many_lines)]
 fn players_after_output_loss() -> Outcome {
-    use takewise_media::aggregate::{create_aggregate, destroy_aggregate};
+    use aggregate::{create_aggregate, destroy_aggregate};
     const UID: &str = "com.niklasheer.takewise.smoke.reconnect";
     let film_path = film_path()?;
     let builtin = output_devices()
@@ -288,7 +296,7 @@ fn players_after_output_loss() -> Outcome {
         .find(|o| o.transport == Transport::BuiltIn)
         .ok_or("no built-in output")?;
     let sub = takewise_media::output_uid(&builtin.name).map_err(|e| e.to_string())?;
-    let id = create_aggregate(UID, "Takewise smoke output", &sub).map_err(|e| e.to_string())?;
+    let id = create_aggregate(UID, "Takewise smoke output", &sub)?;
     pump_run_loop(0.5);
     println!(
         "    aggregate {id} over {:?}: {:?}",
@@ -314,15 +322,13 @@ fn players_after_output_loss() -> Outcome {
         take.set_gain_db(-60.0);
         let show = |when: &str, film: &FilmPlayer, take: &TakePlayer| {
             println!(
-                "    {when}:\n      film ready {} failure {:?} at {:.2} s; {}\n      take ready {} failure {:?} at {:.2} s; {}",
+                "    {when}:\n      film ready {} failure {:?} at {:.2} s\n      take ready {} failure {:?} at {:.2} s",
                 film.is_ready(),
                 film.failure(),
                 film.current_film_s(),
-                film.state(),
                 take.is_ready(),
                 take.failure(),
-                take.current_s(),
-                take.state()
+                take.current_s()
             );
         };
         let start = host_time_now_s() + 0.2;
@@ -331,24 +337,29 @@ fn players_after_output_loss() -> Outcome {
         pump_run_loop(1.0);
         show("playing", &film, &take);
 
-        destroy_aggregate(id).map_err(|e| e.to_string())?;
+        destroy_aggregate(id)?;
         pump_run_loop(2.0);
         println!(
             "    device destroyed: {:?}",
             takewise_media::output_object(UID)
         );
         show("after the loss", &film, &take);
+        ensure(film.failure().is_some() && take.failure().is_some(), || {
+            "the players did not fail when their output went away".to_owned()
+        })?;
 
         // A new player while the device is gone, set to its UID.
         let early = FilmPlayer::open(&film_path).map_err(|e| e.to_string())?;
         early.set_output_uid(Some(UID));
         pump_run_loop(1.0);
         println!(
-            "    a new film player while it is gone: ready {} failure {:?}; {}",
+            "    a new film player while it is gone: ready {} failure {:?}",
             early.is_ready(),
-            early.failure(),
-            early.state()
+            early.failure()
         );
+        ensure(!early.is_ready() && early.failure().is_some(), || {
+            "a film player opened while its output was gone did not fail".to_owned()
+        })?;
         early.set_gain_db(-60.0);
         let start = host_time_now_s() + 0.2;
         let played = early
@@ -357,16 +368,14 @@ fn players_after_output_loss() -> Outcome {
             .map_err(|e| e.to_string());
         pump_run_loop(1.0);
         println!(
-            "    played while gone: {played:?}; ready {} failure {:?} at {:.2} s; {}",
+            "    played while gone: {played:?}; ready {} failure {:?} at {:.2} s",
             early.is_ready(),
             early.failure(),
-            early.current_film_s(),
-            early.state()
+            early.current_film_s()
         );
         early.pause();
 
-        let id2 =
-            create_aggregate(UID, "Takewise smoke output", &sub).map_err(|e| e.to_string())?;
+        let id2 = create_aggregate(UID, "Takewise smoke output", &sub)?;
         pump_run_loop(1.0);
         println!(
             "    created again as {id2}: {:?}",
@@ -407,22 +416,18 @@ fn players_after_output_loss() -> Outcome {
             pump_run_loop(0.01);
         }
         println!(
-            "    a new film player: ready {} failure {:?}; {}",
+            "    a new film player: ready {} failure {:?}",
             fresh.is_ready(),
-            fresh.failure(),
-            fresh.state()
+            fresh.failure()
         );
         let start = host_time_now_s() + 0.2;
         fresh.set_gain_db(-60.0);
         fresh.play_at(0.0, start).map_err(|e| e.to_string())?;
         pump_run_loop(1.0);
         let at = fresh.current_film_s();
-        println!(
-            "    the new film player plays: at {at:.2} s; {}",
-            fresh.state()
-        );
+        println!("    the new film player plays: at {at:.2} s");
         fresh.pause();
-        destroy_aggregate(id2).map_err(|e| e.to_string())?;
+        destroy_aggregate(id2)?;
         ensure(fresh.failure().is_none() && at > 0.5, || {
             "a new film player did not play on the device that came back".to_owned()
         })

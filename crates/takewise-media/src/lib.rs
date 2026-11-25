@@ -18,8 +18,6 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod about;
-#[doc(hidden)]
-pub mod aggregate;
 mod capture;
 mod devices;
 mod error;
