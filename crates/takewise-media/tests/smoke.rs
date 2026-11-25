@@ -280,10 +280,10 @@ fn watches_device_changes() -> Outcome {
 /// What becomes of a playing film and take whose output goes away and
 /// comes back under the same UID, as headphones switched off and on: a
 /// private aggregate device over the built-in output is destroyed and
-/// created again. Asserts that both players fail for good when it goes,
-/// that a player opened while it is gone fails too, and that one opened
-/// once it is back plays; logs each step;
-/// plays `TAKEWISE_SMOKE_FILM` at -60 dB.
+/// created again. Asserts that both players fail when it goes and stay
+/// failed once it is back, also when set to it again; that a player
+/// opened while it is gone fails too; and that one opened once it is back
+/// plays. Logs each step; plays `TAKEWISE_SMOKE_FILM` at -60 dB.
 // One scripted scenario, logged step by step: kept in one piece to read.
 #[allow(clippy::too_many_lines)]
 fn players_after_output_loss() -> Outcome {
@@ -382,6 +382,12 @@ fn players_after_output_loss() -> Outcome {
             takewise_media::output_object(UID)
         );
         show("back, output not set again", &film, &take);
+        let still_failed = |film: &FilmPlayer, take: &TakePlayer, when: &str| {
+            ensure(film.failure().is_some() && take.failure().is_some(), || {
+                format!("the failed players recovered {when}")
+            })
+        };
+        still_failed(&film, &take, "once the device was back")?;
         film.pause();
         take.stop();
         let replay = |film: &FilmPlayer, take: &TakePlayer| {
@@ -406,6 +412,7 @@ fn players_after_output_loss() -> Outcome {
         let (f, t) = replay(&film, &take);
         println!("    play again: film {f:?}, take {t:?}");
         show("played again, output set again", &film, &take);
+        still_failed(&film, &take, "once the output was set again")?;
         film.pause();
         take.stop();
 
