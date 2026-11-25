@@ -1015,15 +1015,15 @@ impl Recorder {
         let mut placement = place(&take, &written, estimated, unplayed_s);
         // Only a film that ran can have played elsewhere.
         let lost = take.route_lost.take().filter(|_| take.clock.ran());
-        placement.notes = join(placement.notes, lost.clone());
+        // Why it stopped goes with its notes: said now, and again when it
+        // is saved or cut only later.
+        placement.notes = join(why, join(placement.notes, lost.clone()));
         if let Some(passage) = take.passage.take() {
-            placement.notes = join(why, placement.notes);
             let mut update = self.publish_passage(dir, passage, written, placement);
             update.route_note = lost;
             return update;
         }
         let mut update = self.commit_line(dir, take, written, placement);
-        update.message = join(why, update.message);
         update.route_note = lost;
         update
     }
@@ -1132,10 +1132,15 @@ impl Recorder {
     fn publish(&mut self, dir: &Path, mut stopped: Stopped) -> Update {
         let message = match publish(dir, &mut stopped.unsaved) {
             Ok(id) => {
+                let notes = stopped.notes.clone();
                 let mut uncut = stopped.published(id);
                 start_cut(dir, &mut uncut);
                 self.uncut.push(uncut);
-                "Saved the passage; cutting it into takes…".to_owned()
+                join(
+                    Some("Saved the passage; cutting it into takes…".to_owned()),
+                    notes,
+                )
+                .unwrap_or_default()
             }
             Err(err) => {
                 let message = format!(
@@ -1622,7 +1627,7 @@ impl Recorder {
                 None if now - playback.opened_host_s > TAKE_LOAD_TIMEOUT_S => {
                     self.stop_playback(media);
                     Update {
-                        message: Some("The take did not load.".to_owned()),
+                        message: Some(not_loaded(media)),
                         ..Update::default()
                     }
                 }
@@ -2004,10 +2009,11 @@ fn cut_outcome(
         Ok(_) => Err((uncut, None)),
         Err(err) => {
             let message = (!uncut.failed).then(|| {
-                format!(
+                let failed = format!(
                     "The passage is saved as {}, but could not be cut into takes ({err}); cutting is retried.",
                     passage_file(&uncut.id)
-                )
+                );
+                join(uncut.notes.clone(), Some(failed)).unwrap_or_default()
             });
             uncut.failed = true;
             Err((uncut, message))
@@ -2133,6 +2139,18 @@ fn clock(film_s: f64) -> String {
     let whole = film_s.abs().floor() as i64;
     let sign = if film_s < 0.0 { "-" } else { "" };
     format!("{sign}{}:{:02}", whole / 60, whole % 60)
+}
+
+/// Why a playback that waited too long did not start: the film, not the
+/// take, when the film is what it waited for.
+fn not_loaded(media: &dyn Media) -> String {
+    if media.film_ready() {
+        return "The take did not load.".to_owned();
+    }
+    let why = media
+        .film_failure()
+        .unwrap_or_else(|| "still loading".to_owned());
+    format!("The film is not ready ({why}); play it again in a moment.")
 }
 
 /// Both messages, or whichever there is.

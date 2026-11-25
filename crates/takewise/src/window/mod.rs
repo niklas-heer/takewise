@@ -642,21 +642,9 @@ pub struct RecordingWindow {
     take_warning: Option<String>,
     /// The failing streaks of device lookups, by kind.
     failing: output::Failures,
-    /// When a failed film may be reopened next.
-    film_reopen_at: f64,
-    /// Whether the project's film is open, or waits to be reopened, or
-    /// failed for good.
-    film: recover::FilmState,
-    /// The output device the film was opened on: a failure once it is
-    /// gone, or back as another device, is put down to that.
-    film_on: latency::OutputIdentity,
-    /// When the film was reopened, until it is ready.
-    film_loading_since: Option<f64>,
-    /// The device generation at which the film could not be reopened:
-    /// tried again only once the devices change.
-    film_given_up: Option<u64>,
-    /// What a failed reopen said, taken back once one works.
-    film_warning: Option<String>,
+    /// The project's film: open, or waiting to be opened again after its
+    /// player failed, and what that says.
+    film: recover::Recovery,
     /// The last take result shown, which no notice about the output may
     /// replace.
     take_result: Option<String>,
@@ -757,12 +745,7 @@ impl RecordingWindow {
             ticked_at: None,
             take_warning: None,
             failing: output::Failures::default(),
-            film_reopen_at: 0.0,
-            film: recover::FilmState::Open,
-            film_on: latency::OutputIdentity::Unknown,
-            film_loading_since: None,
-            film_given_up: None,
-            film_warning: None,
+            film: recover::Recovery::default(),
             take_result: None,
             calibrating: None,
             beep_film: crate::calibrate::make_beep_film,
@@ -771,6 +754,9 @@ impl RecordingWindow {
             rescue_root: None,
             close_refused: None,
         };
+        // A film that never loads counts as failed, as a reopened one does.
+        let now = view.media.host_now_s();
+        view.film.opened(now);
         // The levels in use, within their ranges, are what takes play at.
         view.volumes.write_into(&mut view.project.config);
         view.after_reload(None);
@@ -2112,6 +2098,8 @@ impl Render for RecordingWindow {
         let now = self.media.host_now_s();
         let scroll_rows = self.scroll_rows(film_s, now);
         let (note, next) = self.prompter_cues();
+        // The film's recovery has its own notice, beside any other.
+        let shown = recorder::join(self.message.clone(), self.film.note.clone());
         let prompter = prompter::Prompter {
             film_s,
             reading: self.prompter_line(),
@@ -2123,7 +2111,7 @@ impl Render for RecordingWindow {
             near_clip: self.peak_meter.near_clip(),
             recording,
             blocked: self.blocked(),
-            message: self.message.as_deref(),
+            message: shown.as_deref(),
             editor: self.editing.as_ref().map(|draft| &draft.input),
             scroll_rows,
         };

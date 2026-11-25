@@ -13,7 +13,6 @@ use takewise_core::{self as tw, CalibrationInfo, Route};
 use takewise_media::DeviceLookup;
 
 use super::output::{Lookup, Seen};
-use super::recover::FilmState;
 use super::setup::{Setup, calibration_needed, line};
 use super::{RecordingWindow, colors};
 use crate::calibrate::{self, Measurement, Run};
@@ -43,7 +42,7 @@ pub struct Calibrating {
 /// could not be read. A device that went away and came back keeps its UID
 /// but has another object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum OutputIdentity {
+enum OutputIdentity {
     Device(String, u32),
     System(u32),
     Unknown,
@@ -99,8 +98,8 @@ impl RecordingWindow {
             .and_then(|()| Run::new(&*self.media, &device, &output));
         match started {
             Ok(run) => {
-                self.film = FilmState::Reopen;
-                self.film_on = self.output_identity();
+                // The beep film is in its place.
+                self.film.set_aside();
                 self.calibrating = Some(Calibrating {
                     run,
                     _work: work,
@@ -166,7 +165,7 @@ impl RecordingWindow {
 
     /// The output device the film plays through now: the one the players
     /// are set to, or the system's default output.
-    pub(super) fn output_identity(&self) -> OutputIdentity {
+    fn output_identity(&self) -> OutputIdentity {
         match (&self.film_output, &self.applied_device) {
             (Some(_), Some((uid, Some(object)))) => OutputIdentity::Device(uid.clone(), *object),
             (Some(_), _) => OutputIdentity::Unknown,
@@ -239,10 +238,6 @@ impl RecordingWindow {
     /// missing output fails.
     pub(super) fn restore_film(&mut self) -> Result<(), String> {
         let opened = self.media.film_open(&self.project.film_path());
-        if opened.is_ok() {
-            self.film_on = self.output_identity();
-            self.film = FilmState::Open;
-        }
         self.media.film_set_gain_db(self.volumes.film);
         self.media.film_set_muted(false);
         self.recorder.rewarm();

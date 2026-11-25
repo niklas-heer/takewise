@@ -920,6 +920,24 @@ fn a_capture_failure_stops_a_passage_and_keeps_what_was_read(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn a_film_failure_stops_a_passage_and_says_so_at_once(cx: &mut TestAppContext) {
+    let f = open_passages(cx);
+    read_from_a(cx, &f, "shift-space", 7.5);
+    f.media.0.borrow_mut().film_failed = Some("failed".to_owned());
+    at_film(cx, &f, 7.5);
+    assert!(!recording(cx, &f));
+    // Said while it is cut, not only once it is.
+    let shown = message(cx, &f.view);
+    assert!(shown.contains("cutting it into takes"), "{shown}");
+    assert!(
+        shown.contains("The take stopped early: the film stopped (failed)."),
+        "{shown}"
+    );
+    cut(cx, &f);
+    assert_eq!(recorded_takes(&f.dir), takes_of(&["a", "b"]));
+}
+
+#[gpui_kit::test]
 fn m_is_off_during_a_passage_take(cx: &mut TestAppContext) {
     let f = open_passages(cx);
     read_from_a(cx, &f, "shift-space", 0.7);

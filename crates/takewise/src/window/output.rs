@@ -392,6 +392,32 @@ impl RecordingWindow {
         }
     }
 
+    /// Whether a player opened now would play, by the route as this module
+    /// keeps it (it alone sets the route, and says so): the configured
+    /// device set, confirmed and not failing; or, with none configured,
+    /// the players on the system output and one there (one property read).
+    /// No listing, and nothing set; not before the latest device change
+    /// has been acted on.
+    pub(super) fn route_usable(&self) -> bool {
+        if self.route_due
+            || self.failing.applied.since.is_some()
+            || self.devices_watched != self.media.device_generation()
+        {
+            return false;
+        }
+        match &self.project.config.output.device {
+            Some(name) => {
+                self.film_output.as_ref() == Some(name)
+                    && self.output_missing.is_none()
+                    && matches!(self.applied_device, Some((_, Some(_))))
+            }
+            None => {
+                self.film_output.is_none()
+                    && matches!(self.media.default_output_object(), DeviceLookup::Present(_))
+            }
+        }
+    }
+
     /// Whether the route waits on its device's object (reads failing
     /// within the grace, or not read yet since it was set): read again
     /// every tick, one property read, until it resolves, as before a start.
