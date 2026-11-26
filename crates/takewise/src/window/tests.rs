@@ -6561,6 +6561,78 @@ fn output_warning_tells_speakers_from_the_headphone_jack(cx: &mut TestAppContext
     assert_eq!(warning_on(cx, &f, "Test Phones"), None);
 }
 
+/// The setup check's devices step names the project's output next to the
+/// one that really plays, and says recording is off while they differ
+/// (issue #2: Bluetooth headphones as the Mac's default output, the
+/// project's interface missing).
+#[gpui_kit::test]
+fn the_devices_step_shows_the_output_that_really_plays(cx: &mut TestAppContext) {
+    let lines =
+        |cx: &mut TestAppContext, f: &Fixture| f.view.read_with(cx, |view, _| view.output_lines());
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    frame(cx, f.window);
+    assert_eq!(
+        lines(cx, &f),
+        vec![
+            ("Output: System output".to_owned(), super::colors::TEXT),
+            (
+                "Plays through: MacBook Speakers (built-in)".to_owned(),
+                super::colors::TEXT
+            ),
+        ]
+    );
+
+    let f = on_test_phones(cx);
+    assert_eq!(
+        lines(cx, &f)[1],
+        (
+            "Plays through: Test Phones (usb)".to_owned(),
+            super::colors::GOOD
+        )
+    );
+    {
+        let mut fake = f.media.0.borrow_mut();
+        fake.outputs.push(output(
+            PHONES,
+            Transport::Bluetooth,
+            OutputSource::Headphones,
+        ));
+        fake.default_output = PHONES.to_owned();
+    }
+    unplug(&f, "Test Phones");
+    f.media.set_now(300.0);
+    frame(cx, f.window);
+    let shown = lines(cx, &f);
+    assert_eq!(shown[0].0, "Output: Test Phones");
+    assert_eq!(
+        shown[1],
+        ("Plays through: nothing".to_owned(), super::colors::WARN)
+    );
+    assert!(
+        shown[2].0.starts_with("Test Phones is not connected")
+            && shown[2]
+                .0
+                .contains("Recording stays off until the film plays through Test Phones"),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|(text, _)| text.contains(PHONES)),
+        "never the system output in its place: {shown:?}"
+    );
+
+    plug(&f, "Test Phones");
+    f.media.set_now(303.0);
+    frame(cx, f.window);
+    frame(cx, f.window);
+    assert_eq!(
+        lines(cx, &f)[1],
+        (
+            "Plays through: Test Phones (usb)".to_owned(),
+            super::colors::GOOD
+        )
+    );
+}
+
 #[gpui_kit::test]
 fn setup_not_offered_when_current(cx: &mut TestAppContext) {
     let f = open_with(cx, &[(DEVICE, 48_000)], |dir| {

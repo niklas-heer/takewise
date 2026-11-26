@@ -356,6 +356,48 @@ impl RecordingWindow {
             .is_some_and(|output| output.transport == Transport::Bluetooth)
     }
 
+    /// The devices step's output lines, with a color each: the output the
+    /// project names next to the one the film and takes really play
+    /// through (what the players are set to, while that device is there).
+    /// When the project's output is not the one playing, they say so and
+    /// that recording stays off until it is, or until the narrator picks
+    /// System output on purpose.
+    pub(super) fn output_lines(&self) -> Vec<(String, u32)> {
+        let playing = self.current_route().output;
+        let outputs = self.media.outputs();
+        let describe = |name: &str| {
+            outputs.iter().find(|o| o.name == name).map_or_else(
+                || name.to_owned(),
+                |o| format!("{name} ({})", o.transport.as_str()),
+            )
+        };
+        let Some(named) = &self.project.config.output.device else {
+            let plays = playing
+                .as_deref()
+                .map_or_else(|| "nothing: the Mac has no output".to_owned(), describe);
+            return vec![
+                ("Output: System output".to_owned(), colors::TEXT),
+                (format!("Plays through: {plays}"), colors::TEXT),
+            ];
+        };
+        let mut lines = vec![(format!("Output: {named}"), colors::TEXT)];
+        if playing.as_deref() == Some(named.as_str()) {
+            lines.push((format!("Plays through: {}", describe(named)), colors::GOOD));
+            return lines;
+        }
+        lines.push(("Plays through: nothing".to_owned(), colors::WARN));
+        let why = self
+            .output_note()
+            .unwrap_or_else(|| format!("{named} is not in use yet."));
+        lines.push((
+            format!(
+                "{why} Recording stays off until the film plays through {named}; to record with the system output instead, pick System output in the audio panel (A)."
+            ),
+            colors::WARN,
+        ));
+        lines
+    }
+
     /// The open step's content.
     fn setup_body(&self, setup: &Setup) -> Vec<AnyElement> {
         let mut body = Vec::new();
@@ -370,13 +412,11 @@ impl RecordingWindow {
                     ),
                     colors::TEXT,
                 ));
-                body.push(line(
-                    format!(
-                        "Output: {}",
-                        route.output.as_deref().unwrap_or("system output")
-                    ),
-                    colors::TEXT,
-                ));
+                body.extend(
+                    self.output_lines()
+                        .into_iter()
+                        .map(|(text, color)| line(text, color)),
+                );
                 if let Some(problem) = &self.input_problem {
                     body.push(line(problem.clone(), colors::WARN));
                 }
