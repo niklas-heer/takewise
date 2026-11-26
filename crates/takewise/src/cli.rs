@@ -1720,6 +1720,21 @@ fn playback_report(
     report
 }
 
+/// `word` as one shell word, quoted when it holds anything but plain path
+/// characters, so a hint with a project folder such as `My Promo.takewise`
+/// can be pasted as it is.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-".contains(c));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// Whether the configured model is there, and how to install it if not.
 fn model_check(model: &str) -> Check {
     use tw::models::ModelState;
@@ -1874,7 +1889,10 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         }),
         Some(Ok(project)) => {
             let film_path = project.film_path();
-            let dir = dir.unwrap_or(Path::new("<dir>")).display();
+            let dir = dir.map_or_else(
+                || "<dir>".to_owned(),
+                |dir| shell_word(&dir.display().to_string()),
+            );
             let (ok, detail) = match film::matches(&film_path, &project.config.film_info) {
                 Ok(true) => (true, film_path.display().to_string()),
                 Ok(false) => (
@@ -1940,6 +1958,17 @@ fn doctor(dir: Option<&Path>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hints_quote_a_folder_with_spaces() {
+        assert_eq!(shell_word("/tmp/promo.takewise"), "/tmp/promo.takewise");
+        assert_eq!(
+            shell_word("/Users/n/My Promo.takewise"),
+            "'/Users/n/My Promo.takewise'"
+        );
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        assert_eq!(shell_word(""), "''");
+    }
 
     #[test]
     fn window_result_is_read() {
