@@ -1679,34 +1679,31 @@ fn playback_report(
         }
         None => default.map(|d| (Some(d), d.name.as_str(), "system")),
     };
-    match playing {
-        Some((device, name, from)) => {
-            let mut json = device.map_or_else(|| json!({ "name": name }), device_json);
-            json["from"] = json!(from);
-            report.json = Some(json);
-            if let Some(device) = device
-                && device.transport == Transport::Bluetooth
-            {
-                report.warnings.push(format!(
+    if let Some((device, name, from)) = playing {
+        let mut json = device.map_or_else(|| json!({ "name": name }), device_json);
+        json["from"] = json!(from);
+        report.json = Some(json);
+        if let Some(device) = device
+            && device.transport == Transport::Bluetooth
+        {
+            report.warnings.push(format!(
                     "output {} is Bluetooth; its latency is long and varies, so record with wired or built-in headphones",
                     device.name
                 ));
-            }
-            let whose = if from == "project" {
-                "the project's output"
-            } else {
-                "the system output"
-            };
-            let shown = device.map_or_else(|| name.to_owned(), describe);
-            let _ = writeln!(report.text, "Playback: {shown}, {whose}");
         }
-        None => {
-            let _ = writeln!(
-                report.text,
-                "Playback: nothing, {} is not connected",
-                named.unwrap_or_default()
-            );
-        }
+        let whose = if from == "project" {
+            "the project's output"
+        } else {
+            "the system output"
+        };
+        let shown = device.map_or_else(|| name.to_owned(), describe);
+        let _ = writeln!(report.text, "Playback: {shown}, {whose}");
+    } else {
+        let why = named.map_or_else(
+            || "the Mac's output could not be read".to_owned(),
+            |name| format!("{name} is not connected"),
+        );
+        let _ = writeln!(report.text, "Playback: nothing, {why}");
     }
     if let Some(d) = default {
         let _ = writeln!(
