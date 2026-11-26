@@ -2107,6 +2107,96 @@ fn a_new_render_asks_for_the_window_to_be_opened_again(cx: &mut TestAppContext) 
     assert_eq!(replaced(cx), "");
 }
 
+#[gpui_kit::test]
+fn a_new_render_keeps_the_running_take_and_holds_the_next(cx: &mut TestAppContext) {
+    // `takewise film` lands mid-take with a longer cut: the take goes on
+    // and is kept, but no new take (Space, Shift+Space, R) starts on the
+    // old picture with the new timings until the film is opened again.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    press(cx, f.window, &["down", "down", "down"]);
+    begin(cx, &f, 100.0);
+    let recording =
+        |cx: &mut TestAppContext| f.view.read_with(cx, |view, _| view.recorder.is_recording());
+    assert!(recording(cx));
+    let render = f.dir.join("film-v2.mp4");
+    fs::write(&render, b"").expect("film");
+    let info = FilmInfo {
+        duration_s: 25.0,
+        size: 0,
+        modified: "2026-11-26T00:00:00Z".to_owned(),
+    };
+    tw::set_film(&f.dir, &render, &info, jiff::Timestamp::now()).expect("set film");
+    f.view.update(cx, |view, _| view.reload());
+    assert!(recording(cx), "the running take goes on");
+    f.media.set_now(100.5);
+    press(cx, f.window, &["space"]);
+    assert!(!recording(cx));
+    assert_eq!(recorded(&f.dir).len(), 1, "the take is kept");
+    assert!(f.dir.join("takes/d/001.wav").is_file());
+
+    let blocked = |cx: &mut TestAppContext| {
+        f.view
+            .read_with(cx, |view, _| view.blocked().map(str::to_owned))
+    };
+    for key in ["space", "shift-space", "r"] {
+        f.media.set_now(101.0);
+        press(cx, f.window, &[key]);
+        assert!(!recording(cx), "{key} starts no take");
+    }
+    assert!(
+        blocked(cx).is_some_and(|why| why.contains("another render of the film")),
+        "{:?}",
+        blocked(cx)
+    );
+    assert_eq!(recorded(&f.dir).len(), 1);
+
+    // Opened again, the window plays the new render and records.
+    let reopened = f.view.update(cx, |view, _| view.restore_film());
+    assert_eq!(reopened, Ok(()));
+    assert_eq!(blocked(cx), None);
+    begin(cx, &f, 102.0);
+    assert!(recording(cx));
+    f.media.set_now(102.5);
+    press(cx, f.window, &["space"]);
+    assert_eq!(recorded(&f.dir).len(), 2);
+}
+
+#[gpui_kit::test]
+fn a_render_written_over_the_film_before_opening_is_the_one_playing(cx: &mut TestAppContext) {
+    // The fixture's film on disk is not what `[film_info]` measured: it
+    // was written over before the window opened, so the player opened
+    // the new render. Accepting it with `takewise film <dir>` asks for no
+    // reopening; a render written over it after the window opened does.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let replaced = |cx: &mut TestAppContext| {
+        f.view
+            .read_with(cx, |view, _| view.film_replaced_note().is_some())
+    };
+    let accept = |cx: &mut TestAppContext| {
+        let film = film_of(&f);
+        let (size, modified) = crate::film::stamp_io(&film).expect("stamp");
+        let info = FilmInfo {
+            duration_s: 20.0,
+            size,
+            modified,
+        };
+        let stored = Project::open(&f.dir).expect("project").config.film;
+        tw::refresh_film(&f.dir, &stored, &info, jiff::Timestamp::now()).expect("refresh");
+        f.view.update(cx, |view, _| view.reload());
+    };
+    assert!(!replaced(cx));
+    accept(cx);
+    assert!(
+        !replaced(cx),
+        "the window already plays the render accepted"
+    );
+    assert!(f.view.read_with(cx, |view, _| view.blocked().is_none()));
+
+    fs::write(film_of(&f), b"a later render").expect("film");
+    accept(cx);
+    assert!(replaced(cx), "the window plays the render before");
+}
+
 /// The headphones go off and on again between two ticks: the devices
 /// changed, and a player on them failed, as macOS fails it.
 fn off_and_on(f: &Fixture, player: &str) {

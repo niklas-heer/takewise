@@ -667,10 +667,10 @@ pub struct RecordingWindow {
     /// its rescue copy and closes. Audio that came since is refused for
     /// once first, so its narrator hears of it.
     close_refused: Option<(usize, usize)>,
-    /// The film the player has open: its path and measurement. When the
-    /// project's differs (`takewise film` pointed it at another render),
-    /// the window says so until the film is opened again.
-    film_played: (PathBuf, tw::FilmInfo),
+    /// The film the player has open. When the project names another
+    /// (`takewise film` pointed it at another render), the window says so
+    /// and records no new take until the film is opened again.
+    film_played: recover::OpenFilm,
 }
 
 impl RecordingWindow {
@@ -700,10 +700,7 @@ impl RecordingWindow {
         let (levels, on_levels) = levels::Levels::new(volumes, window, cx);
         let mut subscriptions = vec![on_quit];
         subscriptions.extend(on_levels);
-        let film_played = (
-            loaded.project.film_path(),
-            loaded.project.config.film_info.clone(),
-        );
+        let film_played = recover::OpenFilm::opened(&loaded.project);
         let mut view = Self {
             dir,
             media,
@@ -1062,10 +1059,14 @@ impl RecordingWindow {
         }
     }
 
+    /// Why no take may start now: the script, the input, or a film that
+    /// is not the render the project now names. A take already running
+    /// goes on and is kept.
     fn blocked(&self) -> Option<&str> {
         self.script_problem
             .as_deref()
             .or(self.input_problem.as_deref())
+            .or_else(|| self.film_replaced_note())
     }
 
     /// Re-reads the project, keeping the current line (by id) and take.
@@ -2118,7 +2119,12 @@ impl Render for RecordingWindow {
         let (note, next) = self.prompter_cues();
         // The film's recovery has its own notice, beside any other.
         let film = recorder::join(self.film_status(), self.film_note(now));
-        let film = recorder::join(film, self.film_replaced_note());
+        // Said once: as why recording is off, or else beside the film's
+        // notices.
+        let replaced = self
+            .film_replaced_note()
+            .filter(|note| self.blocked() != Some(*note));
+        let film = recorder::join(film, replaced.map(str::to_owned));
         let shown = recorder::join(self.message.clone(), film);
         let prompter = prompter::Prompter {
             film_s,

@@ -244,7 +244,7 @@ impl RecordingWindow {
         let film = self.project.film_path();
         let opened = self.media.film_open(&film);
         if opened.is_ok() {
-            self.film_played = (film, self.project.config.film_info.clone());
+            self.film_played = super::recover::OpenFilm::opened(&self.project);
         }
         self.media.film_set_gain_db(self.volumes.film);
         self.media.film_set_muted(false);

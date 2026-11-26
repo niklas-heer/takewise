@@ -32,10 +32,53 @@
 //! is replaced, and both go once the film is ready again. A take player
 //! that failed needs nothing more: the next take opened gets a new one.
 
-use takewise_core as tw;
+use std::path::PathBuf;
+
+use takewise_core::{self as tw, Project};
 use takewise_media::DeviceLookup;
 
 use super::RecordingWindow;
+
+/// Why the window asks to be opened again after `takewise film`.
+const FILM_REPLACED: &str =
+    "The project now uses another render of the film; close and open this window again to play it.";
+
+/// The film the player has open, as it was when it was opened.
+#[derive(Debug, Clone)]
+pub(super) struct OpenFilm {
+    path: PathBuf,
+    /// The project's `[film_info]` then.
+    info: tw::FilmInfo,
+    /// The file's size and modification time then; none when they could
+    /// not be read.
+    stamp: Option<(u64, String)>,
+}
+
+impl OpenFilm {
+    /// The project's film, just opened.
+    pub(super) fn opened(project: &Project) -> Self {
+        let path = project.film_path();
+        let stamp = crate::film::stamp_io(&path).ok();
+        Self {
+            path,
+            info: project.config.film_info.clone(),
+            stamp,
+        }
+    }
+
+    /// Whether `project` still names this film: the same path, and either
+    /// the `[film_info]` it had when the film was opened or one measured
+    /// on the very file that was opened (a render written over the old
+    /// one before the window opened, accepted with `takewise film` since).
+    pub(super) fn is_named_by(&self, project: &Project) -> bool {
+        let info = &project.config.film_info;
+        self.path == project.film_path()
+            && (tw::film::same_film(&self.info, info)
+                || self.stamp.as_ref().is_some_and(|(size, modified)| {
+                    *size == info.size && *modified == info.modified
+                }))
+    }
+}
 
 /// The first pause before the film is opened again after a reopen that
 /// failed; it doubles with every further failure.
@@ -455,14 +498,11 @@ impl RecordingWindow {
     /// When the project now has another film than the one playing
     /// (`takewise film` pointed it at a new render, or measured a changed
     /// one again): the window keeps the film it opened until it is opened
-    /// again, so it asks to be reopened.
-    pub(super) fn film_replaced_note(&self) -> Option<String> {
-        let (path, info) = &self.film_played;
-        let same = *path == self.project.film_path()
-            && tw::film::same_film(info, &self.project.config.film_info);
-        (!same).then(|| {
-            "The project now uses another render of the film; close and open this window again to play it.".to_owned()
-        })
+    /// again, so it asks to be reopened, and no take starts meanwhile
+    /// (see [`RecordingWindow::blocked`]): it would be timed against the
+    /// new cut while the old picture plays.
+    pub(super) fn film_replaced_note(&self) -> Option<&'static str> {
+        (!self.film_played.is_named_by(&self.project)).then_some(FILM_REPLACED)
     }
 
     /// Why what was refused could not start on the film, while it is not
