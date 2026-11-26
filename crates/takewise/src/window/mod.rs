@@ -1264,6 +1264,7 @@ impl RecordingWindow {
     /// lines from it through the end of its passage.
     fn begin_take(&mut self, whole_passage: bool) {
         self.check_inputs();
+        self.notice_film_change();
         if self.blocked().is_some() {
             return;
         }

@@ -501,6 +501,21 @@ impl RecordingWindow {
     /// again, so it asks to be reopened, and no take starts meanwhile
     /// (see [`RecordingWindow::blocked`]): it would be timed against the
     /// new cut while the old picture plays.
+    /// Re-reads the project when the film it names on disk is not the one
+    /// this window last read, so a take never starts on a render that
+    /// `takewise film` replaced before the file watcher reported it.
+    pub(super) fn notice_film_change(&mut self) {
+        let Ok(on_disk) = Project::open(&self.dir) else {
+            return;
+        };
+        let config = &self.project.config;
+        if on_disk.config.film != config.film
+            || !tw::film::same_film(&on_disk.config.film_info, &config.film_info)
+        {
+            self.reload();
+        }
+    }
+
     pub(super) fn film_replaced_note(&self) -> Option<&'static str> {
         (!self.film_played.is_named_by(&self.project)).then_some(FILM_REPLACED)
     }

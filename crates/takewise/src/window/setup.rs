@@ -382,7 +382,23 @@ impl RecordingWindow {
         };
         let mut lines = vec![(format!("Output: {named}"), colors::TEXT)];
         if playing.as_deref() == Some(named.as_str()) {
-            lines.push((format!("Plays through: {}", describe(named)), colors::GOOD));
+            // Green only once CoreAudio confirms the very device the
+            // players were set to; until then, as a take start would, it
+            // waits for that.
+            let confirmed = matches!(
+                &self.applied_device,
+                Some((uid, Some(object)))
+                    if self.media.output_object(uid)
+                        == takewise_media::DeviceLookup::Present(*object)
+            );
+            lines.push(if confirmed {
+                (format!("Plays through: {}", describe(named)), colors::GOOD)
+            } else {
+                (
+                    format!("Plays through: {} (checking the device)", describe(named)),
+                    colors::TEXT,
+                )
+            });
             return lines;
         }
         lines.push(("Plays through: nothing".to_owned(), colors::WARN));

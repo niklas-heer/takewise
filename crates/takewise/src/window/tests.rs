@@ -2162,6 +2162,31 @@ fn a_new_render_keeps_the_running_take_and_holds_the_next(cx: &mut TestAppContex
 }
 
 #[gpui_kit::test]
+fn a_new_render_the_watcher_has_not_reported_yet_holds_the_take(cx: &mut TestAppContext) {
+    // `takewise film` lands, and Space comes before the file watcher
+    // reports it (or with no watcher at all): the take start reads the
+    // project's film itself and starts nothing on the old picture.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let render = f.dir.join("film-v2.mp4");
+    fs::write(&render, b"").expect("film");
+    let info = FilmInfo {
+        duration_s: 25.0,
+        size: 0,
+        modified: "2026-11-26T00:00:00Z".to_owned(),
+    };
+    tw::set_film(&f.dir, &render, &info, jiff::Timestamp::now()).expect("set film");
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(recorded(&f.dir).len(), 0, "no take");
+    assert!(
+        f.view
+            .read_with(cx, |view, _| view.film_replaced_note().is_some()),
+        "the window now knows about the new render"
+    );
+}
+
+#[gpui_kit::test]
 fn a_render_written_over_the_film_before_opening_is_the_one_playing(cx: &mut TestAppContext) {
     // The fixture's film on disk is not what `[film_info]` measured: it
     // was written over before the window opened, so the player opened
@@ -6719,6 +6744,17 @@ fn the_devices_step_shows_the_output_that_really_plays(cx: &mut TestAppContext) 
         (
             "Plays through: Test Phones (usb)".to_owned(),
             super::colors::GOOD
+        )
+    );
+
+    // While CoreAudio cannot say whether that device is still there, it
+    // is not shown as confirmed.
+    f.media.0.borrow_mut().lookups_fail = true;
+    assert_eq!(
+        lines(cx, &f)[1],
+        (
+            "Plays through: Test Phones (usb) (checking the device)".to_owned(),
+            super::colors::TEXT
         )
     );
 }
