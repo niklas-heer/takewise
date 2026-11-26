@@ -1234,6 +1234,41 @@ fn doctor_reports_checks() {
     );
 }
 
+/// `doctor`'s film check names the project in the command that fixes it.
+#[test]
+fn doctor_points_a_changed_or_missing_film_at_takewise_film() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    let film_detail = || {
+        let (_, value) = json(
+            takewise()
+                .arg("doctor")
+                .arg(&dir)
+                .env("TAKEWISE_MODELS", tmp.path().join("no-models")),
+        );
+        let checks = value["data"]["checks"].as_array().unwrap();
+        let film = checks.iter().find(|c| c["name"] == "film").unwrap();
+        assert_eq!(film["ok"], false, "{film}");
+        film["detail"].as_str().unwrap().to_owned()
+    };
+    let path = tmp.path().join("film.wav");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0; 4]);
+    fs::write(&path, &bytes).unwrap();
+    let changed = film_detail();
+    assert!(
+        changed.contains(&format!("run `takewise film {}`", dir.display())),
+        "{changed}"
+    );
+    fs::remove_file(&path).unwrap();
+    let missing = film_detail();
+    assert!(
+        missing.contains(&format!("`takewise film {} --film <path>`", dir.display())),
+        "{missing}"
+    );
+    assert!(!missing.contains("No such file"), "{missing}");
+}
+
 #[test]
 fn status_version_matches_the_script_it_shows() {
     use std::sync::Arc;

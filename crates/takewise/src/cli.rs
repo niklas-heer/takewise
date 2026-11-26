@@ -1874,12 +1874,20 @@ fn doctor(dir: Option<&Path>) -> Outcome {
         }),
         Some(Ok(project)) => {
             let film_path = project.film_path();
+            let dir = dir.unwrap_or(Path::new("<dir>")).display();
             let (ok, detail) = match film::matches(&film_path, &project.config.film_info) {
                 Ok(true) => (true, film_path.display().to_string()),
                 Ok(false) => (
                     false,
                     format!(
-                        "{} changed since it was measured; check the timings, then run `takewise film` to accept it",
+                        "{} changed since it was measured; check the timings, then run `takewise film {dir}` to accept it",
+                        film_path.display()
+                    ),
+                ),
+                Err(_) if !film_path.exists() => (
+                    false,
+                    format!(
+                        "the film {} is missing; point the project at the film with `takewise film {dir} --film <path>`",
                         film_path.display()
                     ),
                 ),
