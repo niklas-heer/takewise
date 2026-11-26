@@ -1495,6 +1495,9 @@ impl RecordingWindow {
         if warning.is_some() && (self.message != before || before.is_none()) {
             self.message = recorder::join(warning, self.message.take());
             self.take_result.clone_from(&self.message);
+        } else {
+            // Not said with this start: the next R still carries it.
+            self.take_warning = warning;
         }
         cx.notify();
     }

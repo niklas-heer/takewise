@@ -177,6 +177,9 @@ pub struct Recorder {
     /// been told to wait.
     start_hold: StartHold,
     waiting_since: Option<f64>,
+    /// Why a playback is told to wait, when the window knows (no system
+    /// output): said if it gives up.
+    waiting_for: Option<String>,
 }
 
 /// A stopped passage that is not published yet.
@@ -454,6 +457,7 @@ impl Recorder {
             uncut: Vec::new(),
             start_hold: StartHold::Go,
             waiting_since: None,
+            waiting_for: None,
         }
     }
 
@@ -1447,6 +1451,11 @@ impl Recorder {
         self.start_hold = hold;
     }
 
+    /// Why a playback waits, when known: said if it gives up.
+    pub fn waiting_for(&mut self, why: Option<String>) {
+        self.waiting_for = why;
+    }
+
     /// A playback opened and not playing yet at host time `now`: its take
     /// may still load, or both are scheduled and their start is to come.
     pub fn playback_waiting(&self, now: f64) -> bool {
@@ -1539,9 +1548,10 @@ impl Recorder {
         }
         self.waiting_since = None;
         StartHold::Stop(match self.phase {
-            Phase::Playing(_) => {
-                "The playback stopped: the output could not be checked.".to_owned()
-            }
+            Phase::Playing(_) => match self.waiting_for.take() {
+                Some(why) => format!("The playback stopped: {why}."),
+                None => "The playback stopped: the output could not be checked.".to_owned(),
+            },
             _ => "the output could not be checked, so the film did not start; start the take again"
                 .to_owned(),
         })

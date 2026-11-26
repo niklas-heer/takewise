@@ -2902,6 +2902,91 @@ fn r_blocked_after_a_warned_take_says_the_warning_once(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn a_reopened_film_ready_without_a_system_output_waits_for_one(cx: &mut TestAppContext) {
+    // The reopened film turns ready while there is no system output; the
+    // output that then appears is another device: the film is opened again
+    // on it, not taken as recovered on the one before.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    reopen_on_system_output(cx, &f, 100.0);
+    let opened = films(&f);
+    {
+        let mut fake = f.media.0.borrow_mut();
+        fake.no_default_output = true;
+        fake.film_loading = false;
+    }
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    assert_eq!(films(&f), opened, "kept while there is none");
+    f.media.0.borrow_mut().no_default_output = false;
+    switch_default_silently(&f);
+    f.media.set_now(101.0);
+    frame(cx, f.window);
+    assert_eq!(films(&f), opened + 1, "opened again on the new default");
+}
+
+#[gpui_kit::test]
+fn a_playback_with_no_system_output_says_so(cx: &mut TestAppContext) {
+    // P on the system output with none there: the playback waits, then
+    // says there is no output, not that it could not be checked.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    record_take(cx, &f);
+    f.media.0.borrow_mut().no_default_output = true;
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    for at in [200.1, 200.6, 201.2, 201.3] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        message(cx, &f.view),
+        "The playback stopped: there is no output to play through."
+    );
+}
+
+#[gpui_kit::test]
+fn a_playback_whose_system_output_cannot_be_read_says_so(cx: &mut TestAppContext) {
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    record_take(cx, &f);
+    f.media.0.borrow_mut().lookups_fail = true;
+    f.media.set_now(200.0);
+    press(cx, f.window, &["p"]);
+    for at in [200.1, 200.6, 201.2, 201.3] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_playing()));
+    assert_eq!(
+        message(cx, &f.view),
+        "The playback stopped: the output could not be checked."
+    );
+}
+
+#[gpui_kit::test]
+fn a_refused_r_keeps_the_warning_for_the_next(cx: &mut TestAppContext) {
+    // R blocked after a warned take: the warning is not used up; the next
+    // R that starts still carries it.
+    let f = on_test_phones(cx);
+    warned_take(cx, &f, 100.0);
+    f.view.update(cx, |view, _| {
+        view.script_problem = Some("The script has a problem.".to_owned());
+    });
+    f.media.set_now(101.0);
+    press(cx, f.window, &["r"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    f.view.update(cx, |view, _| view.script_problem = None);
+    f.media.set_now(102.0);
+    press(cx, f.window, &["r"]);
+    assert!(f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert_eq!(
+        said.matches("Test Phones was disconnected").count(),
+        1,
+        "carried: {said}"
+    );
+}
+
+#[gpui_kit::test]
 fn a_drop_found_by_the_route_check_updates_the_notice_at_once(cx: &mut TestAppContext) {
     // A film that keeps failing waits out a long pause; the phones go
     // without a CoreAudio event, found when P checks the route: the notice

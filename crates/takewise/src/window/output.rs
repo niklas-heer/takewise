@@ -663,17 +663,20 @@ impl RecordingWindow {
     /// it started on.
     pub(super) fn hold_start(&mut self) {
         let now = self.media.host_now_s();
+        let mut waiting_for = None;
         let hold = if self.recorder.playback_waiting(now) {
             match self.sync_output() {
-                // On the system output, only once there is one.
-                Ok(Ready::Yes)
-                    if self.film_output.is_none()
-                        && !matches!(
-                            self.media.default_output_object(),
-                            DeviceLookup::Present(_)
-                        ) =>
-                {
-                    StartHold::Wait
+                // On the system output, only once there is one; known to be
+                // none, that is what a playback that gives up says.
+                Ok(Ready::Yes) if self.film_output.is_none() => {
+                    match self.media.default_output_object() {
+                        DeviceLookup::Present(_) => StartHold::Go,
+                        DeviceLookup::Absent => {
+                            waiting_for = Some("there is no output to play through".to_owned());
+                            StartHold::Wait
+                        }
+                        DeviceLookup::Unknown => StartHold::Wait,
+                    }
                 }
                 Ok(Ready::Yes) => StartHold::Go,
                 Ok(Ready::Pending) => StartHold::Wait,
@@ -687,6 +690,7 @@ impl RecordingWindow {
             StartHold::Go
         };
         self.recorder.hold_start(hold);
+        self.recorder.waiting_for(waiting_for);
     }
 
     /// Whether a take's film may start: on the system output, yes; on a

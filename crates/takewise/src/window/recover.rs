@@ -12,9 +12,10 @@
 //! the window opens it (its output, level and warm-up) once the route is
 //! usable: the configured device set and confirmed afresh after the
 //! failure, or a system output there, as `output.rs` keeps and sets the
-//! route (recovery only reads it). It is tried at once, again at once when
-//! the route becomes usable or its [`Identity`] changes, and otherwise
-//! after a growing pause ([`FIRST_RETRY_S`] up to [`LAST_RETRY_S`]).
+//! route (recovery only reads it). It is tried once the device is
+//! confirmed, again at once when its [`Identity`] changes, and otherwise
+//! after a growing pause ([`FIRST_RETRY_S`] up to [`LAST_RETRY_S`]); right
+//! before it opens, a device's object is read once more.
 //!
 //! Whether the file or the output is at fault is judged by the outcome: a
 //! film opened again on a usable output that fails too is said to be
@@ -292,6 +293,18 @@ impl RecordingWindow {
             return None;
         }
         if self.media.film_ready() {
+            // On the system output, accepted only on a default that is
+            // there: one that appears later may be another device, and is
+            // then checked as above.
+            let unread = identity.uid.is_none()
+                && self
+                    .film
+                    .route
+                    .as_ref()
+                    .is_some_and(|(_, current)| current.object.is_none());
+            if self.film.attempts > 0 && unread {
+                return None;
+            }
             self.film.loading = None;
             self.film.why = None;
             return None;
