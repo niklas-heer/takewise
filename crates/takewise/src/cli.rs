@@ -1727,7 +1727,7 @@ fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-".contains(c));
+            .all(|c| c.is_ascii_alphanumeric() || "_./@%+=:,-".contains(c));
     if plain {
         word.to_owned()
     } else {
@@ -1968,6 +1968,7 @@ mod tests {
         );
         assert_eq!(shell_word("it's"), "'it'\\''s'");
         assert_eq!(shell_word(""), "''");
+        assert_eq!(shell_word("~/promo.takewise"), "'~/promo.takewise'");
     }
 
     #[test]
