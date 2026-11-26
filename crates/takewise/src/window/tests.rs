@@ -2187,6 +2187,32 @@ fn a_new_render_the_watcher_has_not_reported_yet_holds_the_take(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn a_new_render_with_a_broken_script_holds_the_take(cx: &mut TestAppContext) {
+    // `takewise film` lands while `script.toml` cannot be read: the window
+    // cannot reload, so it starts no take rather than record on the old
+    // picture, and says why.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let render = f.dir.join("film-v2.mp4");
+    fs::write(&render, b"").expect("film");
+    let info = FilmInfo {
+        duration_s: 25.0,
+        size: 0,
+        modified: "2026-11-26T00:00:00Z".to_owned(),
+    };
+    tw::set_film(&f.dir, &render, &info, jiff::Timestamp::now()).expect("set film");
+    fs::write(f.dir.join("script.toml"), "this is [not toml").expect("script");
+    f.media.set_now(100.0);
+    press(cx, f.window, &["space"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    assert_eq!(recorded(&f.dir).len(), 0, "no take");
+    assert!(
+        message(cx, &f.view).contains("Could not reload the project"),
+        "{}",
+        message(cx, &f.view)
+    );
+}
+
+#[gpui_kit::test]
 fn a_render_written_over_the_film_before_opening_is_the_one_playing(cx: &mut TestAppContext) {
     // The fixture's film on disk is not what `[film_info]` measured: it
     // was written over before the window opened, so the player opened

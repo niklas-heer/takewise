@@ -501,23 +501,34 @@ impl RecordingWindow {
     /// again, so it asks to be reopened, and no take starts meanwhile
     /// (see [`RecordingWindow::blocked`]): it would be timed against the
     /// new cut while the old picture plays.
-    /// Re-reads the project when the film it names on disk is not the one
-    /// this window last read, so a take never starts on a render that
-    /// `takewise film` replaced before the file watcher reported it.
-    pub(super) fn notice_film_change(&mut self) {
-        let Ok(on_disk) = Project::open(&self.dir) else {
-            return;
-        };
-        let config = &self.project.config;
-        if on_disk.config.film != config.film
-            || !tw::film::same_film(&on_disk.config.film_info, &config.film_info)
-        {
-            self.reload();
-        }
-    }
-
     pub(super) fn film_replaced_note(&self) -> Option<&'static str> {
         (!self.film_played.is_named_by(&self.project)).then_some(FILM_REPLACED)
+    }
+
+    /// Before a take starts: reads the film `project.toml` names now (only
+    /// that file, so a broken `script.toml` cannot hide a new render) and,
+    /// when it is not the one this window last read, reloads, so a take
+    /// never starts on a render that `takewise film` replaced before the
+    /// file watcher reported it. Says why when the project cannot be read
+    /// or the reload fails; no take may start then.
+    pub(super) fn notice_film_change(&mut self) -> Result<(), String> {
+        let on_disk = tw::project::read_config(&self.dir)
+            .map_err(|err| format!("Could not read the project: {err}"))?;
+        let config = &self.project.config;
+        if on_disk.film == config.film && tw::film::same_film(&on_disk.film_info, &config.film_info)
+        {
+            return Ok(());
+        }
+        self.reload();
+        let config = &self.project.config;
+        if on_disk.film == config.film && tw::film::same_film(&on_disk.film_info, &config.film_info)
+        {
+            Ok(())
+        } else {
+            Err(self.message.clone().unwrap_or_else(|| {
+                "Could not reload the project after its film changed.".to_owned()
+            }))
+        }
     }
 
     /// Why what was refused could not start on the film, while it is not
