@@ -1724,6 +1724,13 @@ fn playback_report(
 /// characters, so a hint with a project folder such as `My Promo.takewise`
 /// can be pasted as it is.
 fn shell_word(word: &str) -> String {
+    // A relative path starting with `-` or `=` would read as an option, or
+    // as zsh's command expansion; `./` in front keeps it the same path.
+    let word = &if word.starts_with(['-', '=']) {
+        format!("./{word}")
+    } else {
+        word.to_owned()
+    };
     let plain = !word.is_empty()
         && word
             .chars()
@@ -1969,6 +1976,8 @@ mod tests {
         assert_eq!(shell_word("it's"), "'it'\\''s'");
         assert_eq!(shell_word(""), "''");
         assert_eq!(shell_word("~/promo.takewise"), "'~/promo.takewise'");
+        assert_eq!(shell_word("-draft.takewise"), "./-draft.takewise");
+        assert_eq!(shell_word("=draft.takewise"), "./=draft.takewise");
     }
 
     #[test]
