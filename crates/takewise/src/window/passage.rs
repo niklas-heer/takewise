@@ -122,8 +122,7 @@ impl RecordingWindow {
             self.say_route(problem.for_playback());
             return;
         }
-        if let Some(problem) = self.film_problem(false) {
-            self.message = Some(problem);
+        if self.film_refused(false) {
             return;
         }
         self.message = self

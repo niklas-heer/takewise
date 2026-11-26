@@ -756,8 +756,8 @@ impl RecordingWindow {
         };
         // A film that never loads counts as failed, as a reopened one does.
         let now = view.media.host_now_s();
-        let generation = view.media.device_generation();
-        view.film.opened(now, generation);
+        let route = view.route_seen();
+        view.film.opened(now, route);
         // The levels in use, within their ranges, are what takes play at.
         view.volumes.write_into(&mut view.project.config);
         view.after_reload(None);
@@ -1263,8 +1263,7 @@ impl RecordingWindow {
         }
         // A take on a film that failed, or has not loaded, would only stop
         // at once.
-        if let Some(problem) = self.film_problem(true) {
-            self.message = Some(problem);
+        if self.film_refused(true) {
             return;
         }
         self.message = None;
@@ -1443,6 +1442,9 @@ impl RecordingWindow {
     /// interruption or error is shown together with the success, never
     /// replaced by it.
     fn show(&mut self, update: recorder::Update) {
+        if let Some(waiting) = update.film_waiting {
+            self.film.status = Some(waiting);
+        }
         if let (Some(take), Some(peak)) = (&update.committed, update.peak_dbfs) {
             self.take_peaks.insert((take.line.clone(), take.take), peak);
         }
@@ -1542,8 +1544,7 @@ impl RecordingWindow {
             cx.notify();
             return;
         }
-        if let Some(problem) = self.film_problem(false) {
-            self.message = Some(problem);
+        if self.film_refused(false) {
             cx.notify();
             return;
         }
@@ -2100,7 +2101,8 @@ impl Render for RecordingWindow {
         let scroll_rows = self.scroll_rows(film_s, now);
         let (note, next) = self.prompter_cues();
         // The film's recovery has its own notice, beside any other.
-        let shown = recorder::join(self.message.clone(), self.film.note.clone());
+        let film = recorder::join(self.film.status.clone(), self.film.note.clone());
+        let shown = recorder::join(self.message.clone(), film);
         let prompter = prompter::Prompter {
             film_s,
             reading: self.prompter_line(),

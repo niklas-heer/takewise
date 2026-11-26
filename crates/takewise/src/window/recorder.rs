@@ -117,6 +117,9 @@ pub struct Update {
     /// `message`: the window keeps it in sight until the next take's
     /// result.
     pub route_note: Option<String>,
+    /// Why a playback could not start because its film was not ready: the
+    /// window shows it as the film's status, gone once the film is.
+    pub film_waiting: Option<String>,
 }
 
 /// The takes of a passage recorded in one go.
@@ -1498,6 +1501,7 @@ impl Recorder {
             passage: cut.passage,
             message: join(update.message, cut.message),
             route_note: update.route_note,
+            film_waiting: update.film_waiting,
         }
     }
 
@@ -1626,10 +1630,7 @@ impl Recorder {
                 }
                 None if now - playback.opened_host_s > TAKE_LOAD_TIMEOUT_S => {
                     self.stop_playback(media);
-                    Update {
-                        message: Some(not_loaded(media)),
-                        ..Update::default()
-                    }
+                    not_loaded(media)
                 }
                 _ => Update::default(),
             },
@@ -2141,16 +2142,24 @@ fn clock(film_s: f64) -> String {
     format!("{sign}{}:{:02}", whole / 60, whole % 60)
 }
 
-/// Why a playback that waited too long did not start: the film, not the
-/// take, when the film is what it waited for.
-fn not_loaded(media: &dyn Media) -> String {
+/// Why a playback that waited too long did not start: the take did not
+/// load, or the film is not ready (said as the film's status).
+fn not_loaded(media: &dyn Media) -> Update {
     if media.film_ready() {
-        return "The take did not load.".to_owned();
+        return Update {
+            message: Some("The take did not load.".to_owned()),
+            ..Update::default()
+        };
     }
     let why = media
         .film_failure()
         .unwrap_or_else(|| "still loading".to_owned());
-    format!("The film is not ready ({why}); play it again in a moment.")
+    Update {
+        film_waiting: Some(format!(
+            "The film is not ready ({why}); play it again in a moment."
+        )),
+        ..Update::default()
+    }
 }
 
 /// Both messages, or whichever there is.

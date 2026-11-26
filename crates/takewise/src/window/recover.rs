@@ -12,17 +12,18 @@
 //! check finds the output usable: the configured device set and
 //! confirmed, or a system output there, as `output.rs` keeps and sets the
 //! route (recovery only reads it). It is tried at once, again at once
-//! whenever the route or the devices change or P, Shift+P or Space is
-//! pressed, and otherwise after a growing pause ([`FIRST_RETRY_S`] up to
-//! [`LAST_RETRY_S`]). Whether the
+//! whenever the route changes (see [`RouteSeen`]), and otherwise after a
+//! growing pause ([`FIRST_RETRY_S`] up to [`LAST_RETRY_S`]). Whether the
 //! file or the output is at fault is judged by the outcome: a film opened
 //! again on a usable output that fails too is said to be unplayable, with
 //! the player's reason, and tried again less and less often. A film that
-//! does not load in time counts as failed.
+//! does not load in time counts as failed; a reopened one still loading
+//! when the route changes is opened again at once on the new route.
 //!
-//! What it says has its own notice ([`Recovery::note`]), shown beside the
-//! window's message: no take result or playback message is replaced, and
-//! the notice goes once the film is ready again. A take player that failed
+//! What it says has its own lines beside the window's message: the notice
+//! ([`Recovery::note`]) and the status a refused P, Shift+P or Space left
+//! ([`Recovery::status`]). No take result or playback message is replaced,
+//! and both go once the film is ready again. A take player that failed
 //! needs nothing more: the next take opened gets a new one.
 
 use super::RecordingWindow;
@@ -42,14 +43,27 @@ pub const LOAD_TIMEOUT_S: f64 = 10.0;
 /// The longest a film is given to load.
 pub const LONGEST_LOAD_S: f64 = 30.0;
 
-/// How long a reopened film loads before P, Shift+P, Space or a device
-/// change gives it up early and opens it again (one opened as its output
-/// went away may neither load nor fail).
-pub const EARLY_RETRY_S: f64 = 3.0;
-
-/// How long a reopened film must stay ready (its warm-up done) before its
-/// recovery counts as over and the pauses start again from the first.
+/// How long a reopened film must stay ready before its recovery counts as
+/// over and the pauses start again from the first: well past its warm-up
+/// (`recorder::WARMUP_S`, which starts at the tick after it is ready), so
+/// a film that fails in its warm-up still backs off.
 pub const SETTLED_S: f64 = 2.0;
+
+/// The route as the window keeps it, for recovery to see it change: the
+/// devices' generation, the configured output, the applied output and its
+/// object, and whether it is missing, due or usable. A change of any
+/// (also one the route check's poll found, or a choice in the panel with
+/// no CoreAudio event) tries a film set aside again at once, says again
+/// whether it waits for its output, and restarts a reopened film's load.
+type RouteSeen = (
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+    bool,
+    bool,
+    bool,
+);
 
 /// How often the output is looked at while it is not usable, between the
 /// changes that are reported.
@@ -67,22 +81,20 @@ pub struct Recovery {
     backoff_s: f64,
     /// Reopens since it was last ready.
     attempts: u32,
-    /// When it was opened, and the devices then, until it is ready.
-    loading_since: Option<(f64, u64)>,
-    /// P, Shift+P or Space was pressed while a reopened film loads.
-    nudged: bool,
+    /// When it was opened, and the route then, until it is ready.
+    loading_since: Option<(f64, RouteSeen)>,
     /// When a reopened film that is ready counts as recovered.
     settles_at: Option<f64>,
-    /// The refusal said for P, Shift+P or Space, taken back once the
-    /// film is ready.
-    refusal: Option<String>,
-    /// The devices and the route the window has set when it was last
-    /// tried: a change tries it again at once.
-    seen: Option<(u64, Option<String>, Option<u32>)>,
-    /// Why its player failed, while it waits.
+    /// The route when it was last tried: a change tries it again at once.
+    seen: Option<RouteSeen>,
+    /// Why it is not open: its player failed, or it could not be opened.
     reason: Option<String>,
     /// What its recovery says, beside the window's message.
     pub note: Option<String>,
+    /// Why P, Shift+P, Space or a playback that waited could not start on
+    /// it: the film is not ready. Beside the window's message, and gone
+    /// once the film is ready or something starts.
+    pub status: Option<String>,
 }
 
 impl Default for Recovery {
@@ -93,12 +105,11 @@ impl Default for Recovery {
             backoff_s: FIRST_RETRY_S,
             attempts: 0,
             loading_since: None,
-            nudged: false,
             settles_at: None,
-            refusal: None,
             seen: None,
             reason: None,
             note: None,
+            status: None,
         }
     }
 }
@@ -110,33 +121,17 @@ impl Recovery {
         self.set_aside = true;
         self.retry_at = f64::NEG_INFINITY;
         self.seen = None;
-        // The beep film has its own deadline.
+        // The beep film has its own deadline, and no reason of an earlier
+        // failure is said for it.
         self.loading_since = None;
         self.settles_at = None;
+        self.reason = None;
     }
 
-    /// The film was just opened (with the devices at `generation`): it
-    /// counts as failed if it does not load in time.
-    pub fn opened(&mut self, now: f64, generation: u64) {
-        self.loading_since = Some((now, generation));
-        self.nudged = false;
-    }
-
-    /// Whether it waits for a film to load.
-    #[cfg(test)]
-    pub fn loading(&self) -> bool {
-        self.loading_since.is_some()
-    }
-
-    /// P, Shift+P or Space: a film set aside is tried again at the next
-    /// tick, whatever the pause; a reopened one still loading may be given
-    /// up early (see [`EARLY_RETRY_S`]).
-    pub fn nudge(&mut self) {
-        if self.set_aside {
-            self.retry_at = f64::NEG_INFINITY;
-        } else if self.loading_since.is_some() {
-            self.nudged = true;
-        }
+    /// The film was just opened (on `route`): it counts as failed if it
+    /// does not load in time.
+    pub fn opened(&mut self, now: f64, route: RouteSeen) {
+        self.loading_since = Some((now, route));
     }
 
     /// The pause before the next try, and the one after it.
@@ -186,40 +181,52 @@ impl RecordingWindow {
         }
     }
 
-    /// While a film loads: once it is ready, its notice and any refusal go;
-    /// once it has stayed ready past its warm-up, its recovery is over.
-    /// Returns why it counts as failed when it took too long, or, reopened,
-    /// was given up early.
+    /// While a film loads: once it is ready, its notice and status go;
+    /// once it has stayed ready for [`SETTLED_S`], its recovery is over.
+    /// Returns why it counts as failed when it took too long. A reopened
+    /// film still loading when the route changed is set aside, to be
+    /// opened again at once on the new route.
     fn watch_film_load(&mut self, now: f64) -> Option<String> {
+        // Whatever said it was not ready, it is now.
+        if self.film.status.is_some() && !self.film.set_aside && self.media.film_ready() {
+            self.film.status = None;
+        }
         if let Some(at) = self.film.settles_at
             && now >= at
         {
             self.film = Recovery::default();
             return None;
         }
-        let (since, generation) = self.film.loading_since?;
+        let (since, route) = self.film.loading_since.clone()?;
         if self.media.film_ready() {
             self.film.loading_since = None;
             self.film.note = None;
-            if self.message.is_some() && self.message == self.film.refusal {
-                self.message = None;
-            }
-            self.film.refusal = None;
+            self.film.status = None;
             if self.film.attempts > 0 {
                 self.film.settles_at = Some(now + SETTLED_S);
             }
             return None;
         }
-        let waited = now - since;
-        // A key pressed within the first seconds asks nothing yet.
-        if waited <= EARLY_RETRY_S {
-            self.film.nudged = false;
+        if self.film.attempts > 0 && self.route_seen() != route {
+            self.media.film_pause();
+            self.film.set_aside();
+            return None;
         }
         let timeout = (LOAD_TIMEOUT_S * f64::from(self.film.attempts.max(1))).min(LONGEST_LOAD_S);
-        let early = self.film.attempts > 0
-            && waited > EARLY_RETRY_S
-            && (self.film.nudged || generation != self.media.device_generation());
-        (waited > timeout || early).then(|| "it did not load".to_owned())
+        (now - since > timeout).then(|| "it did not load".to_owned())
+    }
+
+    /// The route as recovery watches it (see [`RouteSeen`]).
+    pub(super) fn route_seen(&self) -> RouteSeen {
+        (
+            self.media.device_generation(),
+            self.project.config.output.device.clone(),
+            self.film_output.clone(),
+            self.applied_device.as_ref().and_then(|(_, object)| *object),
+            self.output_missing.is_some(),
+            self.route_due,
+            self.route_usable(),
+        )
     }
 
     /// The film's player failed: stops what plays on it, and sets it aside
@@ -265,16 +272,12 @@ impl RecordingWindow {
     /// the route the window has set and confirmed, never on one missing or
     /// unconfirmed, where a new player would fail at once.
     pub(super) fn reopen_film(&mut self, now: f64) {
-        let seen = (
-            self.media.device_generation(),
-            self.film_output.clone(),
-            self.applied_device.as_ref().and_then(|(_, object)| *object),
-        );
+        let seen = self.route_seen();
         if now < self.film.retry_at && self.film.seen.as_ref() == Some(&seen) {
             return;
         }
-        self.film.seen = Some(seen);
-        if !self.route_usable() {
+        self.film.seen = Some(seen.clone());
+        if !seen.6 {
             self.film.retry_at = self.film.retry_at.max(now + POLL_S);
             if let Some(reason) = &self.film.reason {
                 self.film.note = Some(format!(
@@ -287,10 +290,10 @@ impl RecordingWindow {
         match self.restore_film() {
             Ok(()) => {
                 self.film.set_aside = false;
-                let generation = self.media.device_generation();
-                self.film.opened(now, generation);
+                self.film.opened(now, seen);
             }
             Err(err) => {
+                self.film.reason = Some(err.clone());
                 let pause = self.film.back_off(now);
                 self.film.note = Some(format!(
                     "Could not open the film again ({err}); Takewise tries again in {pause:.0} s and when the output changes."
@@ -307,12 +310,11 @@ impl RecordingWindow {
         self.reopen_film(now);
     }
 
-    /// Why a playback or a take cannot start on the film now, if it
-    /// cannot: it is set aside (it is then tried again at the next tick)
-    /// or failed, or (`loading`, for a take, whose film must start at
-    /// once) it is still loading.
-    pub(super) fn film_problem(&mut self, loading: bool) -> Option<String> {
-        self.film.nudge();
+    /// Whether a playback or a take cannot start on the film now, saying
+    /// why in the film's status: it is set aside or failed, or (`loading`,
+    /// for a take, whose film must start at once) it is still loading.
+    /// A start that can go clears that status.
+    pub(super) fn film_refused(&mut self, loading: bool) -> bool {
         let why = if self.film.set_aside {
             match (&self.film.reason, self.route_usable()) {
                 (Some(reason), false) => format!("{reason}; it waits for its output"),
@@ -325,10 +327,12 @@ impl RecordingWindow {
         } else if loading && !self.media.film_ready() {
             "still loading".to_owned()
         } else {
-            return None;
+            self.film.status = None;
+            return false;
         };
-        let refusal = format!("The film is not ready ({why}); try again in a moment.");
-        self.film.refusal = Some(refusal.clone());
-        Some(refusal)
+        self.film.status = Some(format!(
+            "The film is not ready ({why}); try again in a moment."
+        ));
+        true
     }
 }
