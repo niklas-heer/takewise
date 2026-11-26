@@ -421,6 +421,15 @@ impl RecordingWindow {
         }
     }
 
+    /// Has the applied device's object read afresh before the route counts
+    /// as usable again (the device may have just gone): the next tick reads
+    /// it, as for a route just set.
+    pub(super) fn reconfirm_route(&mut self) {
+        if let Some((_, object)) = &mut self.applied_device {
+            *object = None;
+        }
+    }
+
     /// Whether the route waits on its device's object (reads failing
     /// within the grace, or not read yet since it was set): read again
     /// every tick, one property read, until it resolves, as before a start.

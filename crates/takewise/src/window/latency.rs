@@ -99,7 +99,8 @@ impl RecordingWindow {
         match started {
             Ok(run) => {
                 // The beep film is in its place.
-                self.film.set_aside();
+                self.film.set_aside_for_beeps();
+                self.recorder.hold_film(true);
                 self.calibrating = Some(Calibrating {
                     run,
                     _work: work,

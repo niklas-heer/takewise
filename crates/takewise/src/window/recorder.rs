@@ -117,9 +117,9 @@ pub struct Update {
     /// `message`: the window keeps it in sight until the next take's
     /// result.
     pub route_note: Option<String>,
-    /// Why a playback could not start because its film was not ready: the
-    /// window shows it as the film's status, gone once the film is.
-    pub film_waiting: Option<String>,
+    /// A playback could not start because its film was not ready: the
+    /// window says so in the film's status, gone once the film is.
+    pub film_waiting: bool,
 }
 
 /// The takes of a passage recorded in one go.
@@ -136,6 +136,8 @@ pub struct PassageTakes {
 pub struct Recorder {
     phase: Phase,
     warmup: Warmup,
+    /// The window has set the film aside (see [`Recorder::hold_film`]).
+    film_held: bool,
     /// Where the film rests while nothing plays.
     park_s: f64,
     /// Peak of the last captured buffer in dBFS, and when it arrived.
@@ -434,6 +436,7 @@ impl Recorder {
         Self {
             phase: Phase::Idle,
             warmup: Warmup::Pending,
+            film_held: false,
             park_s: 0.0,
             level: None,
             tick_peak: None,
@@ -751,6 +754,23 @@ impl Recorder {
         self.warmup = Warmup::Pending;
     }
 
+    /// Whether the film's warm-up is over.
+    pub fn warmed_up(&self) -> bool {
+        matches!(self.warmup, Warmup::Done)
+    }
+
+    /// While the window has set the film aside (its player failed, or the
+    /// beep film is in its place), it counts as not ready: nothing queued
+    /// starts on it, and it is not warmed up.
+    pub fn hold_film(&mut self, held: bool) {
+        self.film_held = held;
+    }
+
+    /// Whether the film is ready to play: loaded, and not set aside.
+    fn film_ready(&self, media: &dyn Media) -> bool {
+        !self.film_held && media.film_ready()
+    }
+
     /// Rests the film at `film_s` while nothing plays.
     pub fn park(&mut self, media: &mut dyn Media, film_s: f64) {
         self.park_s = film_s;
@@ -866,7 +886,7 @@ impl Recorder {
             .device
             .clone()
             .ok_or("No input device chosen; set [input] device in project.toml.")?;
-        if !media.film_ready() {
+        if !self.film_ready(media) {
             return Err("The film is still loading; try again in a moment.".to_owned());
         }
         let snapshot = project
@@ -1530,6 +1550,7 @@ impl Recorder {
     /// The part of [`Recorder::tick`] that depends on what runs.
     fn tick_phase(&mut self, media: &mut dyn Media, dir: &Path, now: f64) -> Update {
         let hold = self.bounded_hold(now);
+        let film_ready = self.film_ready(media);
         match &mut self.phase {
             Phase::Idle => self.retry_unsaved(dir, now),
             Phase::Recording(take) => {
@@ -1612,7 +1633,7 @@ impl Recorder {
                     playback.starts_host_s = f64::INFINITY;
                     Update::default()
                 }
-                None if media.take_ready() && media.film_ready() => {
+                None if media.take_ready() && film_ready => {
                     match start_both(media, playback, now) {
                         Ok(tb) => {
                             playback.started = Some(tb);
@@ -1630,7 +1651,7 @@ impl Recorder {
                 }
                 None if now - playback.opened_host_s > TAKE_LOAD_TIMEOUT_S => {
                     self.stop_playback(media);
-                    not_loaded(media)
+                    not_loaded(film_ready)
                 }
                 _ => Update::default(),
             },
@@ -1639,7 +1660,7 @@ impl Recorder {
 
     fn tick_warmup(&mut self, media: &mut dyn Media, now: f64) {
         match self.warmup {
-            Warmup::Pending if media.film_ready() && matches!(self.phase, Phase::Idle) => {
+            Warmup::Pending if self.film_ready(media) && matches!(self.phase, Phase::Idle) => {
                 media.film_set_muted(true);
                 self.warmup = match media.film_play_at(self.park_s, now) {
                     Ok(_) => Warmup::Running {
@@ -2144,20 +2165,15 @@ fn clock(film_s: f64) -> String {
 
 /// Why a playback that waited too long did not start: the take did not
 /// load, or the film is not ready (said as the film's status).
-fn not_loaded(media: &dyn Media) -> Update {
-    if media.film_ready() {
+fn not_loaded(film_ready: bool) -> Update {
+    if film_ready {
         return Update {
             message: Some("The take did not load.".to_owned()),
             ..Update::default()
         };
     }
-    let why = media
-        .film_failure()
-        .unwrap_or_else(|| "still loading".to_owned());
     Update {
-        film_waiting: Some(format!(
-            "The film is not ready ({why}); play it again in a moment."
-        )),
+        film_waiting: true,
         ..Update::default()
     }
 }
