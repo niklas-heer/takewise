@@ -1879,7 +1879,7 @@ fn doctor(dir: Option<&Path>) -> Outcome {
                 Ok(false) => (
                     false,
                     format!(
-                        "{} changed since it was measured; run `takewise status --refresh-film`",
+                        "{} changed since it was measured; check the timings, then run `takewise film` to accept it",
                         film_path.display()
                     ),
                 ),
