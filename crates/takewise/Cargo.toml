@@ -1,6 +1,6 @@
 [package]
 name = "takewise"
-version = "0.2.0"
+version = "0.3.0"
 description = "Record voiceover narration over a finished film, line by line, with checks and an agent-friendly CLI."
 publish = false
 edition.workspace = true

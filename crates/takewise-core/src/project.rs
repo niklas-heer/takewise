@@ -505,7 +505,7 @@ mod tests {
         assert!((config.record.passage_gap_s - 1.0).abs() < f64::EPSILON);
         assert!(
             config.record.voice_gain_db.abs() < f64::EPSILON,
-            "takes play at full level in projects made before 0.2.1"
+            "takes play at full level in projects made before 0.3.0"
         );
 
         // A new project's file has none of the new tables either.

@@ -6018,7 +6018,7 @@ fn the_menu_bar_works_from_a_recording_window(cx: &mut TestAppContext) {
 // The test window of gpui-pre 0.3.12 (the GPUI gpui-kit 0.10.0 pins)
 // implements minimize() and zoom() as `unimplemented!()`, which panics
 // with "not implemented": these pass only when the action reaches the
-// window's own minimize or zoom, which the app-wide handlers of 0.2.1's
+// window's own minimize or zoom, which the app-wide handlers of 0.3.0's
 // first cut never did. A GPUI whose test window records the calls instead
 // fails them, to be rewritten against what it records.
 #[gpui_kit::test]
