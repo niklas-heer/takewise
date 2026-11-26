@@ -541,14 +541,14 @@ fn film_arg_path(film_arg: &Path) -> Result<PathBuf, CliError> {
 /// the project at it: `takewise film` and `status --refresh-film`.
 fn point_film(dir: &Path, film_arg: Option<&Path>) -> Result<tw::FilmChange, CliError> {
     let project = Project::open(dir)?;
-    let film = film_arg.map(film_arg_path).transpose()?;
-    let info = film::probe(film.as_deref().unwrap_or(&project.film_path()))?;
-    Ok(tw::set_film(
-        dir,
-        film.as_deref(),
-        &info,
-        jiff::Timestamp::now(),
-    )?)
+    let now = jiff::Timestamp::now();
+    // Probed outside the lock (ffprobe takes a while); the core refuses a
+    // refresh when the project was pointed elsewhere meanwhile.
+    if let Some(film) = film_arg.map(film_arg_path).transpose()? {
+        return Ok(tw::set_film(dir, &film, &film::probe(&film)?, now)?);
+    }
+    let info = film::probe(&project.film_path())?;
+    Ok(tw::refresh_film(dir, &project.config.film, &info, now)?)
 }
 
 /// `film`: point the project at a new render, or measure its film again.

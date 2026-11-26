@@ -55,6 +55,12 @@ pub enum Error {
     Ffmpeg(String),
     #[error("{0}")]
     ExportSetting(String),
+    #[error(
+        "the project was pointed at {} while {} was being measured; nothing was written. Run the command again",
+        now.display(),
+        measured.display()
+    )]
+    FilmRepointed { measured: PathBuf, now: PathBuf },
 }
 
 impl Error {
@@ -77,6 +83,7 @@ impl Error {
             Error::MissingFfmpeg(_) => "missing-tool",
             Error::Ffmpeg(_) => "ffmpeg-failed",
             Error::ExportSetting(_) => "bad-export-setting",
+            Error::FilmRepointed { .. } => "film-repointed",
         }
     }
 }

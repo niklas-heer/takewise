@@ -2094,7 +2094,7 @@ fn a_new_render_asks_for_the_window_to_be_opened_again(cx: &mut TestAppContext) 
         size: 0,
         modified: "2026-11-26T00:00:00Z".to_owned(),
     };
-    tw::set_film(&f.dir, Some(&render), &info, jiff::Timestamp::now()).expect("set film");
+    tw::set_film(&f.dir, &render, &info, jiff::Timestamp::now()).expect("set film");
     f.view.update(cx, |view, _| view.reload());
     assert!(
         replaced(cx).contains("another render of the film"),

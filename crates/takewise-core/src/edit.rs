@@ -133,28 +133,58 @@ pub fn set_line_field(
     Ok(ScriptVersion::of(edited.as_bytes()))
 }
 
-/// Re-measures the film at the path the project has: [`set_film`] without
-/// a new path, at the current time.
-pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
-    set_film(dir, None, info, jiff::Timestamp::now()).map(drop)
-}
-
 /// Points the project at a render of its film: `film` is stored as given
-/// (`None` keeps the path the project has, as does the path it already
-/// resolves to), measured as `info`. Under the lock, writes `film` and
-/// `[film_info]` and records the film before as `[previous_film]`, stamped
-/// `at`; when it is the same film measured the same, nothing is written.
-/// The script, the takes, the ledger and the setup stay as they are. The
-/// warnings compare the script, read under the lock, with the new film.
+/// (the path the project already resolves to keeps the path as written),
+/// measured as `info`. Under the lock, writes `film` and `[film_info]` and
+/// records the film before as `[previous_film]`, stamped `at`; when it is
+/// the same film measured the same, nothing is written. The script, the
+/// takes, the ledger and the setup stay as they are. The warnings compare
+/// the script, read under the lock, with the new film.
 pub fn set_film(
     dir: &Path,
+    film: &Path,
+    info: &FilmInfo,
+    at: jiff::Timestamp,
+) -> Result<FilmChange> {
+    point_film(dir, Some(film), None, info, at)
+}
+
+/// Re-measures the film at the path the project has: [`set_film`] with
+/// the path kept. `measured` is the project's `film` as it was read when
+/// `info` was measured; when the project names another film by the time
+/// the lock is held (`takewise film --film` landed meanwhile), nothing is
+/// written and it fails with [`Error::FilmRepointed`], so the measurement
+/// of one file is never stored for another.
+pub fn refresh_film(
+    dir: &Path,
+    measured: &Path,
+    info: &FilmInfo,
+    at: jiff::Timestamp,
+) -> Result<FilmChange> {
+    point_film(dir, None, Some(measured), info, at)
+}
+
+/// [`set_film`] (`film`) or [`refresh_film`] (`measured`).
+fn point_film(
+    dir: &Path,
     film: Option<&Path>,
+    measured: Option<&Path>,
     info: &FilmInfo,
     at: jiff::Timestamp,
 ) -> Result<FilmChange> {
     let mut change = None;
+    let mut refused = None;
     edit_project_when(dir, |text, doc| {
         let config: crate::ProjectConfig = toml::from_str(text).map_err(|err| err.to_string())?;
+        if let Some(measured) = measured
+            && config.film != measured
+        {
+            refused = Some(Error::FilmRepointed {
+                measured: measured.to_path_buf(),
+                now: config.film,
+            });
+            return Ok(false);
+        }
         let resolved = if config.film.is_absolute() {
             config.film.clone()
         } else {
@@ -218,6 +248,9 @@ pub fn set_film(
         );
         Ok(true)
     })?;
+    if let Some(err) = refused {
+        return Err(err);
+    }
     change.ok_or_else(|| Error::Parse {
         path: dir.join(PROJECT_FILE),
         message: "project.toml could not be read".to_owned(),
@@ -952,7 +985,7 @@ text = "Third."
     }
 
     #[test]
-    fn set_film_info_keeps_the_rest() {
+    fn refresh_film_keeps_the_rest() {
         let (_tmp, dir) = project();
         let path = dir.join("project.toml");
         let original = fs::read_to_string(&path).unwrap();
@@ -962,13 +995,59 @@ text = "Third."
             size: 99,
             modified: "2026-11-23T08:00:00Z".to_owned(),
         };
-        set_film_info(&dir, &info).unwrap();
+        let change =
+            refresh_film(&dir, Path::new("film.mp4"), &info, jiff::Timestamp::now()).unwrap();
+        assert!(change.changed);
+        assert_eq!(change.film, Path::new("film.mp4"));
         let config = crate::project::read_config(&dir).unwrap();
+        assert_eq!(config.film, Path::new("film.mp4"));
         assert_eq!(config.film_info, info);
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
                 .starts_with("# my film\n")
+        );
+    }
+
+    #[test]
+    fn refresh_film_refuses_when_the_project_was_pointed_elsewhere_meanwhile() {
+        // `status --refresh-film` measured film.mp4; before it took the
+        // lock, `takewise film --film v2.mp4` pointed the project at
+        // another render. film.mp4's measurement must not land on v2.mp4.
+        let (_tmp, dir) = project();
+        let v2 = FilmInfo {
+            duration_s: 55.0,
+            size: 2,
+            modified: "2026-11-26T09:00:00Z".to_owned(),
+        };
+        let at: jiff::Timestamp = "2026-11-26T10:00:00Z".parse().unwrap();
+        set_film(&dir, Path::new("/renders/v2.mp4"), &v2, at).unwrap();
+        let path = dir.join(PROJECT_FILE);
+        let written = fs::read_to_string(&path).unwrap();
+
+        let stale = FilmInfo {
+            duration_s: 50.0,
+            size: 1,
+            modified: "2026-11-26T09:30:00Z".to_owned(),
+        };
+        let err = refresh_film(&dir, Path::new("film.mp4"), &stale, at).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::FilmRepointed { measured, now }
+                    if measured == Path::new("film.mp4") && now == Path::new("/renders/v2.mp4")
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.code(), "film-repointed");
+        // Nothing written: v2's measurement and the record of film.mp4
+        // as the film it replaced stay.
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        let config = Project::open(&dir).unwrap().config;
+        assert_eq!(config.film_info, v2);
+        assert_eq!(
+            config.previous_film.map(|p| p.film),
+            Some("film.mp4".into())
         );
     }
 
@@ -1002,7 +1081,7 @@ text = "Third."
             size: 2,
             modified: "2026-11-26T09:00:00Z".to_owned(),
         };
-        let change = set_film(&dir, Some(Path::new("/renders/v2.mp4")), &info, at).unwrap();
+        let change = set_film(&dir, Path::new("/renders/v2.mp4"), &info, at).unwrap();
         assert!(change.changed);
         assert_eq!(change.film, Path::new("/renders/v2.mp4"));
         let previous = PreviousFilm {
@@ -1043,11 +1122,11 @@ text = "Third."
 
         // The same film again, measured the same: nothing is written.
         let written = fs::read_to_string(&path).unwrap();
-        let again = set_film(&dir, Some(Path::new("/renders/v2.mp4")), &info, at).unwrap();
+        let again = set_film(&dir, Path::new("/renders/v2.mp4"), &info, at).unwrap();
         assert!(!again.changed);
         assert_eq!(again.previous, None);
         assert_eq!(fs::read_to_string(&path).unwrap(), written);
-        let kept = set_film(&dir, None, &info, at).unwrap();
+        let kept = refresh_film(&dir, Path::new("/renders/v2.mp4"), &info, at).unwrap();
         assert!(!kept.changed);
         assert_eq!(kept.film, Path::new("/renders/v2.mp4"));
     }
@@ -1064,7 +1143,7 @@ text = "Third."
             size: 4,
             modified: "2026-11-26T09:00:00Z".to_owned(),
         };
-        let change = set_film(&dir, Some(&canonical), &info, jiff::Timestamp::now()).unwrap();
+        let change = set_film(&dir, &canonical, &info, jiff::Timestamp::now()).unwrap();
         assert!(change.changed, "measured differently");
         assert_eq!(change.film, Path::new("film.mp4"));
         let config = Project::open(&dir).unwrap().config;
@@ -1094,7 +1173,7 @@ text = "Third."
             size: 3,
             modified: "2026-11-26T09:00:00Z".to_owned(),
         };
-        set_film(&dir, None, &info, jiff::Timestamp::now()).unwrap();
+        refresh_film(&dir, Path::new("film.mp4"), &info, jiff::Timestamp::now()).unwrap();
         let config = Project::open(&dir).unwrap().config;
         assert_eq!(config.film_info, info);
         assert!(config.previous_film.is_some());
