@@ -1522,6 +1522,9 @@ struct AudioReport {
     warnings: Vec<String>,
     inputs: Vec<serde_json::Value>,
     output: Option<serde_json::Value>,
+    /// The output the recording window plays through, with `from`; `None`
+    /// when it plays nothing (the project's output is not connected).
+    playback: Option<serde_json::Value>,
     text: String,
 }
 
@@ -1535,13 +1538,15 @@ fn device_json(device: &DeviceInfo) -> serde_json::Value {
 }
 
 /// Lists the input devices and the default output, checks the project's
-/// input device, and warns about Bluetooth output.
+/// input and output devices, says which output the recording window plays
+/// through, and warns when that is Bluetooth.
 fn audio_devices(project: Option<&Project>) -> AudioReport {
     let mut report = AudioReport {
         checks: Vec::new(),
         warnings: Vec::new(),
         inputs: Vec::new(),
         output: None,
+        playback: None,
         text: String::new(),
     };
     match takewise_media::input_devices() {
@@ -1591,24 +1596,126 @@ fn audio_devices(project: Option<&Project>) -> AudioReport {
             detail: err.to_string(),
         }),
     }
-    match takewise_media::default_output() {
-        Ok(output) => {
-            if output.transport == Transport::Bluetooth {
+    let default = takewise_media::default_output();
+    if let Err(err) = &default {
+        report.warnings.push(format!("no default output: {err}"));
+    }
+    let named = project.and_then(|p| p.config.output.device.as_deref());
+    let outputs = if named.is_some() {
+        takewise_media::output_devices().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // Connected as the window decides it: by the lookup that sets the
+    // players, so a Bluetooth device that briefly lists no configuration
+    // still counts.
+    let connected = named.is_some_and(|name| takewise_media::output_uid(name).is_ok());
+    let playback = playback_report(named, connected, &outputs, default.as_ref().ok());
+    report.checks.extend(playback.check);
+    report.warnings.extend(playback.warnings);
+    report.text.push_str(&playback.text);
+    report.output = default.as_ref().ok().map(device_json);
+    report.playback = playback.json;
+    report
+}
+
+/// What `doctor` says about where the recording window plays the film and
+/// the takes.
+#[derive(Default)]
+struct PlaybackReport {
+    /// The `output` check, for a project that names an output.
+    check: Option<Check>,
+    warnings: Vec<String>,
+    json: Option<serde_json::Value>,
+    text: String,
+}
+
+/// Where the recording window plays: the project's `[output] device`
+/// (`named`) while it is `connected`; nothing while it is not, since the
+/// window never plays through the system output in its place and does not
+/// record; and the system's `default` output when the project names none.
+/// A named output that is not connected fails the `output` check. A
+/// Bluetooth output that plays is a warning: its latency is long and
+/// varies.
+fn playback_report(
+    named: Option<&str>,
+    connected: bool,
+    outputs: &[DeviceInfo],
+    default: Option<&DeviceInfo>,
+) -> PlaybackReport {
+    let describe = |device: &DeviceInfo| format!("{} ({})", device.name, device.transport.as_str());
+    let mut report = PlaybackReport::default();
+    // The device that plays (when it is listed), its name, and whose it is.
+    let playing: Option<(Option<&DeviceInfo>, &str, &str)> = match named {
+        Some(name) if connected => {
+            let device = outputs.iter().find(|o| o.name == name);
+            report.check = Some(Check {
+                name: "output",
+                ok: true,
+                detail: format!(
+                    "{}: the recording window plays the film and the takes there",
+                    device.map_or_else(|| name.to_owned(), describe)
+                ),
+            });
+            Some((device, name, "project"))
+        }
+        Some(name) => {
+            let system = default.map_or_else(String::new, |d| {
+                let late = if d.transport == Transport::Bluetooth {
+                    ", whose delay would put the film's sound late against your voice"
+                } else {
+                    ""
+                };
+                format!(" (now {}{late})", describe(d))
+            });
+            report.check = Some(Check {
+                name: "output",
+                ok: false,
+                detail: format!(
+                    "{name}, the project's output, is not connected, so the recording window plays nothing and does not record; it never plays through the system output{system} in its place. Connect {name}, or pick another output, or System output, in the audio panel (A)"
+                ),
+            });
+            None
+        }
+        None => default.map(|d| (Some(d), d.name.as_str(), "system")),
+    };
+    match playing {
+        Some((device, name, from)) => {
+            let mut json = device.map_or_else(|| json!({ "name": name }), device_json);
+            json["from"] = json!(from);
+            report.json = Some(json);
+            if let Some(device) = device
+                && device.transport == Transport::Bluetooth
+            {
                 report.warnings.push(format!(
                     "output {} is Bluetooth; its latency is long and varies, so record with wired or built-in headphones",
-                    output.name
+                    device.name
                 ));
             }
+            let whose = if from == "project" {
+                "the project's output"
+            } else {
+                "the system output"
+            };
+            let shown = device.map_or_else(|| name.to_owned(), describe);
+            let _ = writeln!(report.text, "Playback: {shown}, {whose}");
+        }
+        None => {
             let _ = writeln!(
                 report.text,
-                "Output: {} ({} Hz, {})",
-                output.name,
-                output.sample_rate,
-                output.transport.as_str()
+                "Playback: nothing, {} is not connected",
+                named.unwrap_or_default()
             );
-            report.output = Some(device_json(&output));
         }
-        Err(err) => report.warnings.push(format!("no default output: {err}")),
+    }
+    if let Some(d) = default {
+        let _ = writeln!(
+            report.text,
+            "System output: {} ({} Hz, {})",
+            d.name,
+            d.sample_rate,
+            d.transport.as_str()
+        );
     }
     report
 }
@@ -1811,6 +1918,7 @@ fn doctor(dir: Option<&Path>) -> Outcome {
             "warnings": devices.warnings,
             "inputs": devices.inputs,
             "output": devices.output,
+            "playback": devices.playback,
         }),
         text,
     );
@@ -1853,6 +1961,101 @@ mod tests {
         assert_eq!(bundle_of_exe(&bin.join("takewise")), Some(app.clone()));
         assert_eq!(bundle_of_exe(&macos.join("takewise")), Some(app));
         assert_eq!(bundle_of_exe(&bin.join("missing")), None);
+    }
+
+    fn device(name: &str, transport: Transport) -> DeviceInfo {
+        DeviceInfo {
+            name: name.to_owned(),
+            sample_rate: 48_000,
+            channels: 2,
+            transport,
+            output_source: takewise_media::OutputSource::Unknown,
+        }
+    }
+
+    #[test]
+    fn a_missing_project_output_fails_and_nothing_plays() {
+        // The issue's setup: the project names the interface, the Mac's
+        // default output is Bluetooth headphones.
+        let sony = device("WH-1000XM5", Transport::Bluetooth);
+        let report = playback_report(Some("RØDECaster Duo"), false, &[], Some(&sony));
+        let check = report.check.expect("an output check");
+        assert!(!check.ok);
+        assert_eq!(check.name, "output");
+        assert!(check.detail.contains("RØDECaster Duo"), "{}", check.detail);
+        assert!(
+            check.detail.contains("WH-1000XM5 (bluetooth)")
+                && check.detail.contains("late against your voice"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(report.json, None);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            report
+                .text
+                .contains("Playback: nothing, RØDECaster Duo is not connected"),
+            "{}",
+            report.text
+        );
+        // A wired default output: still a failure, without the delay.
+        let speakers = device("MacBook Air Speakers", Transport::BuiltIn);
+        let report = playback_report(Some("RØDECaster Duo"), false, &[], Some(&speakers));
+        let check = report.check.expect("an output check");
+        assert!(!check.ok);
+        assert!(!check.detail.contains("late"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_connected_project_output_plays_whatever_the_default() {
+        let duo = device("RØDECaster Duo", Transport::Usb);
+        let sony = device("WH-1000XM5", Transport::Bluetooth);
+        let outputs = [duo.clone(), sony.clone()];
+        let report = playback_report(Some("RØDECaster Duo"), true, &outputs, Some(&sony));
+        let check = report.check.expect("an output check");
+        assert!(check.ok, "{}", check.detail);
+        assert!(
+            check.detail.starts_with("RØDECaster Duo (usb)"),
+            "{}",
+            check.detail
+        );
+        let json = report.json.expect("plays");
+        assert_eq!(json["name"], "RØDECaster Duo");
+        assert_eq!(json["transport"], "usb");
+        assert_eq!(json["from"], "project");
+        // The Bluetooth default is not used, so it is not warned about.
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            report
+                .text
+                .contains("Playback: RØDECaster Duo (usb), the project's output")
+        );
+        assert!(
+            report
+                .text
+                .contains("System output: WH-1000XM5 (48000 Hz, bluetooth)")
+        );
+        // A project that chose Bluetooth headphones gets the warning.
+        let report = playback_report(Some("WH-1000XM5"), true, &outputs, Some(&duo));
+        assert!(report.check.expect("a check").ok);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        // Connected but not listed (no configuration for a moment): named.
+        let report = playback_report(Some("Other"), true, &outputs, Some(&duo));
+        assert_eq!(report.json.expect("plays")["name"], "Other");
+    }
+
+    #[test]
+    fn without_a_project_output_the_system_output_plays() {
+        let sony = device("WH-1000XM5", Transport::Bluetooth);
+        let report = playback_report(None, false, &[], Some(&sony));
+        assert!(report.check.is_none());
+        let json = report.json.expect("plays");
+        assert_eq!(json["name"], "WH-1000XM5");
+        assert_eq!(json["from"], "system");
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("is Bluetooth"));
+        let report = playback_report(None, false, &[], None);
+        assert!(report.check.is_none() && report.json.is_none());
     }
 
     #[test]

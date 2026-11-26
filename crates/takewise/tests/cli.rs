@@ -1144,6 +1144,45 @@ fn doctor_finds_the_tools_with_a_minimal_path() {
     }
 }
 
+/// A project output that is not connected fails `doctor`: the window
+/// would play nothing and not record, rather than play through the
+/// system output (such as Bluetooth headphones).
+#[test]
+fn doctor_fails_when_the_project_output_is_not_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = tmp.path().join("settings.toml");
+    let missing = "Takewise Test Output That Is Never Connected";
+    fs::write(&settings, format!("output = \"{missing}\"\n")).unwrap();
+    let dir = tmp.path().join("promo.takewise");
+    takewise()
+        .env("TAKEWISE_SETTINGS", &settings)
+        .arg("init")
+        .arg(&dir)
+        .arg("--film")
+        .arg(film(tmp.path()))
+        .assert()
+        .success();
+    let (code, value) = json(takewise().arg("doctor").arg(&dir));
+    assert_eq!(code, 1, "{value}");
+    let checks = value["data"]["checks"].as_array().unwrap();
+    let output = checks.iter().find(|c| c["name"] == "output").unwrap();
+    assert_eq!(output["ok"], false, "{output}");
+    assert!(
+        output["detail"].as_str().unwrap().contains(&format!(
+            "{missing}, the project's output, is not connected"
+        )),
+        "{output}"
+    );
+    assert!(value["data"]["playback"].is_null(), "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("output"),
+        "{value}"
+    );
+}
+
 #[test]
 fn doctor_reports_checks() {
     let tmp = tempfile::tempdir().unwrap();

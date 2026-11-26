@@ -219,7 +219,7 @@ One binary, `takewise`. Every command takes the project directory and supports `
 | `takewise export <dir> [--use-proposed] [--format …] [--bit-depth …] [--sample-rate …] [--processing raw\|clean]` | Write `export/narration.wav` or `.flac` and `export/manifest.json`. Refuses (exit 1) a missing or changed film (`film-missing`, `film-changed`), a film `ffprobe` cannot read within 10 s (`film-probe-timeout`) and a state that kept changing while it rendered (`state-changed`). |
 | `takewise calibrate <dir> [--write] [--output <device>]` | Run the loopback latency test; `--write` stores the offset and the device pair. |
 | `takewise models status` / `takewise models install` | Report the speech model's state (`missing`, `partial`, `installed`, `wrong-size`); download it from Hugging Face with progress on stderr, resuming a `.part` file, and install it once its pinned size and SHA-256 match (a mismatch deletes the download). |
-| `takewise doctor [<dir>]` | Check whisper-cli, the model and `ffmpeg` (transcribing 1 s of silence to prove they work together), microphone access, input devices and their sample rates, the output device. |
+| `takewise doctor [<dir>]` | Check whisper-cli, the model and `ffmpeg` (transcribing 1 s of silence to prove they work together), microphone access, input devices and their sample rates, the output the recording window plays through (failing when the project's `[output] device` is not connected, since the window then plays and records nothing rather than use the system output). |
 
 ## Export and Resolve handoff
 

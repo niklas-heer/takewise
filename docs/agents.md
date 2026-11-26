@@ -20,7 +20,7 @@ takewise models install --json
 takewise doctor --json
 ```
 
-`models install` downloads the speech model (1.5 GB) once, resuming an interrupted download, and verifies it; it reports `already-installed` when it is there. `doctor` checks `whisper-cli`, the model, `ffmpeg`, the microphone permission and the audio devices; each failed check in `data.checks` says how to fix it.
+`models install` downloads the speech model (1.5 GB) once, resuming an interrupted download, and verifies it; it reports `already-installed` when it is there. `doctor` checks `whisper-cli`, the model, `ffmpeg`, the microphone permission and the audio devices; each failed check in `data.checks` says how to fix it. With a project, `data.playback` is the output the recording window plays through (`null` while the project's output is not connected, which fails the `output` check: the window then neither plays nor records).
 
 ## 2. Create the project and write the script
 
