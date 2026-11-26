@@ -67,18 +67,27 @@ pub fn warnings(script: &Script, before_s: f64, now_s: f64) -> Vec<FilmWarning> 
     }
     for (idx, line) in script.lines.iter().enumerate() {
         let end = script.slot_end(idx, now_s);
-        if line.start >= now_s || end > now_s + FILM_DURATION_TOLERANCE_S {
-            warnings.push(FilmWarning {
-                code: "slot-past-film-end",
-                line: Some(line.id.clone()),
-                message: format!(
-                    "its slot {}–{} s runs past the film's end at {} s",
-                    ms(line.start),
-                    ms(end),
-                    ms(now_s)
-                ),
-            });
-        }
+        let message = if line.start >= now_s {
+            format!(
+                "it starts at {} s, after the film's end at {} s",
+                ms(line.start),
+                ms(now_s)
+            )
+        } else if end > now_s + FILM_DURATION_TOLERANCE_S {
+            format!(
+                "its slot {}–{} s runs past the film's end at {} s",
+                ms(line.start),
+                ms(end),
+                ms(now_s)
+            )
+        } else {
+            continue;
+        };
+        warnings.push(FilmWarning {
+            code: "slot-past-film-end",
+            line: Some(line.id.clone()),
+            message,
+        });
     }
     warnings
 }
@@ -162,6 +171,10 @@ mod tests {
         assert_eq!(
             found[1].message,
             "its slot 30–45 s runs past the film's end at 40 s"
+        );
+        assert_eq!(
+            found[2].message,
+            "it starts at 45 s, after the film's end at 40 s"
         );
         assert!(
             found[0].message.contains("(-11.5 s)"),
