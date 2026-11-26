@@ -241,7 +241,11 @@ impl RecordingWindow {
     /// used (see [`RecordingWindow::reopen_film`]): a player opened on a
     /// missing output fails.
     pub(super) fn restore_film(&mut self) -> Result<(), String> {
-        let opened = self.media.film_open(&self.project.film_path());
+        let film = self.project.film_path();
+        let opened = self.media.film_open(&film);
+        if opened.is_ok() {
+            self.film_played = (film, self.project.config.film_info.clone());
+        }
         self.media.film_set_gain_db(self.volumes.film);
         self.media.film_set_muted(false);
         self.recorder.rewarm();

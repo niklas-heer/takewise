@@ -40,6 +40,10 @@ pub struct ProjectConfig {
     pub film: PathBuf,
     pub sample_rate: u32,
     pub film_info: FilmInfo,
+    /// The render the project used before `takewise film` (or `status
+    /// --refresh-film`) pointed it at the one it has now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_film: Option<PreviousFilm>,
     #[serde(default)]
     pub input: InputConfig,
     #[serde(default)]
@@ -221,6 +225,21 @@ pub struct FilmInfo {
     pub modified: String,
 }
 
+/// `[previous_film]`: the film a project was pointed away from, and when.
+/// Only the last change is kept; Takewise versions before it ignore the
+/// table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviousFilm {
+    /// The film's path as `film` held it, relative or absolute.
+    pub film: PathBuf,
+    pub duration_s: f64,
+    pub size: u64,
+    /// RFC 3339 modification time.
+    pub modified: String,
+    /// RFC 3339: when the project was pointed at the film it has now.
+    pub replaced_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputConfig {
@@ -300,6 +319,7 @@ impl Project {
             film: film.to_path_buf(),
             sample_rate: 48_000,
             film_info,
+            previous_film: None,
             input: InputConfig::default(),
             record: RecordConfig::default(),
             check: CheckConfig::default(),

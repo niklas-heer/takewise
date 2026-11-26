@@ -32,6 +32,7 @@
 //! is replaced, and both go once the film is ready again. A take player
 //! that failed needs nothing more: the next take opened gets a new one.
 
+use takewise_core as tw;
 use takewise_media::DeviceLookup;
 
 use super::RecordingWindow;
@@ -448,6 +449,19 @@ impl RecordingWindow {
                 "The film could not play ({reason}); Takewise tries again in {pause:.0} s and when the output changes. If this goes on, check the film file."
             ),
             Why::Failed(_) => format!("The film stopped ({reason}); Takewise opens it again."),
+        })
+    }
+
+    /// When the project now has another film than the one playing
+    /// (`takewise film` pointed it at a new render, or measured a changed
+    /// one again): the window keeps the film it opened until it is opened
+    /// again, so it asks to be reopened.
+    pub(super) fn film_replaced_note(&self) -> Option<String> {
+        let (path, info) = &self.film_played;
+        let same = *path == self.project.film_path()
+            && tw::film::same_film(info, &self.project.config.film_info);
+        (!same).then(|| {
+            "The project now uses another render of the film; close and open this window again to play it.".to_owned()
         })
     }
 

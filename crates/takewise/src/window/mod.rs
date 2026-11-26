@@ -667,6 +667,10 @@ pub struct RecordingWindow {
     /// its rescue copy and closes. Audio that came since is refused for
     /// once first, so its narrator hears of it.
     close_refused: Option<(usize, usize)>,
+    /// The film the player has open: its path and measurement. When the
+    /// project's differs (`takewise film` pointed it at another render),
+    /// the window says so until the film is opened again.
+    film_played: (PathBuf, tw::FilmInfo),
 }
 
 impl RecordingWindow {
@@ -696,6 +700,10 @@ impl RecordingWindow {
         let (levels, on_levels) = levels::Levels::new(volumes, window, cx);
         let mut subscriptions = vec![on_quit];
         subscriptions.extend(on_levels);
+        let film_played = (
+            loaded.project.film_path(),
+            loaded.project.config.film_info.clone(),
+        );
         let mut view = Self {
             dir,
             media,
@@ -753,6 +761,7 @@ impl RecordingWindow {
             remembered_for: None,
             rescue_root: None,
             close_refused: None,
+            film_played,
         };
         // A film that never loads counts as failed, as a reopened one does.
         let now = view.media.host_now_s();
@@ -2109,6 +2118,7 @@ impl Render for RecordingWindow {
         let (note, next) = self.prompter_cues();
         // The film's recovery has its own notice, beside any other.
         let film = recorder::join(self.film_status(), self.film_note(now));
+        let film = recorder::join(film, self.film_replaced_note());
         let shown = recorder::join(self.message.clone(), film);
         let prompter = prompter::Prompter {
             film_s,

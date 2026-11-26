@@ -87,9 +87,20 @@ enum Command {
         /// that still lack their takes.
         #[arg(long)]
         repair: bool,
-        /// Re-measure the film and update `film_info`.
+        /// Re-measure the film and update `film_info`, as `film` does
+        /// without --film.
         #[arg(long)]
         refresh_film: bool,
+    },
+    /// Point the project at a new render of its film, keeping the script,
+    /// the takes and the setup; warns when the duration changed or a
+    /// line's slot now runs past the film's end. Without --film, the film
+    /// at the path the project has is measured again.
+    Film {
+        dir: PathBuf,
+        /// The new render (any format ffprobe reads).
+        #[arg(long)]
+        film: Option<PathBuf>,
     },
     /// Edit script.toml.
     Script {
@@ -289,6 +300,7 @@ pub fn run(cli: Cli) -> Result<Outcome, CliError> {
             repair,
             refresh_film,
         } => status(&dir, strict, repair, refresh_film),
+        Command::Film { dir, film } => film_command(&dir, film.as_deref()),
         Command::Script {
             command:
                 ScriptCommand::Set {
@@ -514,13 +526,67 @@ fn models_install() -> Result<Outcome, CliError> {
     ))
 }
 
-pub(crate) fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
-    let film_path = std::fs::canonicalize(film_arg).map_err(|err| {
+/// The film given on the command line, as `project.toml` stores it: an
+/// absolute path with links resolved.
+fn film_arg_path(film_arg: &Path) -> Result<PathBuf, CliError> {
+    std::fs::canonicalize(film_arg).map_err(|err| {
         CliError::Setup(format!(
             "cannot find the film {}: {err}",
             film_arg.display()
         ))
-    })?;
+    })
+}
+
+/// Measures the film (`film_arg`, or the one the project has) and points
+/// the project at it: `takewise film` and `status --refresh-film`.
+fn point_film(dir: &Path, film_arg: Option<&Path>) -> Result<tw::FilmChange, CliError> {
+    let project = Project::open(dir)?;
+    let film = film_arg.map(film_arg_path).transpose()?;
+    let info = film::probe(film.as_deref().unwrap_or(&project.film_path()))?;
+    Ok(tw::set_film(
+        dir,
+        film.as_deref(),
+        &info,
+        jiff::Timestamp::now(),
+    )?)
+}
+
+/// `film`: point the project at a new render, or measure its film again.
+fn film_command(dir: &Path, film_arg: Option<&Path>) -> Result<Outcome, CliError> {
+    let change = point_film(dir, film_arg)?;
+    let now = change.film_info.duration_s;
+    let mut text = match &change.previous {
+        None => format!(
+            "{} already uses {} ({now} s); nothing changed.",
+            dir.display(),
+            change.film.display()
+        ),
+        Some(previous) if previous.film == change.film => format!(
+            "Measured {} again: {now} s (was {} s). The script, the takes and the setup are kept.",
+            change.film.display(),
+            previous.duration_s
+        ),
+        Some(previous) => format!(
+            "{} now uses {} ({now} s), in place of {} ({} s). The script, the takes and the setup are kept.",
+            dir.display(),
+            change.film.display(),
+            previous.film.display(),
+            previous.duration_s
+        ),
+    };
+    text.push('\n');
+    for w in &change.warnings {
+        match &w.line {
+            Some(line) => writeln!(text, "warning: {line}: {} ({})", w.message, w.code),
+            None => writeln!(text, "warning: {} ({})", w.message, w.code),
+        }
+        .ok();
+    }
+    Ok(Outcome::new(&change, text))
+}
+
+pub(crate) fn init(dir: &Path, film_arg: &Path) -> Result<Outcome, CliError> {
+    let film_path = film_arg_path(film_arg)?;
     let info = film::probe(&film_path)?;
     let project = Project::init(dir, &film_path, info)?;
     // New projects export clean (a project without `[export]` stays raw).
@@ -575,13 +641,16 @@ struct FilmStatus {
     info: FilmInfo,
     missing: bool,
     changed: bool,
+    /// The film the project used before the one it has now (`takewise
+    /// film`), and when it was replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous: Option<tw::PreviousFilm>,
 }
 
 fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<Outcome, CliError> {
     let repair = if repair { Some(tw::repair(dir)?) } else { None };
     if refresh_film {
-        let info = film::probe(&Project::open(dir)?.film_path())?;
-        tw::set_film_info(dir, &info)?;
+        point_film(dir, None)?;
     }
     // The script is read once: the version issued is the one folded.
     let (project, script_version) = Project::open_versioned(dir)?;
@@ -596,14 +665,17 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
         state.problems.push(Problem::new(
             None,
             "film-missing",
-            format!("the film {} is missing", film_path.display()),
+            format!(
+                "the film {} is missing; point the project at the film with `takewise film <dir> --film <path>`",
+                film_path.display()
+            ),
         ));
     }
     if changed {
         state.problems.push(Problem::new(
             None,
             "film-changed",
-            "the film changed since it was measured; check the timings, then run `takewise status --refresh-film`",
+            "the film changed since it was measured; check the timings, then run `takewise film <dir>`",
         ));
     }
     let route = current_route(&project);
@@ -637,6 +709,7 @@ fn status(dir: &Path, strict: bool, repair: bool, refresh_film: bool) -> Result<
             info: project.config.film_info.clone(),
             missing,
             changed,
+            previous: project.config.previous_film.clone(),
         },
         state,
         repair,
@@ -723,6 +796,15 @@ fn status_text(project: &Project, data: &StatusData) -> String {
         project.film_duration(),
         data.state.lines.len()
     );
+    if let Some(previous) = &data.film.previous {
+        let _ = writeln!(
+            text,
+            "film replaced {}: was {} ({} s)",
+            previous.replaced_at,
+            previous.film.display(),
+            previous.duration_s
+        );
+    }
     for line in &data.state.lines {
         text.push_str(&line_text(line));
         text.push('\n');

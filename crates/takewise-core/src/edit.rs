@@ -10,10 +10,11 @@ use sha2::{Digest as _, Sha256};
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::error::{Error, Result, io};
+use crate::film::FilmChange;
 use crate::fsutil::{lock, write_atomic};
 use crate::project::{
-    CalibrationInfo, ExportConfig, FilmInfo, PROJECT_FILE, SCRIPT_FILE, SetupInfo, parse_script,
-    read_config, read_script_bytes,
+    CalibrationInfo, ExportConfig, FilmInfo, PROJECT_FILE, PreviousFilm, SCRIPT_FILE, SetupInfo,
+    parse_script, read_config, read_script_bytes,
 };
 use crate::script::validate;
 
@@ -132,29 +133,104 @@ pub fn set_line_field(
     Ok(ScriptVersion::of(edited.as_bytes()))
 }
 
-/// Rewrites `[film_info]` in `project.toml` under the lock, keeping the rest
-/// of the file as it is.
+/// Re-measures the film at the path the project has: [`set_film`] without
+/// a new path, at the current time.
 pub fn set_film_info(dir: &Path, info: &FilmInfo) -> Result<()> {
-    let path = dir.join(PROJECT_FILE);
-    let _guard = lock(dir)?;
-    let text = fs::read_to_string(&path).map_err(io(&path))?;
-    let parse_error = |message: String| Error::Parse {
-        path: path.clone(),
-        message,
-    };
-    let mut doc: DocumentMut = text
-        .parse()
-        .map_err(|err: toml_edit::TomlError| parse_error(err.to_string()))?;
-    let size = i64::try_from(info.size).map_err(|err| parse_error(err.to_string()))?;
-    let table = doc
-        .entry("film_info")
-        .or_insert_with(toml_edit::table)
-        .as_table_like_mut()
-        .ok_or_else(|| parse_error("film_info is not a table".to_owned()))?;
+    set_film(dir, None, info, jiff::Timestamp::now()).map(drop)
+}
+
+/// Points the project at a render of its film: `film` is stored as given
+/// (`None` keeps the path the project has, as does the path it already
+/// resolves to), measured as `info`. Under the lock, writes `film` and
+/// `[film_info]` and records the film before as `[previous_film]`, stamped
+/// `at`; when it is the same film measured the same, nothing is written.
+/// The script, the takes, the ledger and the setup stay as they are. The
+/// warnings compare the script, read under the lock, with the new film.
+pub fn set_film(
+    dir: &Path,
+    film: Option<&Path>,
+    info: &FilmInfo,
+    at: jiff::Timestamp,
+) -> Result<FilmChange> {
+    let mut change = None;
+    edit_project_when(dir, |text, doc| {
+        let config: crate::ProjectConfig = toml::from_str(text).map_err(|err| err.to_string())?;
+        let resolved = if config.film.is_absolute() {
+            config.film.clone()
+        } else {
+            dir.join(&config.film)
+        };
+        let resolved = fs::canonicalize(&resolved).unwrap_or(resolved);
+        let stored = match film {
+            Some(film) if film != resolved => film.to_path_buf(),
+            _ => config.film.clone(),
+        };
+        let moved = stored != config.film;
+        let changed = moved || !crate::film::same_film(&config.film_info, info);
+        let script = crate::project::read_script(dir).unwrap_or_default();
+        let before = &config.film_info;
+        let previous = changed.then(|| PreviousFilm {
+            film: config.film.clone(),
+            duration_s: before.duration_s,
+            size: before.size,
+            modified: before.modified.clone(),
+            replaced_at: jiff::Timestamp::from_second(at.as_second())
+                .unwrap_or(at)
+                .to_string(),
+        });
+        change = Some(FilmChange {
+            film: stored.clone(),
+            film_info: info.clone(),
+            changed,
+            previous: previous.clone(),
+            warnings: crate::film::warnings(&script, before.duration_s, info.duration_s),
+        });
+        let Some(previous) = previous else {
+            return Ok(false);
+        };
+        if moved {
+            let path = stored
+                .to_str()
+                .ok_or_else(|| format!("the film's path {} is not UTF-8", stored.display()))?;
+            set_value(doc.as_table_mut(), "film", Some(Value::from(path)));
+        }
+        write_film_info(table_like(doc, "film_info")?, info)?;
+        let old = table_like(doc, "previous_film")?;
+        let path = previous.film.to_str().ok_or_else(|| {
+            format!(
+                "the previous film's path {} is not UTF-8",
+                previous.film.display()
+            )
+        })?;
+        set_value(old, "film", Some(Value::from(path)));
+        write_film_info(
+            old,
+            &FilmInfo {
+                duration_s: previous.duration_s,
+                size: previous.size,
+                modified: previous.modified.clone(),
+            },
+        )?;
+        set_value(
+            old,
+            "replaced_at",
+            Some(Value::from(previous.replaced_at.as_str())),
+        );
+        Ok(true)
+    })?;
+    change.ok_or_else(|| Error::Parse {
+        path: dir.join(PROJECT_FILE),
+        message: "project.toml could not be read".to_owned(),
+    })
+}
+
+/// A film's measurement: `duration_s`, `size` and `modified`.
+fn write_film_info(table: &mut dyn TableLike, info: &FilmInfo) -> Result<(), String> {
+    let size = i64::try_from(info.size).map_err(|err| err.to_string())?;
     set_value(table, "duration_s", Some(Value::from(info.duration_s)));
     set_value(table, "size", Some(Value::from(size)));
     set_value(table, "modified", Some(Value::from(info.modified.as_str())));
-    write_atomic(&path, doc.to_string().as_bytes())
+    Ok(())
 }
 
 /// Sets `[input] latency_offset_ms` in `project.toml` under the lock,
@@ -894,6 +970,134 @@ text = "Third."
                 .unwrap()
                 .starts_with("# my film\n")
         );
+    }
+
+    #[test]
+    fn set_film_points_at_a_new_render_and_keeps_the_rest() {
+        let (_tmp, dir) = project();
+        set_setup(
+            &dir,
+            &SetupInfo {
+                date: "2026-11-23".to_owned(),
+                input: "Duo".to_owned(),
+                channel: 2,
+                output: "Duo".to_owned(),
+                room_floor_dbfs: None,
+                speech_to_noise_db: None,
+                from: None,
+            },
+        )
+        .unwrap();
+        let path = dir.join(PROJECT_FILE);
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("# my film\n{original}")).unwrap();
+        let before = Project::open(&dir).unwrap().config;
+        let script_before = script_text(&dir);
+        let at: jiff::Timestamp = "2026-11-26T10:00:00.5Z".parse().unwrap();
+
+        // A shorter render elsewhere: "today" (5 s, up to "question")
+        // now runs past its end, and "question" (10 s) starts after it.
+        let info = FilmInfo {
+            duration_s: 9.5,
+            size: 2,
+            modified: "2026-11-26T09:00:00Z".to_owned(),
+        };
+        let change = set_film(&dir, Some(Path::new("/renders/v2.mp4")), &info, at).unwrap();
+        assert!(change.changed);
+        assert_eq!(change.film, Path::new("/renders/v2.mp4"));
+        let previous = PreviousFilm {
+            film: "film.mp4".into(),
+            duration_s: 51.5,
+            size: 1,
+            modified: "2026-11-22T20:05:11Z".to_owned(),
+            replaced_at: "2026-11-26T10:00:00Z".to_owned(),
+        };
+        assert_eq!(change.previous.as_ref(), Some(&previous));
+        let codes: Vec<_> = change
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.line.as_deref()))
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("film-duration-changed", None),
+                ("slot-past-film-end", Some("today")),
+                ("slot-past-film-end", Some("question")),
+            ]
+        );
+
+        let config = Project::open(&dir).unwrap().config;
+        assert_eq!(config.film, Path::new("/renders/v2.mp4"));
+        assert_eq!(config.film_info, info);
+        assert_eq!(config.previous_film, Some(previous));
+        // The setup, the script and the file's comments stay.
+        assert_eq!(config.setup, before.setup);
+        assert_eq!(config.input, before.input);
+        assert_eq!(script_text(&dir), script_before);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# my film\n")
+        );
+
+        // The same film again, measured the same: nothing is written.
+        let written = fs::read_to_string(&path).unwrap();
+        let again = set_film(&dir, Some(Path::new("/renders/v2.mp4")), &info, at).unwrap();
+        assert!(!again.changed);
+        assert_eq!(again.previous, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        let kept = set_film(&dir, None, &info, at).unwrap();
+        assert!(!kept.changed);
+        assert_eq!(kept.film, Path::new("/renders/v2.mp4"));
+    }
+
+    #[test]
+    fn set_film_keeps_a_relative_path_to_the_same_file() {
+        let (tmp, dir) = project();
+        // `film = "film.mp4"`, a file in the project folder.
+        let film = dir.join("film.mp4");
+        fs::write(&film, b"film").unwrap();
+        let canonical = fs::canonicalize(&film).unwrap();
+        let info = FilmInfo {
+            duration_s: 52.0,
+            size: 4,
+            modified: "2026-11-26T09:00:00Z".to_owned(),
+        };
+        let change = set_film(&dir, Some(&canonical), &info, jiff::Timestamp::now()).unwrap();
+        assert!(change.changed, "measured differently");
+        assert_eq!(change.film, Path::new("film.mp4"));
+        let config = Project::open(&dir).unwrap().config;
+        assert_eq!(config.film, Path::new("film.mp4"));
+        assert_eq!(config.film_info, info);
+        let previous = config.previous_film.unwrap();
+        assert_eq!(previous.film, Path::new("film.mp4"));
+        assert!((previous.duration_s - 51.5).abs() < f64::EPSILON);
+        drop(tmp);
+    }
+
+    #[test]
+    fn set_film_writes_into_an_inline_film_info() {
+        let (_tmp, dir) = project();
+        let path = dir.join(PROJECT_FILE);
+        let text = fs::read_to_string(&path).unwrap();
+        let start = text.find("[film_info]").unwrap();
+        let end = text[start..].find("\n\n").map_or(text.len(), |n| start + n);
+        // An inline table comes before the first [table].
+        let inline =
+            "film_info = { duration_s = 51.5, size = 1, modified = \"2026-11-22T20:05:11Z\" }\n";
+        let text = format!("{inline}{}{}", &text[..start], &text[end..]);
+        fs::write(&path, &text).unwrap();
+        assert_eq!(Project::open(&dir).unwrap().config.film_info.size, 1);
+        let info = FilmInfo {
+            duration_s: 60.0,
+            size: 3,
+            modified: "2026-11-26T09:00:00Z".to_owned(),
+        };
+        set_film(&dir, None, &info, jiff::Timestamp::now()).unwrap();
+        let config = Project::open(&dir).unwrap().config;
+        assert_eq!(config.film_info, info);
+        assert!(config.previous_film.is_some());
     }
 
     #[test]

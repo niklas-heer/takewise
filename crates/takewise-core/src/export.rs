@@ -687,19 +687,22 @@ fn probe_timeout_refusal() -> Refusal {
 }
 
 /// Durations closer than this are the same film.
-const FILM_DURATION_TOLERANCE_S: f64 = 1e-3;
+pub(crate) const FILM_DURATION_TOLERANCE_S: f64 = 1e-3;
 
 /// Why the film no longer matches what the project measured, if it does
 /// not: `film-missing` or `film-changed`.
 fn film_refusal(project: &Project, film: &FilmOnDisk) -> Option<Refusal> {
     let info = &project.config.film_info;
-    let refresh = "check the timings, then run `takewise status --refresh-film`";
+    let refresh = "check the timings, then run `takewise film <dir>` to accept it";
     match film {
         FilmOnDisk::ProbeTimedOut => Some(probe_timeout_refusal()),
         FilmOnDisk::Missing => Some(Refusal {
             code: "film-missing",
             lines: Vec::new(),
-            message: format!("the film {} is missing", project.film_path().display()),
+            message: format!(
+                "the film {} is missing; point the project at the film with `takewise film <dir> --film <path>`",
+                project.film_path().display()
+            ),
         }),
         FilmOnDisk::Found {
             size,
@@ -885,7 +888,7 @@ fn film_moved(project: &Project, started: &FilmOnDisk, now: &FilmOnDisk) -> Opti
         FilmOnDisk::Found { .. } => Refusal {
             code: "film-changed",
             lines: Vec::new(),
-            message: "the film changed while the export rendered; check the timings, then run `takewise status --refresh-film`".to_owned(),
+            message: "the film changed while the export rendered; check the timings, then run `takewise film <dir>` to accept it".to_owned(),
         },
     })
 }

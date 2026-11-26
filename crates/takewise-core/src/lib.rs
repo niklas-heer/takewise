@@ -8,6 +8,7 @@ pub mod edit;
 pub mod error;
 pub mod export;
 pub mod ffmpeg;
+pub mod film;
 pub mod fsutil;
 pub mod ledger;
 pub mod models;
@@ -36,7 +37,7 @@ pub mod words;
 pub use check::Transcript;
 pub use edit::{
     Field, ScriptVersion, Volumes, clear_output_device, script_version, set_calibration,
-    set_export, set_film_info, set_latency_offset, set_line_field, set_route, set_setup,
+    set_export, set_film, set_film_info, set_latency_offset, set_line_field, set_route, set_setup,
     set_volumes,
 };
 pub use error::{Error, Result};
@@ -44,6 +45,7 @@ pub use export::{
     ExportOptions, ExportReport, ExportSettings, ExportWarning, FilmOnDisk, ManifestLine,
     ManifestWord, Refusal, export, narration_file,
 };
+pub use film::{FilmChange, FilmWarning};
 pub use fsutil::{ProjectLock, lock, write_atomic};
 pub use ledger::{
     Checked, Chosen, Event, EventKind, Judged, Ledger, PassagePiece, Reason, Recorded, Snapshot,
@@ -57,7 +59,7 @@ pub use passage::{
 pub use permission::{MicPermission, mic_advice};
 pub use project::{
     CalibrationInfo, CheckConfig, ExportConfig, ExportFormat, FilmInfo, InputConfig, MonitorConfig,
-    OutputConfig, Processing, Project, ProjectConfig, RecordConfig, SetupInfo,
+    OutputConfig, PreviousFilm, Processing, Project, ProjectConfig, RecordConfig, SetupInfo,
 };
 pub use route::{
     Route, calibration_stale, effective_latency_offset, load_defaults, save_defaults,

@@ -2076,6 +2076,37 @@ fn film_of(f: &Fixture) -> PathBuf {
     Project::open(&f.dir).expect("project").film_path()
 }
 
+#[gpui_kit::test]
+fn a_new_render_asks_for_the_window_to_be_opened_again(cx: &mut TestAppContext) {
+    // `takewise film` points the open project at another render: the
+    // player keeps the film it opened, and the window says so until the
+    // film is opened again, which opens the new one.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    let replaced = |cx: &mut TestAppContext| {
+        f.view
+            .read_with(cx, |view, _| view.film_replaced_note().unwrap_or_default())
+    };
+    assert_eq!(replaced(cx), "");
+    let render = f.dir.join("film-v2.mp4");
+    fs::write(&render, b"").expect("film");
+    let info = FilmInfo {
+        duration_s: 21.0,
+        size: 0,
+        modified: "2026-11-26T00:00:00Z".to_owned(),
+    };
+    tw::set_film(&f.dir, Some(&render), &info, jiff::Timestamp::now()).expect("set film");
+    f.view.update(cx, |view, _| view.reload());
+    assert!(
+        replaced(cx).contains("another render of the film"),
+        "{}",
+        replaced(cx)
+    );
+    let reopened = f.view.update(cx, |view, _| view.restore_film());
+    assert_eq!(reopened, Ok(()));
+    assert_eq!(f.media.0.borrow().films.last(), Some(&render));
+    assert_eq!(replaced(cx), "");
+}
+
 /// The headphones go off and on again between two ticks: the devices
 /// changed, and a player on them failed, as macOS fails it.
 fn off_and_on(f: &Fixture, player: &str) {

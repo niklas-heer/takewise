@@ -304,9 +304,9 @@ fn export_refuses_a_changed_or_missing_film() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("film-changed"))
-        .stderr(predicate::str::contains("--refresh-film"));
+        .stderr(predicate::str::contains("takewise film <dir>"));
 
-    // After --refresh-film it exports.
+    // After --refresh-film (as `takewise film <dir>`) it exports.
     takewise()
         .arg("status")
         .arg(&dir)
@@ -315,6 +315,10 @@ fn export_refuses_a_changed_or_missing_film() {
         .success();
     let (code, value) = export(&dir);
     assert_eq!(code, 0, "{value}");
+    // The render it replaced is on record.
+    let data = status(&dir);
+    assert_eq!(data["film"]["previous"]["duration_s"], 51.5, "{data}");
+    assert_eq!(data["film"]["info"]["duration_s"], 52.5, "{data}");
 
     fs::remove_file(&film).unwrap();
     let (code, value) = export(&dir);
@@ -324,6 +328,118 @@ fn export_refuses_a_changed_or_missing_film() {
         "{value}"
     );
     assert!(!dir.join("export/manifest.json").exists());
+}
+
+#[test]
+fn film_points_the_project_at_a_new_render() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = init(tmp.path());
+    fs::write(dir.join("script.toml"), SCRIPT).unwrap();
+    let take = record_take(&dir, "hook");
+    takewise()
+        .arg("choose")
+        .arg(&dir)
+        .args(["hook", &take.take.to_string()])
+        .assert()
+        .success();
+    let raw = ["--processing", "raw"];
+
+    // The film is rendered again, a second longer, under another name.
+    fs::remove_file(tmp.path().join("film.wav")).unwrap();
+    let v2 = tmp.path().join("film-v2.wav");
+    write_take_wav(&v2, &vec![0; 8_000 * 105 / 2], 8_000).unwrap();
+    takewise()
+        .arg("export")
+        .arg(&dir)
+        .args(raw)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("film-missing"))
+        .stderr(predicate::str::contains(
+            "takewise film <dir> --film <path>",
+        ));
+
+    let (code, value) = json(takewise().arg("film").arg(&dir).arg("--film").arg(&v2));
+    assert_eq!(code, 0, "{value}");
+    let data = &value["data"];
+    assert_eq!(data["changed"], true, "{value}");
+    assert_eq!(
+        data["film"],
+        fs::canonicalize(&v2).unwrap().to_str().unwrap()
+    );
+    assert_eq!(data["film_info"]["duration_s"], 52.5);
+    assert_eq!(data["previous"]["duration_s"], 51.5);
+    assert!(
+        data["previous"]["film"]
+            .as_str()
+            .unwrap()
+            .ends_with("film.wav")
+    );
+    assert!(data["previous"]["replaced_at"].is_string());
+    assert_eq!(data["warnings"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(data["warnings"][0]["code"], "film-duration-changed");
+
+    // The take and its choice are kept, and the project exports again.
+    let data = status(&dir);
+    assert_eq!(data["film"]["changed"], false, "{data}");
+    assert_eq!(data["film"]["missing"], false, "{data}");
+    assert_eq!(data["film"]["previous"]["duration_s"], 51.5, "{data}");
+    assert_eq!(data["problems"], Value::Array(Vec::new()), "{data}");
+    assert_eq!(data["lines"][0]["chosen"]["take"], take.take);
+    takewise()
+        .arg("status")
+        .arg(&dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("film replaced"));
+    let (code, value) = json(takewise().arg("export").arg(&dir).args(raw));
+    assert_eq!(code, 0, "{value}");
+
+    // A render shorter than the line's start: said, in text and JSON.
+    let v3 = tmp.path().join("film-v3.wav");
+    write_take_wav(&v3, &vec![0; 8_000 * 9], 8_000).unwrap();
+    takewise()
+        .arg("film")
+        .arg(&dir)
+        .arg("--film")
+        .arg(&v3)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("warning: hook:"))
+        .stdout(predicate::str::contains("slot-past-film-end"))
+        .stdout(predicate::str::contains("film-duration-changed"));
+    // The same film again changes nothing, and still says what does not fit.
+    let (code, value) = json(takewise().arg("film").arg(&dir).arg("--film").arg(&v3));
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["changed"], false, "{value}");
+    assert_eq!(value["data"].get("previous"), None, "{value}");
+    assert_eq!(value["data"]["warnings"][0]["code"], "slot-past-film-end");
+    assert_eq!(value["data"]["warnings"][0]["line"], "hook");
+    let (code, value) = json(takewise().arg("film").arg(&dir));
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["data"]["changed"], false, "{value}");
+    assert_eq!(status(&dir)["film"]["previous"]["duration_s"], 52.5);
+
+    // A film that cannot be found, or a folder that is no project, is a
+    // usage error that changes nothing.
+    let (code, value) = json(
+        takewise()
+            .arg("film")
+            .arg(&dir)
+            .arg("--film")
+            .arg(tmp.path().join("nope.mp4")),
+    );
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(status(&dir)["film"]["info"]["duration_s"], 9.0);
+    let (code, value) = json(
+        takewise()
+            .arg("film")
+            .arg(tmp.path())
+            .arg("--film")
+            .arg(&v2),
+    );
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["error"]["code"], "not-a-project");
 }
 
 #[test]
