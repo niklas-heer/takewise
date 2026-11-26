@@ -400,8 +400,9 @@ impl RecordingWindow {
     /// device set, confirmed and not failing; or, with none configured,
     /// the players on the system output and one there (one property read).
     /// No listing, and nothing set; not before the latest device change
-    /// has been acted on.
-    pub(super) fn route_usable(&self) -> bool {
+    /// has been acted on. `default` is the system output's object, read
+    /// once by the caller (only looked at on the system output).
+    pub(super) fn route_usable(&self, default: DeviceLookup) -> bool {
         if self.route_due || self.devices_watched != self.media.device_generation() {
             return false;
         }
@@ -414,10 +415,7 @@ impl RecordingWindow {
                     && self.output_missing.is_none()
                     && matches!(self.applied_device, Some((_, Some(_))))
             }
-            None => {
-                self.film_output.is_none()
-                    && matches!(self.media.default_output_object(), DeviceLookup::Present(_))
-            }
+            None => self.film_output.is_none() && matches!(default, DeviceLookup::Present(_)),
         }
     }
 
@@ -667,6 +665,16 @@ impl RecordingWindow {
         let now = self.media.host_now_s();
         let hold = if self.recorder.playback_waiting(now) {
             match self.sync_output() {
+                // On the system output, only once there is one.
+                Ok(Ready::Yes)
+                    if self.film_output.is_none()
+                        && !matches!(
+                            self.media.default_output_object(),
+                            DeviceLookup::Present(_)
+                        ) =>
+                {
+                    StartHold::Wait
+                }
                 Ok(Ready::Yes) => StartHold::Go,
                 Ok(Ready::Pending) => StartHold::Wait,
                 Err(problem) => {

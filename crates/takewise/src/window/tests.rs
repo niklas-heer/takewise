@@ -2319,7 +2319,7 @@ fn a_failed_film_waits_for_a_confirmed_output(cx: &mut TestAppContext) {
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
     assert_eq!(
         film_status(cx, &f),
-        "The film is not ready (failed; it waits for its output); try again in a moment."
+        "The film is not ready; try again once it is back."
     );
     f.media.0.borrow_mut().lookups_fail = false;
     f.media.set_now(115.0);
@@ -2399,7 +2399,10 @@ fn a_reopen_that_failed_backs_off_and_retries_on_a_change(cx: &mut TestAppContex
     // Space says why, and tries nothing sooner.
     press(cx, f.window, &["space"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
-    assert!(film_status(cx, &f).contains("The film is not ready (no; it is being opened again)"));
+    assert_eq!(
+        film_status(cx, &f),
+        "The film is not ready; try again once it is back."
+    );
     assert!(
         message(cx, &f.view).contains("Recorded"),
         "the take's result stays"
@@ -2559,7 +2562,7 @@ fn space_on_a_slow_reopen_lets_it_load(cx: &mut TestAppContext) {
     press(cx, f.window, &["space"]);
     assert_eq!(
         film_status(cx, &f),
-        "The film is not ready (still loading); try again in a moment."
+        "The film is not ready; try again once it is back."
     );
     f.media.set_now(104.1);
     frame(cx, f.window);
@@ -2693,7 +2696,7 @@ fn a_silent_switch_of_the_default_restarts_a_loading_film(cx: &mut TestAppContex
         fake.no_default_output = true;
         fake.generation += 1;
     }
-    f.media.set_now(110.6);
+    f.media.set_now(111.3);
     frame(cx, f.window);
     let note = film_note(cx, &f);
     assert!(note.contains("once its output is back"), "{note}");
@@ -2756,10 +2759,10 @@ fn a_film_failing_as_its_device_goes_is_not_reopened_on_it(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
-fn the_films_status_follows_what_keeps_it_from_opening(cx: &mut TestAppContext) {
-    // Space while the phones cannot be read: it waits for its output.
-    // Readable again, but opening fails: the status says so without
-    // another key.
+fn the_films_notice_follows_what_keeps_it_from_opening(cx: &mut TestAppContext) {
+    // Space while the phones cannot be read: the status says to wait, the
+    // notice that it waits for its output. Readable again, but opening
+    // fails: the notice says so without another key; the status stays.
     let f = on_test_phones(cx);
     {
         let mut fake = f.media.0.borrow_mut();
@@ -2768,11 +2771,16 @@ fn the_films_status_follows_what_keeps_it_from_opening(cx: &mut TestAppContext) 
     }
     f.media.set_now(100.0);
     frame(cx, f.window);
+    plug(&f, "USB Mic");
+    f.media.set_now(100.05);
+    frame(cx, f.window);
     press(cx, f.window, &["space"]);
     assert_eq!(
         film_status(cx, &f),
-        "The film is not ready (failed; it waits for its output); try again in a moment."
+        "The film is not ready; try again once it is back."
     );
+    let note = film_note(cx, &f);
+    assert!(note.contains("once its output is back"), "{note}");
     {
         let mut fake = f.media.0.borrow_mut();
         fake.film_open_error = Some("no".to_owned());
@@ -2784,7 +2792,112 @@ fn the_films_status_follows_what_keeps_it_from_opening(cx: &mut TestAppContext) 
     }
     assert_eq!(
         film_status(cx, &f),
-        "The film is not ready (no; it is being opened again); try again in a moment."
+        "The film is not ready; try again once it is back."
+    );
+    let note = film_note(cx, &f);
+    assert!(
+        note.contains("Could not open the film again (no)"),
+        "{note}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_retry_reads_the_device_before_it_opens(cx: &mut TestAppContext) {
+    // A film that failed twice waits out its pause; meanwhile the phones
+    // go and CoreAudio does not say so yet. At the retry, one read finds
+    // them gone: nothing is opened on them.
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().film_failed = Some("Cannot decode".to_owned());
+    for at in [100.0, 100.05] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    f.media.0.borrow_mut().film_failed = Some("Cannot decode".to_owned());
+    for at in [100.1, 100.15] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    let opened = films(&f);
+    unplug_quietly(&f, "Test Phones");
+    for at in [101.2, 101.3, 104.0] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    assert_eq!(films(&f), opened, "not on the vanished phones");
+    let note = film_note(cx, &f);
+    assert!(note.contains("once its output is back"), "{note}");
+    plug(&f, "Test Phones");
+    f.media.set_now(105.0);
+    frame(cx, f.window);
+    assert_eq!(films(&f), opened + 1, "opened once they are back");
+}
+
+#[gpui_kit::test]
+fn a_queued_playback_waits_for_a_system_output(cx: &mut TestAppContext) {
+    // P while a reopened film loads on the system output; the last output
+    // goes (no CoreAudio event) as the film turns ready: the playback does
+    // not start with nowhere to play.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    record_take(cx, &f);
+    reopen_on_system_output(cx, &f, 200.0);
+    f.media.set_now(200.1);
+    press(cx, f.window, &["p"]);
+    frame(cx, f.window);
+    let plays = f.media.0.borrow().take_plays.len();
+    {
+        let mut fake = f.media.0.borrow_mut();
+        fake.no_default_output = true;
+        fake.film_loading = false;
+    }
+    for at in [200.2, 200.3, 200.4] {
+        f.media.set_now(at);
+        frame(cx, f.window);
+    }
+    assert_eq!(f.media.0.borrow().take_plays.len(), plays, "not started");
+}
+
+#[gpui_kit::test]
+fn a_default_switch_as_the_film_turns_ready_still_restarts_it(cx: &mut TestAppContext) {
+    // The reopened film turns ready in the very tick the default becomes
+    // another device: it is opened again on that one.
+    let f = open(cx, &[(DEVICE, 48_000)]);
+    reopen_on_system_output(cx, &f, 100.0);
+    let opened = films(&f);
+    switch_default_silently(&f);
+    f.media.0.borrow_mut().film_loading = false;
+    f.media.set_now(100.5);
+    frame(cx, f.window);
+    assert_eq!(films(&f), opened + 1, "opened again on the new default");
+}
+
+#[gpui_kit::test]
+fn a_failure_is_not_said_to_wait_for_the_output_while_it_is_read_again(cx: &mut TestAppContext) {
+    // In the frame the film fails, its route is only being read again: the
+    // notice does not say it waits for its output.
+    let f = on_test_phones(cx);
+    f.media.0.borrow_mut().film_failed = Some("failed".to_owned());
+    f.media.set_now(100.0);
+    frame(cx, f.window);
+    let note = film_note(cx, &f);
+    assert!(!note.contains("once its output is back"), "{note}");
+    assert!(note.contains("The film stopped (failed)"), "{note}");
+}
+
+#[gpui_kit::test]
+fn r_blocked_after_a_warned_take_says_the_warning_once(cx: &mut TestAppContext) {
+    let f = on_test_phones(cx);
+    warned_take(cx, &f, 100.0);
+    f.view.update(cx, |view, _| {
+        view.script_problem = Some("The script has a problem.".to_owned());
+    });
+    f.media.set_now(101.0);
+    press(cx, f.window, &["r"]);
+    assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    let said = message(cx, &f.view);
+    assert_eq!(
+        said.matches("Test Phones was disconnected").count(),
+        1,
+        "once: {said}"
     );
 }
 
@@ -2947,7 +3060,7 @@ fn a_failed_read_of_the_phones_does_not_block_the_system_output(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
-fn space_on_a_film_that_keeps_failing_gives_its_reason(cx: &mut TestAppContext) {
+fn space_on_a_film_that_keeps_failing_leaves_the_reason_to_the_notice(cx: &mut TestAppContext) {
     let f = on_test_phones(cx);
     f.media.0.borrow_mut().film_failed = Some("Cannot decode".to_owned());
     f.media.set_now(100.0);
@@ -2961,10 +3074,13 @@ fn space_on_a_film_that_keeps_failing_gives_its_reason(cx: &mut TestAppContext) 
     frame(cx, f.window);
     press(cx, f.window, &["space"]);
     assert!(!f.view.read_with(cx, |view, _| view.recorder.is_recording()));
+    // The notice gives the reason and the countdown; the status only says
+    // to wait for it.
     assert_eq!(
         film_status(cx, &f),
-        "The film is not ready (Cannot decode; it is being opened again); try again in a moment."
+        "The film is not ready; try again once it is back."
     );
+    assert!(film_note(cx, &f).contains("could not play (Cannot decode)"));
 }
 
 #[gpui_kit::test]

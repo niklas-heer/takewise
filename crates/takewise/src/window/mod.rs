@@ -756,7 +756,7 @@ impl RecordingWindow {
         };
         // A film that never loads counts as failed, as a reopened one does.
         let now = view.media.host_now_s();
-        let identity = view.route_identity();
+        let identity = view.current_identity();
         view.film.opened(now, identity);
         // The levels in use, within their ranges, are what takes play at.
         view.volumes.write_into(&mut view.project.config);
@@ -1487,10 +1487,12 @@ impl RecordingWindow {
         // the next one starts, or with why it cannot.
         let warning = self.take_warning.take();
         self.recorder.stop_playback(&mut *self.media);
+        let before = self.message.clone();
         self.start_take();
-        // Refused by the film: the result that carries the warning is
-        // still the message, with the film's status beside it.
-        if warning.is_some() && !self.film_refused_start() {
+        // Joined only when the start said something new (or cleared the
+        // message): refused before that, the result that carries the
+        // warning is still the message.
+        if warning.is_some() && (self.message != before || before.is_none()) {
             self.message = recorder::join(warning, self.message.take());
             self.take_result.clone_from(&self.message);
         }

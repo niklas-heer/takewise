@@ -113,11 +113,13 @@ pub struct Recovery {
     settles_at: Option<f64>,
     /// The output it was last tried on.
     tried: Option<Identity>,
-    /// Whether the route was usable at the last tick.
-    was_usable: bool,
-    /// The route is read afresh after a failure: its becoming usable again
-    /// then is no reason to skip the pause.
-    reconfirming: bool,
+    /// The route as this tick saw it, once, for both what recovery does
+    /// and what it says: whether it is usable, and its identity (only
+    /// read while a film is set aside or recovering).
+    route: Option<(bool, Identity)>,
+    /// When its route was marked to be read afresh after a failure: until
+    /// a later tick has read it, it is said to be opening again.
+    rereading_since: Option<f64>,
     /// Why it is not open, until it is ready again.
     why: Option<Why>,
     /// What could not start on it, until it is ready.
@@ -134,8 +136,8 @@ impl Default for Recovery {
             loading: None,
             settles_at: None,
             tried: None,
-            was_usable: true,
-            reconfirming: false,
+            route: None,
+            rereading_since: None,
             why: None,
             refused: None,
         }
@@ -183,6 +185,7 @@ impl RecordingWindow {
     /// player failed, and opens the film again once that can work.
     pub(super) fn recover_players(&mut self, now: f64) {
         self.settle_film(now);
+        self.observe_route(now);
         // A failed player set aside is not asked again every tick.
         let failure = (!self.film.set_aside || self.calibrating.is_some())
             .then(|| self.media.film_failure())
@@ -217,8 +220,8 @@ impl RecordingWindow {
     }
 
     /// The output the window has set, as recovery tells devices apart (see
-    /// [`Identity`]).
-    pub(super) fn route_identity(&self) -> Identity {
+    /// [`Identity`]); `default` is the system output's object.
+    fn route_identity(&self, default: DeviceLookup) -> Identity {
         match &self.applied_device {
             Some((uid, object)) if self.film_output.is_some() => Identity {
                 uid: Some(uid.clone()),
@@ -226,12 +229,47 @@ impl RecordingWindow {
             },
             _ => Identity {
                 uid: None,
-                object: match self.media.default_output_object() {
+                object: match default {
                     DeviceLookup::Present(object) => Some(object),
                     DeviceLookup::Absent | DeviceLookup::Unknown => None,
                 },
             },
         }
+    }
+
+    /// The output the film is opened on now (one read of the system
+    /// output's object, when it is in use).
+    pub(super) fn current_identity(&self) -> Identity {
+        let default = if self.film_output.is_none() {
+            self.media.default_output_object()
+        } else {
+            DeviceLookup::Unknown
+        };
+        self.route_identity(default)
+    }
+
+    /// Takes this tick's one look at the route, while a film is set aside
+    /// or recovering (nothing is read during an ordinary first load).
+    fn observe_route(&mut self, now: f64) {
+        if !self.film.set_aside && self.film.attempts == 0 {
+            self.film.route = None;
+            return;
+        }
+        let default = if self.film_output.is_none() {
+            self.media.default_output_object()
+        } else {
+            DeviceLookup::Unknown
+        };
+        let usable = self.route_usable(default);
+        self.film.route = Some((usable, self.route_identity(default)));
+        if self.film.rereading_since.is_some_and(|since| now > since) {
+            self.film.rereading_since = None;
+        }
+    }
+
+    /// Whether the route is usable, as this tick saw it.
+    fn seen_usable(&self) -> bool {
+        self.film.route.as_ref().is_some_and(|(usable, _)| *usable)
     }
 
     /// While a film loads. Once it is ready, what it said goes. A reopened film still loading whose
@@ -243,15 +281,19 @@ impl RecordingWindow {
             self.film.refused = None;
         }
         let (since, identity) = self.film.loading.clone()?;
+        // Another output, even as it turns ready: opened again on it.
+        if self.film.attempts > 0
+            && let Some((_, current)) = &self.film.route
+            && current.object.is_some()
+            && *current != identity
+        {
+            self.film.attempts -= 1;
+            self.put_film_aside();
+            return None;
+        }
         if self.media.film_ready() {
             self.film.loading = None;
             self.film.why = None;
-            return None;
-        }
-        let current = self.route_identity();
-        if self.film.attempts > 0 && current.object.is_some() && current != identity {
-            self.film.attempts -= 1;
-            self.put_film_aside();
             return None;
         }
         let timeout = (LOAD_TIMEOUT_S * f64::from(self.film.attempts.max(1))).min(LONGEST_LOAD_S);
@@ -317,23 +359,33 @@ impl RecordingWindow {
         // Its device may have just gone: not reopened on the confirmation
         // from before.
         self.reconfirm_route();
-        self.film.reconfirming = true;
+        self.film.rereading_since = Some(now);
+        if let Some((usable, _)) = &mut self.film.route {
+            *usable = false;
+        }
     }
 
     /// Opens the film again, as the window opens it, once the route is
-    /// usable: at once when it became usable or another output is set,
-    /// else when the pause is over.
+    /// usable and its device confirmed: at once when another output is set,
+    /// else when the pause is over. Right before it opens, a device's
+    /// object is read once more: one that went meanwhile (its notice may
+    /// come late) is read afresh by the route check instead.
     fn reopen_film(&mut self, now: f64) {
-        let usable = self.route_usable();
-        let became_usable = usable && !self.film.was_usable && !self.film.reconfirming;
-        self.film.was_usable = usable;
-        if !usable {
+        let Some((true, identity)) = self.film.route.clone() else {
+            return;
+        };
+        if identity.object.is_none() {
             return;
         }
-        self.film.reconfirming = false;
-        let identity = self.route_identity();
         let changed = self.film.tried.as_ref() != Some(&identity);
-        if now < self.film.retry_at && !changed && !became_usable {
+        if now < self.film.retry_at && !changed {
+            return;
+        }
+        if let (Some(uid), Some(object)) = (&identity.uid, identity.object)
+            && self.media.output_object(uid) != DeviceLookup::Present(object)
+        {
+            self.reconfirm_route();
+            self.film.route = Some((false, identity));
             return;
         }
         self.film.tried = Some(identity.clone());
@@ -355,6 +407,7 @@ impl RecordingWindow {
     pub(super) fn reopen_film_now(&mut self) {
         self.film.set_aside_for_beeps();
         let now = self.media.host_now_s();
+        self.observe_route(now);
         self.reopen_film(now);
         self.recorder.hold_film(self.film.set_aside);
     }
@@ -363,7 +416,7 @@ impl RecordingWindow {
     pub(super) fn film_note(&self, now: f64) -> Option<String> {
         let why = self.film.why.as_ref()?;
         let reason = why.reason();
-        if !self.route_usable() {
+        if !self.seen_usable() && self.film.rereading_since.is_none() {
             return Some(format!(
                 "The film stopped ({reason}); Takewise opens it again once its output is back."
             ));
@@ -389,24 +442,22 @@ impl RecordingWindow {
     /// ready, rendered from its facts.
     pub(super) fn film_status(&self) -> Option<String> {
         let refused = self.film.refused?;
+        let again = match refused {
+            Refused::Start => "try again",
+            Refused::Playback => "play it again",
+        };
+        // The notice says why and when: the status does not repeat it.
+        if self.film.why.is_some() {
+            return Some(format!("The film is not ready; {again} once it is back."));
+        }
         let why = if self.film.set_aside {
-            let reason = self.film.why.as_ref().map(Why::reason);
-            match (reason, self.route_usable()) {
-                (Some(reason), false) => format!("{reason}; it waits for its output"),
-                (None, false) => "it waits for its output".to_owned(),
-                (Some(reason), true) => format!("{reason}; it is being opened again"),
-                (None, true) => "it is being opened again".to_owned(),
-            }
+            "it is being opened again".to_owned()
         } else if let Some(reason) = self.media.film_failure() {
             reason
         } else if !self.media.film_ready() {
             "still loading".to_owned()
         } else {
             return None;
-        };
-        let again = match refused {
-            Refused::Start => "try again",
-            Refused::Playback => "play it again",
         };
         Some(format!(
             "The film is not ready ({why}); {again} in a moment."
@@ -422,10 +473,5 @@ impl RecordingWindow {
             || (loading && !self.media.film_ready());
         self.film.refused = refused.then_some(Refused::Start);
         refused
-    }
-
-    /// Whether the last start was refused by the film.
-    pub(super) fn film_refused_start(&self) -> bool {
-        self.film.refused == Some(Refused::Start)
     }
 }
